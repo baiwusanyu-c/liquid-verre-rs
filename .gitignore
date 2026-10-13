@@ -1,0 +1,15 @@
+# Node
+node_modules/
+dist/
+
+# Rust
+src-tauri/target/
+target/
+
+# 生成物
+src-tauri/gen/schemas/
+
+# 临时文件
+*.log
+tools/enc-test.txt
+tools/repl-test.txt
