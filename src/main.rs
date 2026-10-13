@@ -529,8 +529,16 @@ fn main() {
     }
 
     // ---- 主循环：消息泵 + 每帧渲染 ----
+    // GLASS_METRICS=1 开启轻量 CPU 侧帧预算统计；不改变渲染路径。
+    let metrics_enabled = std::env::var("GLASS_METRICS").ok().as_deref() == Some("1");
+    let mut metrics_epoch = Instant::now();
+    let mut metrics_frames: u64 = 0;
+    let mut metrics_max_loop_us: u128 = 0;
+    let mut metrics_render_sum_us: u128 = 0;
+    let mut metrics_render_max_us: u128 = 0;
     let mut msg = MSG::default();
     loop {
+        let loop_start = Instant::now();
         while unsafe { PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE) }.as_bool() {
             if msg.message == WM_QUIT {
                 return;
@@ -716,6 +724,7 @@ fn main() {
 
         // 始终渲染：即使无 WGC 帧也用 fallback 纹理显示玻璃轮廓
         {
+            let render_start = Instant::now();
             let t = app.time();
             if let Err(e) = app.compositor.render(
                 &app.gfx,
@@ -730,9 +739,32 @@ fn main() {
             ) {
                 eprintln!("render: {e}");
             }
+            if metrics_enabled {
+                let render_us = render_start.elapsed().as_micros();
+                metrics_render_sum_us += render_us;
+                metrics_render_max_us = metrics_render_max_us.max(render_us);
+            }
         }
 
         app.frames += 1;
+        if metrics_enabled {
+            metrics_frames += 1;
+            metrics_max_loop_us = metrics_max_loop_us.max(loop_start.elapsed().as_micros());
+            if metrics_epoch.elapsed() >= std::time::Duration::from_secs(5) {
+                let avg_render_ms = metrics_render_sum_us as f64 / metrics_frames.max(1) as f64 / 1000.0;
+                let max_render_ms = metrics_render_max_us as f64 / 1000.0;
+                let max_loop_ms = metrics_max_loop_us as f64 / 1000.0;
+                eprintln!(
+                    "[metrics] blocks={} frames={} avg_render_ms={:.3} max_render_ms={:.3} max_loop_ms={:.3}",
+                    app.manager.len(), metrics_frames, avg_render_ms, max_render_ms, max_loop_ms
+                );
+                metrics_epoch = Instant::now();
+                metrics_frames = 0;
+                metrics_max_loop_us = 0;
+                metrics_render_sum_us = 0;
+                metrics_render_max_us = 0;
+            }
+        }
         // 事件驱动：桌面静止 + 鼠标不动 + 无拖拽时可以睡一会儿
         let idle = app.drag.is_none()
             && app.drag_velocity[0].abs() < 0.01
