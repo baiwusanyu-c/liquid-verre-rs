@@ -66,6 +66,7 @@ struct App {
     last_cursor: [f32; 2],
     last_drag_apply: f64,
     drag_velocity: [f32; 2],
+    region_dirty: bool,
     t0: Instant,
     frames: u64,
 }
@@ -233,6 +234,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                             let i = app.manager.len();
                             let (w, h) = screen_logical();
                             app.manager.add_auto(i, 320.0, 200.0, w, h);
+                            app.region_dirty = true;
                             sync_selection(app);
                         }
                         0xBD => {
@@ -240,6 +242,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                             let id = app.manager.blocks().last().map(|b| b.id);
                             if let Some(id) = id {
                                 app.manager.remove(id);
+                                app.region_dirty = true;
                             }
                             sync_selection(app);
                         }
@@ -465,7 +468,16 @@ fn main() {
         gfx,
         compositor,
         manager,
-        params: Params::default(),
+        params: {
+            let mut p = Params::default();
+            // 极端回归模式：用最大高光强度、最小高光锐度验证
+            // bevel/plane 和圆角转角不会出现断裂。视觉效果可通过面板恢复。
+            if std::env::var("GLASS_EXTREME_SPEC").ok().as_deref() == Some("1") {
+                p.spec_intensity = 4.0;
+                p.spec_power = 1.0;
+            }
+            p
+        },
         shared,
         hwnd,
         canvas_origin: [mx as f32, my as f32],
@@ -477,6 +489,7 @@ fn main() {
         last_cursor: [0.0, 0.0],
         last_drag_apply: 0.0,
         drag_velocity: [0.0, 0.0],
+        region_dirty: true,
         t0: Instant::now(),
         frames: 0,
     };
@@ -501,11 +514,11 @@ fn main() {
     let capture_deadline = Instant::now() + std::time::Duration::from_secs(5);
     while !app.compositor.capture_ready() && Instant::now() < capture_deadline {
         match capture.try_capture(&app.gfx.device, &app.gfx.ctx) {
-            Ok(Some((tex, w, h))) => {
+            Ok(Some((tex, w, h, changed))) => {
                 if app.compositor.width != w || app.compositor.height != h {
                     let _ = app.compositor.resize(&app.gfx, w, h);
                 }
-                let _ = app.compositor.set_capture(&app.gfx, tex);
+                let _ = app.compositor.set_capture(&app.gfx, tex, changed);
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(8)),
             Err(e) => {
@@ -519,9 +532,10 @@ fn main() {
         return;
     }
     // 先渲染/提交一帧完整玻璃，再显示窗口，避免闪黑。
+    let initial_time = app.time();
     let _ = app.compositor.render(
-        &app.gfx, &app.manager, &app.params, app.cursor, app.canvas_origin,
-        app.drag_velocity, app.time(), app.press, app.hover,
+        &app.gfx, &mut app.manager, &app.params, app.cursor, app.canvas_origin,
+        app.drag_velocity, initial_time, app.press, app.hover,
     );
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -550,13 +564,13 @@ fn main() {
         // DDA 与参考 examples 相同：持续复制最新桌面帧。DComp overlay 不会进入
         // duplication，因此不存在 WGC+WDA 的黑色占位，也没有递归自反馈。
         match capture.try_capture(&app.gfx.device, &app.gfx.ctx) {
-            Ok(Some((tex, w, h))) => {
+            Ok(Some((tex, w, h, changed))) => {
                 if app.compositor.width != w || app.compositor.height != h {
                     if let Err(e) = app.compositor.resize(&app.gfx, w, h) {
                         eprintln!("resize: {e}");
                     }
                 }
-                if let Err(e) = app.compositor.set_capture(&app.gfx, tex) {
+                if let Err(e) = app.compositor.set_capture(&app.gfx, tex, changed) {
                     eprintln!("set_capture: {e}");
                 }
             }
@@ -567,6 +581,11 @@ fn main() {
         // ---- 控制面板参数同步（每帧读取原子值，无锁） ----
         let previous_params = app.params.clone();
         app.shared.apply(&mut app.params);
+        if std::env::var("GLASS_EXTREME_SPEC").ok().as_deref() == Some("1") {
+            // Keep the requested extreme regression values after panel sync.
+            app.params.spec_intensity = 4.0;
+            app.params.spec_power = 1.0;
+        }
         if app.params != previous_params {
             if (app.params.ior - previous_params.ior).abs() > f32::EPSILON {
                 if let Err(e) = app.compositor.glass.update_lut(&app.gfx.ctx, &app.params) {
@@ -595,9 +614,11 @@ fn main() {
             if let Some(b) = app.manager.get_mut(id) {
                 if target_w >= 24.0 && b.width != target_w {
                     b.width = target_w;
+                    app.region_dirty = true;
                 }
                 if target_h >= 24.0 && b.height != target_h {
                     b.height = target_h;
+                    app.region_dirty = true;
                 }
                 b.radius = radius_slider.min(0.5 * b.width.min(b.height));
                 b.clamp();
@@ -628,6 +649,7 @@ fn main() {
                     let i = app.manager.len();
                     let (sw, sh) = screen_logical();
                     let id = app.manager.add_auto(i, nw, nh, sw, sh);
+                    app.region_dirty = true;
                     app.shared
                         .selected_id
                         .store(id as isize, std::sync::atomic::Ordering::Relaxed);
@@ -643,11 +665,13 @@ fn main() {
                         .or_else(|| app.manager.blocks().last().map(|b| b.id));
                     if let Some(id) = id {
                         app.manager.remove(id);
+                        app.region_dirty = true;
                     }
                     sync_selection(&app);
                 }
                 3 => {
                     app.manager.clear();
+                    app.region_dirty = true;
                     app.shared
                         .selected_id
                         .store(-1, std::sync::atomic::Ordering::Relaxed);
@@ -660,6 +684,7 @@ fn main() {
                         let id = app.manager.add_auto(i, nw, nh, sw, sh);
                         last = id as isize;
                     }
+                    app.region_dirty = true;
                     app.shared
                         .selected_id
                         .store(last, std::sync::atomic::Ordering::Relaxed);
@@ -689,6 +714,7 @@ fn main() {
                 b.y = r[1];
                 b.width = r[2];
                 b.height = r[3];
+                app.region_dirty = true;
                 b.radius = b.radius.min(0.5 * b.width.min(b.height));
                 b.clamp();
             }
@@ -696,7 +722,10 @@ fn main() {
             app.drag_velocity[0] *= 0.85;
             app.drag_velocity[1] *= 0.85;
         }
-        update_canvas_region(&app);
+        if app.region_dirty {
+            update_canvas_region(&app);
+            app.region_dirty = false;
+        }
 
         // 鼠标点击穿透：光标在某块内 -> 取消穿透；否则恢复穿透（方案 12.1.4）
         let inside = app
@@ -728,7 +757,7 @@ fn main() {
             let t = app.time();
             if let Err(e) = app.compositor.render(
                 &app.gfx,
-                &app.manager,
+                &mut app.manager,
                 &app.params,
                 app.cursor,
                 app.canvas_origin,
@@ -748,6 +777,7 @@ fn main() {
 
         app.frames += 1;
         if metrics_enabled {
+            let s = app.compositor.last_stage_us;
             metrics_frames += 1;
             metrics_max_loop_us = metrics_max_loop_us.max(loop_start.elapsed().as_micros());
             if metrics_epoch.elapsed() >= std::time::Duration::from_secs(5) {
@@ -755,8 +785,9 @@ fn main() {
                 let max_render_ms = metrics_render_max_us as f64 / 1000.0;
                 let max_loop_ms = metrics_max_loop_us as f64 / 1000.0;
                 eprintln!(
-                    "[metrics] blocks={} frames={} avg_render_ms={:.3} max_render_ms={:.3} max_loop_ms={:.3}",
-                    app.manager.len(), metrics_frames, avg_render_ms, max_render_ms, max_loop_ms
+                    "[metrics] blocks={} frames={} avg_render_ms={:.3} max_render_ms={:.3} max_loop_ms={:.3} stage_us=A{} B{} P{} C{}",
+                    app.manager.len(), metrics_frames, avg_render_ms, max_render_ms, max_loop_ms,
+                    s[0], s[1], s[2], s[3]
                 );
                 metrics_epoch = Instant::now();
                 metrics_frames = 0;

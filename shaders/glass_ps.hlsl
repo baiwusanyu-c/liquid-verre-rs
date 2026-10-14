@@ -50,7 +50,17 @@ float2 SdSquircleGrad(float2 p,float2 hs,float n)
     return normalize(sign(p)*pow(max(d,1e-6),n-1.0)/hs*sp+1e-8);
 }
 float Shape(float2 p,float2 hs){return c15.x<.5?SdRoundBox(p,hs,c3.y):SdSquircle(p,hs,c3.x);}
-float2 ShapeGrad(float2 p,float2 hs){return c15.x<.5?SdRoundBoxGrad(p,hs,c3.y):SdSquircleGrad(p,hs,c3.x);}
+float2 ShapeGrad(float2 p,float2 hs)
+{
+    // Use the same centered finite-difference normal as the reference renderer.
+    // The analytic round-box branch has an x/y tie at corner transitions; that
+    // tie creates the diagonal seam when specular sharpness is low.
+    float e=1.0;
+    float2 g=float2(
+        Shape(p+float2(e,0),hs)-Shape(p-float2(e,0),hs),
+        Shape(p+float2(0,e),hs)-Shape(p-float2(0,e),hs));
+    return normalize(g+float2(1e-5,1e-5));
+}
 
 float2 LutSample(float u)
 {
@@ -123,17 +133,25 @@ float4 ps_main(float4 vpos:SV_POSITION):SV_Target
     float insideDistance=max(-sd,0);
     float bevelWidth=lerp(max(c3.w,1),max(min(hs.x,hs.y),1),saturate(c3.z));
     float u=saturate(insideDistance/max(bevelWidth,1e-3));
-    float2 lut=LutSample(u); float slope=min(lut.x,c15.z)*(1-c16.w),tan2=lut.y*(1-c16.w);
-    float3 N=normalize(float3(gr*slope,1)),V=float3(0,0,1);
+    float edgeWeight=1-smoothstep(0,bevelWidth*1.35,insideDistance);
+    float2 lut=LutSample(u); float tan2=lut.y*(1-c16.w);
+    // The reference example derives its optical normal from a smooth SDF
+    // derivative, but the planar center has no bevel normal. Fade the gradient
+    // with the same C1 profile as the bevel; otherwise the round-box nearest
+    // edge switches on a diagonal and becomes a visible seam at low sharpness.
+    float bevelNormal=smoothstep(0.0,1.0,edgeWeight);
+    float3 N=normalize(float3(gr*bevelNormal,1)),V=float3(0,0,1);
 
     float2 screenPx=canvasPx+c17.xy;
     float2 sampleScreen=screenPx+c13.xy*c13.z;
     float2 uv0=(sampleScreen-c1.xy)/c1.zw,texel=1/max(c1.zw,float2(1,1));
 
-    float2 physicalOffset=-gr*(tan2*c4.y*c4.z);
-    float2 referenceOffset=ReferenceDisplacement(local,lensSize,c4.y*c4.z*3.85);
-    float2 offsetPx=lerp(physicalOffset,referenceOffset,.72);
-    float edgeWeight=1-smoothstep(0,bevelWidth,insideDistance); offsetPx*=edgeWeight;
+    // A continuous rounded-box displacement field. The old procedural
+    // approximation used a fixed non-unit SDF and generated diagonal facets at
+    // extreme specular settings. Use the actual block SDF gradient and a single
+    // monotonic edge profile instead.
+    float refractProfile=smoothstep(1.0,0.0,u);
+    float2 offsetPx=-gr*(c4.y*c4.z*.42)*refractProfile;
     float dk=c4.w*.08*(1-u);
     float2 uvR=saturate(uv0+offsetPx*(1-dk)*texel),uvG=saturate(uv0+offsetPx*texel),uvB=saturate(uv0+offsetPx*(1+dk)*texel);
     float3 sharp=float3(gCapture.SampleLevel(gSamp,uvR,0).r,gCapture.SampleLevel(gSamp,uvG,0).g,gCapture.SampleLevel(gSamp,uvB,0).b);
@@ -144,8 +162,8 @@ float4 ps_main(float4 vpos:SV_POSITION):SV_Target
     // Reference keeps a clean center only for content; the backdrop itself remains
     // frosted. Keep edge refraction clear, but do not let edgeAlwaysSharp turn the
     // whole lens back into an unblurred desktop copy.
-    float edgeSharp=pow(1-u,2)*edgeWeight;
-    float sharpMix=saturate(c5.x+c10.y*(1-c5.x)*edgeSharp*.35);
+    float edgeSharp=smoothstep(0.0,1.0,1.0-u)*edgeWeight;
+    float sharpMix=saturate(c5.x+c10.y*(1-c5.x)*edgeSharp*.22);
     float3 col=lerp(blurred,sharp,sharpMix);
     col=saturate(CssSaturate(col,1.40));
 
@@ -160,14 +178,26 @@ float4 ps_main(float4 vpos:SV_POSITION):SV_Target
     float shininess=max(lerp(c9.y,c9.y*.12,c10.x),1);
     float specK=pow(saturate(dot(N,Hk)),shininess)*c8.w;
     float e=.01,converge=abs(LutSample(u+e).y-LutSample(u-e).y)/(2*e),caustic=saturate(converge*c10.z)*edgeWeight;
+    // Keep specular continuous on the planar/bevel junction. The old raw
+    // Fresnel term was multiplied by an abrupt bevel mask, producing a hard
+    // diagonal at rounded corners.
+    float bevelLight=saturate(edgeWeight);
+    float specEnvelope=lerp(0.18,1.0,bevelLight*bevelLight);
+    float cornerContinuity=smoothstep(0.0,1.0,bevelNormal);
+    // With a single displacement field, Fresnel remains smooth at the plane;
+    // do not reintroduce an independent LUT envelope into the highlight.
     float2 mouseVector=c11.xy-screenPx; float md2=dot(mouseVector,mouseVector),invR2=1/max(2*c11.z*c11.z,1e-3),fall=exp(-md2*invR2);
     float3 Lm=normalize(float3(mouseVector/max(c12.x,1),1)),Hm=normalize(Lm+V);
-    float glint=pow(saturate(dot(N,Hm)),shininess)*fall*c11.w*edgeWeight;
-    // Reference hover is the moving border gradient, not a rectangular radial
-    // wash over the whole card. Keep only the physical edge glint here.
-    float hoverGain=saturate(c12.y*.72+fall*.28);
+    // In the reference, the pointer is a moving screen/overlay color field;
+    // edge glint is only a small physical supplement. Keep the radial response
+    // broad and let the overlay layer below carry the visible white feedback.
+    float glint=pow(saturate(dot(N,Hm)),shininess)*fall*c11.w*edgeWeight*.16;
+    float mouseEnvelope=smoothstep(0.0,1.0,edgeWeight);
+    glint*=mouseEnvelope;
+    float hoverGain=saturate(c12.y*.55+fall*.20);
     float specBoost=lerp(1,1.9,c6.y*saturate(1-envL*1.6));
-    col+=c14.xyz*((specK*fres*c9.x+caustic*fres*.35)*specBoost+glint*hoverGain*(1+.35*c12.z));
+    col+=c14.xyz*((specK*fres*c9.x*specEnvelope+caustic*fres*.28)*specBoost
+        +glint*hoverGain*(1+.35*c12.z)*specEnvelope*cornerContinuity);
 
     float2 blockCenterScreen=c16.xy+c0.zw*.5+c17.xy;
     float2 mouseOffset=c11.xy-blockCenterScreen;
@@ -181,13 +211,21 @@ float4 ps_main(float4 vpos:SV_POSITION):SV_Target
     float2 localTopLeft=local+hs;
     float gradientPosition=dot(localTopLeft-lensSize*.5,gradientDirection)/(gradientExtent*2)+.5;
     float stopA=clamp((33+normalizedMouse.y*.3)/100,.1,.9),stopB=clamp((66+normalizedMouse.y*.4)/100,.1,.9);
-    float borderWidth=max(c9.w,1),borderMask=saturate(1-smoothstep(0,borderWidth,insideDistance))*glassCoverage;
+    // Use a wider, curvature-aware border field. A one-pixel mask makes the
+    // straight-edge/corner transition look segmented at extreme spec settings.
+    float borderWidth=max(c9.w*2.0,2.0),borderMask=saturate(1-smoothstep(0,borderWidth,insideDistance))*glassCoverage;
     float insetDirection=saturate(.5-gr.y*.5),insetGlow=exp(-.5*pow(insideDistance/max(borderWidth,.001),2))*insetDirection*.25;
     float insetAlpha=saturate((1-smoothstep(.25,.75,insideDistance))*.5+insetGlow)*borderMask;
     float screenAlpha=saturate(GradientAlpha(gradientPosition,stopA,stopB,.12+abs(normalizedMouse.x)*.008,.4+abs(normalizedMouse.x)*.012))*borderMask*.2;
     screenAlpha=1-(1-screenAlpha)*(1-insetAlpha*.2); col=1-(1-col)*(1-screenAlpha);
     float overlayAlpha=saturate(GradientAlpha(gradientPosition,stopA,stopB,.32+abs(normalizedMouse.x)*.008,.6+abs(normalizedMouse.x)*.012))*borderMask;
-    overlayAlpha=1-(1-overlayAlpha)*(1-insetAlpha); col=lerp(col,OverlayWhite(col),overlayAlpha);
+    overlayAlpha=1-(1-overlayAlpha)*(1-insetAlpha);
+    // Reference mouse light modulates the overlay/diffraction color field over
+    // the bevel, not a hard white line. Apply a soft field inside the transition
+    // so high intensity + low sharpness stays continuous at corners.
+    float mouseField=fall * c12.y * smoothstep(0.0,1.0,edgeWeight) * 0.24;
+    float3 mouseOverlay=OverlayWhite(col);
+    col=lerp(col,mouseOverlay,saturate(overlayAlpha+mouseField));
 
     // Captured desktop is already inside col: replace the underlying desktop within
     // the glass shape. Partial alpha would double-composite sharp and blurred images.

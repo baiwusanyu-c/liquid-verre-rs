@@ -31,12 +31,15 @@ pub struct Compositor {
     pub glass: GlassRenderer,
     capture_tex: Option<ID3D11Texture2D>,
     capture_srv: Option<ID3D11ShaderResourceView>,
+    capture_generation: u64,
     fallback_srv: Option<ID3D11ShaderResourceView>,
     pub width: i32,
     pub height: i32,
     /// 共享背景金字塔是否仍对应当前捕获帧。
     /// WGC 新帧到达时由 set_capture 置 false；鼠标移动只执行 Pass B。
     background_valid: bool,
+    /// CPU submission/wait durations only, NOT GPU execution times.
+    pub last_stage_us: [u128; 4], // Pass A, Pass B, Present, Commit
 }
 
 impl Compositor {
@@ -59,10 +62,12 @@ impl Compositor {
             glass,
             capture_tex: None,
             capture_srv: None,
+            capture_generation: 0,
             fallback_srv: Some(fallback_srv),
             width,
             height,
             background_valid: false,
+            last_stage_us: [0; 4],
         })
     }
 
@@ -174,17 +179,30 @@ impl Compositor {
         self.capture_srv.is_some()
     }
 
-    pub fn set_capture(&mut self, gfx: &Device, tex: ID3D11Texture2D) -> Result<(), String> {
-        let mut srv = None;
-        unsafe {
-            gfx.device
-                .CreateShaderResourceView(&tex, None, Some(&mut srv))
-                .map_err(|e| format!("CreateShaderResourceView(capture): {e}"))?;
+    pub fn set_capture(
+        &mut self,
+        gfx: &Device,
+        tex: ID3D11Texture2D,
+        refresh_background: bool,
+    ) -> Result<(), String> {
+        // DDA 返回的是 compositor 自己的长期纹理；只创建一次 SRV，避免每个
+        // desktop frame 在 CPU 热路径重复创建 COM view。
+        let reuse = self.capture_tex.as_ref().is_some_and(|old| old == &tex);
+        if !reuse {
+            let mut srv = None;
+            unsafe {
+                gfx.device
+                    .CreateShaderResourceView(&tex, None, Some(&mut srv))
+                    .map_err(|e| format!("CreateShaderResourceView(capture): {e}"))?;
+            }
+            self.capture_srv = srv;
+            self.capture_tex = Some(tex);
         }
-        self.capture_tex = Some(tex);
-        self.capture_srv = srv;
-        // WGC 发布了新纹理；下一次 render 必须刷新共享背景金字塔。
-        self.background_valid = false;
+        self.capture_generation = self.capture_generation.wrapping_add(1);
+        // 仅在确实检测到桌面内容变化时刷新共享背景，拖拽/鼠标帧不触发 Pass A。
+        if refresh_background {
+            self.background_valid = false;
+        }
         Ok(())
     }
 
@@ -192,7 +210,7 @@ impl Compositor {
     pub fn render(
         &mut self,
         gfx: &Device,
-        manager: &Manager,
+        manager: &mut Manager,
         params: &Params,
         cursor_screen: [f32; 2],
         canvas_origin: [f32; 2],
@@ -221,12 +239,17 @@ impl Compositor {
         // 关键性能约束：它与块数无关，并且静态背景时不重复执行；
         // 鼠标/拖拽只进入 Pass B，不触发整屏 down/up-sample。
         if !self.background_valid {
+            let t = std::time::Instant::now();
             self.pyramid
                 .run(&gfx.ctx, &capture_srv, self.width, self.height);
+            self.last_stage_us[0] = t.elapsed().as_micros();
             self.background_valid = true;
+        } else {
+            self.last_stage_us[0] = 0;
         }
         // Pass B：逐块 scissor 绘制
-        let blocks = manager.draw_order();
+        let pass_b_start = std::time::Instant::now();
+        let blocks = manager.blocks_sorted();
         self.glass.draw_blocks(
             &gfx.ctx,
             &self.rt.rtv,
@@ -245,6 +268,7 @@ impl Compositor {
             press,
             hover_id,
         );
+        self.last_stage_us[1] = pass_b_start.elapsed().as_micros();
         if let Ok(path) = std::env::var("GLASS_INTERNAL_SHOT") {
             if !DEBUG_SHOT_DONE.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 if let Err(e) = self.save_debug_bmp(gfx, &path) {
@@ -254,7 +278,10 @@ impl Compositor {
                 }
             }
         }
-        self.present()
+        let present_start = std::time::Instant::now();
+        let result = self.present();
+        self.last_stage_us[2] = present_start.elapsed().as_micros();
+        result
     }
 
     /// 保存三类诊断图：
@@ -414,8 +441,10 @@ impl Compositor {
         std::fs::write(path, bmp).map_err(|e| format!("write debug BMP {path}: {e}"))
     }
 
-    fn present(&self) -> Result<(), String> {
+    fn present(&mut self) -> Result<(), String> {
+        let present_start = std::time::Instant::now();
         self.swap.present()?;
+        self.last_stage_us[3] = present_start.elapsed().as_micros();
         self.dcomp.commit()
     }
 }

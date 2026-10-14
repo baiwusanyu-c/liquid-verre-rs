@@ -21,6 +21,7 @@ pub struct DdaCapture {
     srv: Option<ID3D11ShaderResourceView>,
     pub width: i32,
     pub height: i32,
+    last_frame_signature: u64,
 }
 
 impl DdaCapture {
@@ -31,7 +32,14 @@ impl DdaCapture {
         let output1: IDXGIOutput1 = output.cast().map_err(|e| format!("IDXGIOutput1: {e}"))?;
         let duplication = unsafe { output1.DuplicateOutput(device) }
             .map_err(|e| format!("DuplicateOutput: {e}"))?;
-        Ok(Self { duplication, texture: None, srv: None, width: 0, height: 0 })
+        Ok(Self {
+            duplication,
+            texture: None,
+            srv: None,
+            width: 0,
+            height: 0,
+            last_frame_signature: 0,
+        })
     }
 
     /// Acquire and copy the newest desktop frame into an owned texture.
@@ -39,14 +47,14 @@ impl DdaCapture {
         &mut self,
         device: &ID3D11Device,
         ctx: &ID3D11DeviceContext,
-    ) -> Result<Option<(ID3D11Texture2D, i32, i32)>, String> {
+    ) -> Result<Option<(ID3D11Texture2D, i32, i32, bool)>, String> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
         let acquired = unsafe { self.duplication.AcquireNextFrame(0, &mut info, &mut resource) };
         if acquired.is_err() {
             return Ok(None);
         }
-        let result = (|| -> Result<Option<(ID3D11Texture2D, i32, i32)>, String> {
+        let result = (|| -> Result<Option<(ID3D11Texture2D, i32, i32, bool)>, String> {
             let Some(resource) = resource else { return Ok(None); };
             let frame: ID3D11Texture2D = resource.cast().map_err(|e| format!("DDA texture: {e}"))?;
             let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -83,7 +91,18 @@ impl DdaCapture {
             }
             let owned = self.texture.as_ref().ok_or("DDA texture missing")?;
             unsafe { ctx.CopyResource(owned, &frame); }
-            Ok(Some((owned.clone(), self.width, self.height)))
+            // AccumulatedFrames==0 can be pointer-only metadata. The desktop
+            // texture still remains valid, but avoid rebuilding Pass A unless
+            // duplication reports actual desktop content.
+            let signature = info.LastPresentTime as u64;
+            // Pointer-only acquisitions have LastPresentTime=0: never replace
+            // the remembered desktop timestamp with zero or refresh the blur.
+            let changed = recreate
+                || (signature != 0 && signature != self.last_frame_signature);
+            if signature != 0 {
+                self.last_frame_signature = signature;
+            }
+            Ok(Some((owned.clone(), self.width, self.height, changed)))
         })();
         let _ = unsafe { self.duplication.ReleaseFrame() };
         result

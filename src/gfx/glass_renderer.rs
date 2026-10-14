@@ -299,7 +299,16 @@ impl GlassRenderer {
             let (shape_mode, super_n) = p.shape.uniform();
             let tt = time;
             let is_hover = hover_id == Some(block.id);
+            let is_dragged = is_hover && press > 0.01;
             let hover = if is_hover { 1.0 } else { 0.0 };
+            // Drag velocity is a screen-sampling compensation for the dragged
+            // glass only. Applying it to every block makes all other glass
+            // backgrounds visibly wobble when one block moves.
+            let block_drag_velocity = if is_dragged {
+                drag_velocity
+            } else {
+                [0.0, 0.0]
+            };
 
             let mut cb = GlassCb::zeroed();
             // c0: 渲染目标原点(画布px) / 块窗口尺寸
@@ -360,7 +369,13 @@ impl GlassRenderer {
             // c12: mouseSpread / hover / press / proximityGlow
             cb.set4(12, p.mouse_spread, hover, press, p.proximity_glow);
             // c13: dragVelocity xy / lagSeconds / pad
-            cb.set4(13, drag_velocity[0], drag_velocity[1], p.lag_seconds, 0.0);
+            cb.set4(
+                13,
+                block_drag_velocity[0],
+                block_drag_velocity[1],
+                p.lag_seconds,
+                0.0,
+            );
             // c14: mouseColor xyz / envTintMix
             cb.set4(
                 14,

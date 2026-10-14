@@ -247,7 +247,7 @@ impl Params {
 
         self.light_intensity = self.light_intensity.clamp(0.0, 4.0);
         self.spec_intensity = self.spec_intensity.clamp(0.0, 4.0);
-        self.spec_power = self.spec_power.clamp(2.0, 512.0);
+        self.spec_power = self.spec_power.clamp(1.0, 512.0);
         self.spec_spread = self.spec_spread.clamp(0.0, 1.0);
         self.fresnel_f0 = self.fresnel_f0.clamp(0.0, 1.0);
         self.rim_width = self.rim_width.clamp(0.0, 16.0);
