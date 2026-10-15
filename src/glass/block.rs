@@ -1,33 +1,36 @@
 //! 玻璃块数据模型（方案 3.5 glass/block.rs）。
 
-#[derive(Debug, Clone)]
+/// 全部字段都是标量，`Copy` 语义；多屏投影每帧复制块时不会产生堆分配
+/// （方案 7.3「热路径零堆分配」）。
+#[derive(Debug, Clone, Copy)]
 pub struct Block {
     pub id: u32,
-    pub label: String,
-    /// 块左上角（逻辑 px，相对显示器工作区）
+    /// 块左上角（虚拟屏物理 px，多屏绝对坐标）
     pub x: f32,
     pub y: f32,
-    /// 块尺寸（逻辑 px，不含阴影边距）
+    /// 块尺寸（所在屏物理 px，不含阴影边距）
     pub width: f32,
     pub height: f32,
     pub radius: f32,
     pub z_order: u32,
-    /// 每个块独立的参数覆盖（None = 用全局）
-    pub overrides: Option<crate::glass::params::Params>,
+    /// 所在显示器下标（方案 12.10：默认钳制到单屏，不跨屏）
+    pub monitor: usize,
+    /// 该屏 DPI / 主屏 DPI。块跨屏时按它换算，保持物理观感一致。
+    pub scale: f32,
 }
 
 impl Block {
     pub fn new(id: u32, x: f32, y: f32, width: f32, height: f32) -> Self {
         Self {
             id,
-            label: format!("GLASS {id:02}"),
             x,
             y,
             width: width.max(MIN_SIZE),
             height: height.max(MIN_SIZE),
             radius: 28.0,
             z_order: id,
-            overrides: None,
+            monitor: 0,
+            scale: 1.0,
         }
     }
 

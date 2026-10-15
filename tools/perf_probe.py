@@ -1,0 +1,325 @@
+"""perf_probe.py -- 液态玻璃性能实测探针（《折射渲染方案》7.6 口径）。
+
+统一测量四件事：
+  1) CPU：单核当量占用（Δ进程CPU时间 / Δ墙钟），拖拽段与静止段分开统计；
+  2) 内存：常驻 WorkingSet64 与 PrivateUsage（方案要求 RSS < 40 MB）；
+  3) 显存：GPU Process Memory 的 Dedicated Usage（方案要求 20 块 ≤ 200 MB）；
+  4) 帧节奏：解析被测程序 GLASS_METRICS 的 avg/max render 与 max loop 长尾。
+
+用法：
+  python tools/perf_probe.py --case single-idle
+  python tools/perf_probe.py --case single-drag
+  python tools/perf_probe.py --case many-idle
+  python tools/perf_probe.py --case many-drag
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from ctypes import wintypes
+
+# 探针必须与被测程序同为 Per-Monitor V2，否则 SetCursorPos/GetSystemMetrics
+# 会被 DPI 虚拟化，落点偏移到物理屏之外。
+try:
+    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+except Exception:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        ctypes.windll.user32.SetProcessDPIAware()
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+PROCESS_QUERY_INFORMATION = 0x0400
+PROCESS_VM_READ = 0x0010
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXE = os.path.join(ROOT, "target", "release", "liquid-glass.exe")
+
+
+class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("PageFaultCount", wintypes.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t),
+    ]
+
+
+def open_process(pid: int):
+    h = kernel32.OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not h:
+        raise OSError(ctypes.get_last_error())
+    return h
+
+
+def cpu_seconds(handle) -> float:
+    creation = wintypes.FILETIME()
+    exit_t = wintypes.FILETIME()
+    kernel = wintypes.FILETIME()
+    user = wintypes.FILETIME()
+    if not kernel32.GetProcessTimes(handle, ctypes.byref(creation),
+                                    ctypes.byref(exit_t),
+                                    ctypes.byref(kernel), ctypes.byref(user)):
+        return 0.0
+    k = (kernel.dwHighDateTime << 32) | kernel.dwLowDateTime
+    u = (user.dwHighDateTime << 32) | user.dwLowDateTime
+    return (k + u) / 1e7
+
+
+def memory_bytes(handle):
+    counters = PROCESS_MEMORY_COUNTERS_EX()
+    counters.cb = ctypes.sizeof(counters)
+    if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters),
+                                      ctypes.sizeof(counters)):
+        return 0, 0
+    return counters.WorkingSetSize, counters.PrivateUsage
+
+
+def gpu_dedicated_mb(pid: int) -> float:
+    """读 GPU Process Memory 的 Dedicated + Shared Usage（所有 LUID 求和）。
+
+    本机是 Intel Arc 集显，显存走系统内存，Dedicated Usage 恒为 0，
+    真正的占用记在 Shared Usage；两者相加才是该进程的 GPU 侧占用。
+    """
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';$t=0;"
+        "foreach($n in 'Dedicated Usage','Shared Usage'){"
+        "$c=Get-Counter -Counter ('\\GPU Process Memory(pid_%d_*)\\'+$n);"
+        "$t+=($c.CounterSamples | Measure-Object -Property CookedValue -Sum).Sum};"
+        "$t" % pid
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=40)
+        txt = out.stdout.strip()
+        if not txt:
+            return float("nan")
+        return float(txt) / (1024 * 1024)
+    except Exception:
+        return float("nan")
+
+
+METRIC_RE = re.compile(
+    r"win_s=(?P<win>[\d.]+)\s+screens=(?P<screens>\d+)\s+blocks=(?P<blocks>\d+)\s+"
+    r"loops=(?P<loops>\d+)\s+frames=(?P<frames>\d+)\s+fps=(?P<fps>[\d.]+)\s+"
+    r"idle=(?P<idle>\d+)\s+avg_render_ms=(?P<avg>[\d.]+)\s+"
+    r"max_render_ms=(?P<mr>[\d.]+)\s+max_loop_ms=(?P<ml>[\d.]+)\s+"
+    r"stage_us=A(?P<a>\d+)\s+B(?P<b>\d+)\s+P(?P<p>\d+)\s+C(?P<c>\d+)\s+"
+    r"dirty_mpx_avg=(?P<davg>[\d.]+)\s+dirty_mpx_max=(?P<dmax>[\d.]+)\s+"
+    r"blocks_avg=(?P<bavg>[\d.]+)\s+pass_a=(?P<pa>[\d.]+)/frame\s+"
+    r"pass_a_mpx_avg=(?P<pam>[\d.]+)\s+dda_acq=(?P<acq>[\d.]+)/s\s+"
+    r"dda_changed=(?P<chg>[\d.]+)/s\s+copy_mpx_avg=(?P<cp>[\d.]+)")
+
+
+class LogReader(threading.Thread):
+    def __init__(self, stream):
+        super().__init__(daemon=True)
+        self.stream = stream
+        self.lines: list[str] = []
+        self.metrics: list[dict] = []
+
+    def run(self):
+        for raw in self.stream:
+            line = raw.decode("utf-8", "replace").rstrip()
+            if not line:
+                continue
+            self.lines.append(line)
+            m = METRIC_RE.search(line)
+            if m:
+                d = m.groupdict()
+                self.metrics.append({
+                    "screens": int(d["screens"]),
+                    "blocks": int(d["blocks"]),
+                    "frames": int(d["frames"]),
+                    "fps": float(d["fps"]),
+                    "idle_loops": int(d["idle"]),
+                    "avg_render_ms": float(d["avg"]),
+                    "max_render_ms": float(d["mr"]),
+                    "max_loop_ms": float(d["ml"]),
+                    "stage_us": [int(d["a"]), int(d["b"]),
+                                 int(d["p"]), int(d["c"])],
+                    "dirty_mpx_avg": float(d["davg"]),
+                    "dirty_mpx_max": float(d["dmax"]),
+                    "blocks_drawn_avg": float(d["bavg"]),
+                    "pass_a_per_frame": float(d["pa"]),
+                    "pass_a_mpx_avg": float(d["pam"]),
+                    "dda_acq_per_s": float(d["acq"]),
+                    "dda_changed_per_s": float(d["chg"]),
+                    "copy_mpx_avg": float(d["cp"]),
+                })
+
+    def metrics_since(self, index: int):
+        return self.metrics[index:]
+
+
+def set_cursor(x: float, y: float):
+    user32.SetCursorPos(int(round(x)), int(round(y)))
+
+
+def screen_size():
+    return (user32.GetSystemMetrics(SM_CXSCREEN),
+            user32.GetSystemMetrics(SM_CYSCREEN))
+
+
+def drag_path(t: float, cx: float, cy: float, span: float):
+    """模拟人工手速：正弦横扫 + 轻微纵向漂移，峰值速度约 1.3 k px/s。"""
+    x = cx + span * 0.5 * math.sin(2.0 * math.pi * 0.55 * t)
+    y = cy + span * 0.18 * math.sin(2.0 * math.pi * 0.31 * t + 0.7)
+    return x, y
+
+
+def run_case(case: str, seconds: float, warmup: float) -> dict:
+    many = case.startswith("many")
+    do_drag = case.endswith("drag")
+    env = dict(os.environ)
+    env["GLASS_METRICS"] = "1"
+    if many:
+        env["GLASS_MANY"] = "1"
+    env.pop("GLASS_EXTREME_SPEC", None)
+
+    proc = subprocess.Popen([EXE], env=env, cwd=ROOT,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE)
+    reader = LogReader(proc.stderr)
+    reader.start()
+    handle = open_process(proc.pid)
+
+    sw, sh = screen_size()
+    # 块 0 在 GLASS_MANY 布局下固定为 (32,64) 600x400；单块模式居中。
+    if many:
+        cx, cy = 32.0 + 300.0, 64.0 + 200.0
+    else:
+        cx, cy = sw * 0.5, sh * 0.5
+
+    set_cursor(cx, cy)
+    time.sleep(warmup * 0.6)
+    # GPU 显存计数器的采集会 spawn PowerShell 并短暂拖慢整机，
+    # 必须放在测量窗口之外，否则会污染 max_loop 长尾。
+    gpu_mb = gpu_dedicated_mb(proc.pid)
+    time.sleep(warmup * 0.4)
+
+    result = {"case": case, "pid": proc.pid, "screen": [sw, sh],
+              "warmup_s": warmup, "measure_s": seconds, "drag": do_drag}
+
+    # ---- 静止段 ----
+    base_marks = len(reader.metrics)
+    t0, c0 = time.perf_counter(), cpu_seconds(handle)
+    ws_samples, priv_samples = [], []
+    end = t0 + (seconds if not do_drag else seconds * 0.4)
+    while time.perf_counter() < end:
+        ws, priv = memory_bytes(handle)
+        ws_samples.append(ws)
+        priv_samples.append(priv)
+        time.sleep(0.15)
+    t1, c1 = time.perf_counter(), cpu_seconds(handle)
+    result["idle"] = {
+        "wall_s": round(t1 - t0, 3),
+        "cpu_pct_of_one_core": round((c1 - c0) / max(t1 - t0, 1e-6) * 100, 2),
+        "working_set_mb": round(max(ws_samples) / 1048576, 1) if ws_samples else 0,
+        "working_set_avg_mb": round(
+            (sum(ws_samples) / len(ws_samples)) / 1048576, 1) if ws_samples else 0,
+        "private_mb": round(max(priv_samples) / 1048576, 1) if priv_samples else 0,
+        "gpu_dedicated_mb": round(gpu_mb, 1),
+        "metrics": reader.metrics_since(base_marks),
+    }
+
+    # ---- 拖拽段 ----
+    if do_drag:
+        set_cursor(cx, cy)
+        time.sleep(0.25)
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.06)
+        base_marks = len(reader.metrics)
+        t0, c0 = time.perf_counter(), cpu_seconds(handle)
+        span = min(520.0, sw * 0.4)
+        last = t0
+        max_loop = 0.0
+        try:
+            while True:
+                now = time.perf_counter()
+                if now - t0 > seconds:
+                    break
+                x, y = drag_path(now - t0, cx, cy, span)
+                set_cursor(x, y)
+                max_loop = max(max_loop, time.perf_counter() - last)
+                last = time.perf_counter()
+                # 250 Hz 采样，接近 1000 Hz 鼠标的合并前速率
+                time.sleep(max(0.0, 0.004 - (time.perf_counter() - now)))
+        finally:
+            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        t1, c1 = time.perf_counter(), cpu_seconds(handle)
+        result["drag"] = {
+            "wall_s": round(t1 - t0, 3),
+            "cpu_pct_of_one_core": round(
+                (c1 - c0) / max(t1 - t0, 1e-6) * 100, 2),
+            "probe_max_step_ms": round(max_loop * 1000, 2),
+            "metrics": reader.metrics_since(base_marks),
+        }
+        time.sleep(0.4)
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    kernel32.CloseHandle(handle)
+    result["stderr_tail"] = reader.lines[-6:]
+    result["warnings"] = [l for l in reader.lines
+                          if "[warn]" in l or "[info]" in l or "DDA" in l][:12]
+    logpath = os.path.join(ROOT, "tools", "probe_%s.log" % case)
+    with open(logpath, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(reader.lines))
+    return result
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--case", default="single-idle",
+                    choices=["single-idle", "single-drag",
+                             "many-idle", "many-drag", "all"])
+    ap.add_argument("--seconds", type=float, default=12.0)
+    ap.add_argument("--warmup", type=float, default=3.0)
+    ap.add_argument("--out", default="")
+    args = ap.parse_args()
+
+    cases = (["single-idle", "single-drag", "many-idle", "many-drag"]
+             if args.case == "all" else [args.case])
+    payload = []
+    for case in cases:
+        if not os.path.exists(EXE):
+            print("缺少 release 可执行文件：%s" % EXE)
+            return 2
+        payload.append(run_case(case, args.seconds, args.warmup))
+        print(json.dumps(payload[-1], ensure_ascii=False, indent=1))
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

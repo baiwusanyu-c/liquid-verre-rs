@@ -7,10 +7,11 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 
 use crate::gfx::device::Device;
 use crate::gfx::glass_renderer::GlassRenderer;
+use crate::gfx::gpu_timer::GpuTimer;
 use crate::gfx::pyramid::Pyramid;
 use crate::gfx::swapchain::CanvasSwapchain;
 use crate::gfx::DComp;
-use crate::glass::manager::Manager;
+use crate::glass::block::Block;
 use crate::glass::params::Params;
 
 static DEBUG_SHOT_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -28,7 +29,6 @@ pub struct Compositor {
     rt: BackbufferRt,
     dcomp: DComp,
     pub pyramid: Pyramid,
-    pub glass: GlassRenderer,
     capture_tex: Option<ID3D11Texture2D>,
     capture_srv: Option<ID3D11ShaderResourceView>,
     capture_generation: u64,
@@ -40,6 +40,35 @@ pub struct Compositor {
     background_valid: bool,
     /// CPU submission/wait durations only, NOT GPU execution times.
     pub last_stage_us: [u128; 4], // Pass A, Pass B, Present, Commit
+    /// 真实 GPU 计时（方案 7.6）。仅 GLASS_METRICS=1 时创建。
+    pub gpu: Option<GpuTimer>,
+    /// 上一帧各块的绘制矩形（画布像素），用于推导本帧脏区。
+    prev_rects: Vec<(u32, [i32; 4])>,
+    /// 本帧矩形 scratch（复用，热路径零分配）。
+    cur_rects: Vec<(u32, [i32; 4])>,
+    /// 本帧脏区统计（像素），用于 metrics。
+    pub last_dirty_px: i64,
+    /// 本帧是否真的画了块。
+    pub last_drew_blocks: usize,
+    /// 本帧是否重跑了 Pass A（背景真的变了）。
+    pub last_pass_a: bool,
+    /// 金字塔当前「内容有效」的全屏坐标矩形。块足迹超出它才需要重跑 Pass A。
+    pyramid_valid: Option<[i32; 4]>,
+    /// 本帧 Pass A 实际覆盖的像素数（metrics）。
+    pub last_pass_a_px: i64,
+    /// 调试截图需要整屏内容，强制全量重画。
+    force_full_shot: bool,
+    /// GLASS_FORCE_FULL=1：关闭脏矩形优化，每帧整屏重画（A/B 对照用）。
+    force_full_always: bool,
+    /// GLASS_INTERNAL_SHOT_AT_MS：延迟到该时刻之后的第一帧再截图，
+    /// 用于验证脏矩形路径（首帧本来就是整屏重画，测不出差异）。
+    shot_at: Option<std::time::Instant>,
+    /// 已经提交过至少一帧（首帧必须全量）。
+    has_presented: bool,
+    /// GLASS_INTERNAL_SHOT 的输出路径（拍完即取走）。
+    pub shot_path: Option<String>,
+    /// 是否已经拍出这一帧（供 GLASS_VERIFY_PASS_A 自检串联第二次全量渲染）。
+    pub shot_fired: bool,
 }
 
 impl Compositor {
@@ -49,17 +78,30 @@ impl Compositor {
         let dcomp = DComp::new(gfx, hwnd)?;
         let _visual = dcomp.attach_swapchain(&swap.swap)?;
         let pyramid = Pyramid::new(&gfx.device)?;
-        let glass = GlassRenderer::new(&gfx.device)?;
 
-        // 创建 4x4 的 fallback 纹理：在无 WGC 帧时让玻璃块仍能渲染轮廓
+        // fallback 纹理：仅在采集完全不可用时兜底（main 在首帧就绪前不会显示窗口，
+        // 因此正常路径永远不会采样它）。做成 8x8 渐变即可，省掉旧实现里
+        // 1024x1024 的 4 MB 常驻显存与启动时约 100 万次 sin/cos 的 CPU 开销。
         let fallback_srv = Self::create_fallback_srv(gfx)?;
+        // 注意：D3D11 timestamp query 会打断驱动的命令批处理，本身就会拖慢
+        // 管线，因此独立于 GLASS_METRICS，只在专门做 GPU 归因时打开。
+        let gpu = if std::env::var("GLASS_GPU_TIMINGS").ok().as_deref() == Some("1") {
+            match GpuTimer::new(&gfx.device) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("[warn] GPU timestamp query 不可用: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             swap,
             rt,
             dcomp,
             pyramid,
-            glass,
             capture_tex: None,
             capture_srv: None,
             capture_generation: 0,
@@ -68,28 +110,43 @@ impl Compositor {
             height,
             background_valid: false,
             last_stage_us: [0; 4],
+            gpu,
+            prev_rects: Vec::new(),
+            cur_rects: Vec::new(),
+            last_dirty_px: 0,
+            last_drew_blocks: 0,
+            last_pass_a: false,
+            pyramid_valid: None,
+            last_pass_a_px: 0,
+            force_full_shot: std::env::var("GLASS_INTERNAL_SHOT").is_ok(),
+            force_full_always: std::env::var("GLASS_FORCE_FULL").ok().as_deref() == Some("1"),
+            // 未指定延迟时默认「首帧即拍」，与旧实现一致。
+            shot_at: std::env::var("GLASS_INTERNAL_SHOT").ok().map(|_| {
+                let delay = std::env::var("GLASS_INTERNAL_SHOT_AT_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                std::time::Instant::now() + std::time::Duration::from_millis(delay)
+            }),
+            has_presented: false,
+            shot_path: std::env::var("GLASS_INTERNAL_SHOT").ok(),
+            shot_fired: false,
         })
     }
 
-    /// 创建 fallback SRV：全屏尺寸渐变纹理，无 WGC 时也能看到漂亮的玻璃效果
+    /// 创建 fallback SRV：极小的柔和渐变，仅在采集彻底不可用时兜底。
     fn create_fallback_srv(gfx: &Device) -> Result<ID3D11ShaderResourceView, String> {
-        // 1024×1024：看似"毛玻璃背后的桌面"的抽象图案
-        let w = 1024u32;
-        let h = 1024u32;
+        let w = 8u32;
+        let h = 8u32;
         let mut pixels = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
             for x in 0..w {
                 let i = ((y * w + x) * 4) as usize;
-                let cx = x as f32 / w as f32;
-                let cy = y as f32 / h as f32;
-                // 模拟模糊桌面：大块色斑 + 柔和过渡
-                let blob1 = ((cx * 3.0 + 0.5).sin() * (cy * 2.5).cos() * 0.5 + 0.5).max(0.0);
-                let blob2 = ((cx * 4.5 + 2.0).cos() * (cy * 3.0 + 1.0).sin() * 0.5 + 0.5).max(0.0);
-                let blob3 = ((cx * 2.0 + 1.5).sin() * (cy * 3.5).cos() * 0.5 + 0.5).max(0.0);
-                // 柔和色调：蓝色/紫色/暖灰
-                pixels[i]     = (100.0 + 80.0 * blob1 + 40.0 * blob2) as u8;
-                pixels[i + 1] = (90.0 + 70.0 * blob2 + 50.0 * blob3) as u8;
-                pixels[i + 2] = (130.0 + 60.0 * blob3 + 50.0 * blob1) as u8;
+                let cx = x as f32 / (w - 1).max(1) as f32;
+                let cy = y as f32 / (h - 1).max(1) as f32;
+                pixels[i] = (100.0 + 120.0 * cx * 0.5 + 40.0 * cy) as u8;
+                pixels[i + 1] = (90.0 + 120.0 * cy * 0.5 + 50.0 * cx) as u8;
+                pixels[i + 2] = (130.0 + 80.0 * (1.0 - cx) + 40.0 * cy) as u8;
                 pixels[i + 3] = 255u8;
             }
         }
@@ -172,7 +229,29 @@ impl Compositor {
         self.height = h;
         self.pyramid.resize(&gfx.device, w, h)?;
         self.background_valid = false;
+        self.pyramid_valid = None;
+        // ResizeBuffers 之后后备缓冲内容未定义，必须整屏重画一次。
+        self.prev_rects.clear();
+        self.has_presented = false;
         Ok(())
+    }
+
+    /// 采集源重建后调用：金字塔与后备缓冲都失效，下一帧必须整屏重来。
+    pub fn invalidate(&mut self) {
+        self.pyramid_valid = None;
+        self.background_valid = false;
+        self.prev_rects.clear();
+        self.has_presented = false;
+    }
+
+    /// 自检用：把下一帧强制变成「全量 Pass A + 全量 Pass B」。
+    pub fn force_full_next(&mut self) {
+        self.pyramid_valid = None;
+        self.background_valid = false;
+        self.prev_rects.clear();
+        self.has_presented = false;
+        self.force_full_always = true;
+        self.shot_at = Some(std::time::Instant::now());
     }
 
     pub fn capture_ready(&self) -> bool {
@@ -207,10 +286,15 @@ impl Compositor {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// 渲染一个显示器画布。`blocks` 必须已经是**该画布局部坐标**，
+    /// `order` 是 `blocks` 的下标（z 升序）—— 多屏时每个画布各自一份。
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         gfx: &Device,
-        manager: &mut Manager,
+        glass: &GlassRenderer,
+        blocks: &[Block],
+        order: &[usize],
         params: &Params,
         cursor_screen: [f32; 2],
         canvas_origin: [f32; 2],
@@ -218,6 +302,9 @@ impl Compositor {
         time: f32,
         press: f32,
         hover_id: Option<u32>,
+        prev_cursor_canvas: [f32; 2],
+        full_redraw: bool,
+        backdrop_dirty: Option<[i32; 4]>,
     ) -> Result<(), String> {
         // 优先使用 WGC 采集帧，无帧时用 fallback 纹理保证玻璃可见。
         // capture_srv 的所有权仍由 compositor 持有，Pass A 只在它失效时更新。
@@ -228,36 +315,296 @@ impl Compositor {
         let Some(capture_srv) = capture_srv else {
             return self.present();
         };
+        if let Some(gpu) = &mut self.gpu {
+            gpu.begin_frame(&gfx.ctx);
+            gpu.mark(&gfx.ctx, 0);
+        }
 
-        // 全屏清成透明黑：flip-model 后备缓冲会保留上一帧内容，
-        // 不清空会在块外留下旧像素（DComp 直接叠加到桌面）。
+        // ---- 脏区推导（方案 12.4.1 / 12.5 的矩形级实现）----
+        // flip-model（FLIP_SEQUENTIAL）后备缓冲逐 buffer 保留内容，因此只需把
+        // 「本帧真正会变的像素」清成透明黑并重画，其余像素沿用上一帧。
+        let cursor_canvas = [
+            cursor_screen[0] - canvas_origin[0],
+            cursor_screen[1] - canvas_origin[1],
+        ];
+        let margin = params.shadow_margin.max(0.0);
+        self.cur_rects.clear();
+        for &index in order {
+            let Some(block) = blocks.get(index) else {
+                continue;
+            };
+            let rt_w = (block.width + margin * 2.0).ceil().max(1.0);
+            let rt_h = (block.height + margin * 2.0).ceil().max(1.0);
+            let sx = (block.x - margin).floor() as i32;
+            let sy = (block.y - margin).floor() as i32;
+            self.cur_rects.push((
+                block.id,
+                [sx, sy, sx + rt_w as i32, sy + rt_h as i32],
+            ));
+        }
+
+        let shot_now = self
+            .shot_at
+            .map_or(false, |at| std::time::Instant::now() >= at);
+        if shot_now {
+            self.shot_at = None;
+        }
+        // Pass A 只需要覆盖「块真正会采样到的像素」：
+        //   块矩形 ⊕ (折射位移 + 色散 + 模糊核 + 速度外推) 的余量。
+        let vel = (drag_velocity[0] * drag_velocity[0]
+            + drag_velocity[1] * drag_velocity[1])
+            .sqrt();
+        let pad = (128.0 + (vel * params.lag_seconds).min(128.0)) as i32;
+        let mut need: Option<[i32; 4]> = None;
+        for &(_, r) in self.cur_rects.iter() {
+            let e = [r[0] - pad, r[1] - pad, r[2] + pad, r[3] + pad];
+            need = Some(match need {
+                None => e,
+                Some(o) => [
+                    o[0].min(e[0]),
+                    o[1].min(e[1]),
+                    o[2].max(e[2]),
+                    o[3].max(e[3]),
+                ],
+            });
+        }
+        let need = need.map(|r| {
+            [
+                r[0].clamp(0, self.width),
+                r[1].clamp(0, self.height),
+                r[2].clamp(0, self.width),
+                r[3].clamp(0, self.height),
+            ]
+        });
+
+        let backdrop_changed = !self.background_valid;
+        // Pass A 的刷新区域（方案 7.4-2 脏矩形金字塔 + 12.5 足迹相交）：
+        //   桌面变了  -> 只重算「DDA 脏矩形 ⊕ 模糊核」∩「块足迹 ⊕ 采样余量」；
+        //                拿不到脏矩形时保守退回整块足迹。
+        //   桌面没变  -> 只有块移动导致足迹外扩时才重算，并外扩 192 px 做迟滞，
+        //                拖拽一小段距离不必重跑金字塔。
+        const BLUR_REACH: i32 = 96;
+        const HYSTERESIS: i32 = 192;
+        let clamp_rect = |r: [i32; 4]| -> [i32; 4] {
+            [
+                r[0].clamp(0, self.width),
+                r[1].clamp(0, self.height),
+                r[2].clamp(0, self.width),
+                r[3].clamp(0, self.height),
+            ]
+        };
+        let covered = match (need, self.pyramid_valid) {
+            (Some(n), Some(v)) => v[0] <= n[0] && v[1] <= n[1] && v[2] >= n[2] && v[3] >= n[3],
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+        let (run_rect, new_valid): (Option<[i32; 4]>, Option<[i32; 4]>) = match need {
+            None => (None, self.pyramid_valid),
+            Some(n) if backdrop_changed => {
+                let region = match backdrop_dirty {
+                    Some(d) => {
+                        let x = [
+                            (d[0] - BLUR_REACH).max(n[0]),
+                            (d[1] - BLUR_REACH).max(n[1]),
+                            (d[2] + BLUR_REACH).min(n[2]),
+                            (d[3] + BLUR_REACH).min(n[3]),
+                        ];
+                        if x[2] > x[0] && x[3] > x[1] {
+                            Some(x)
+                        } else {
+                            None
+                        }
+                    }
+                    None => Some(n),
+                };
+                // 脏区之外的足迹本来就没变，刷新后整个 need 都与当前 capture 一致。
+                (region, Some(n))
+            }
+            Some(_) if covered => (None, self.pyramid_valid),
+            Some(n) => {
+                let r = clamp_rect([
+                    n[0] - HYSTERESIS,
+                    n[1] - HYSTERESIS,
+                    n[2] + HYSTERESIS,
+                    n[3] + HYSTERESIS,
+                ]);
+                let merged = match self.pyramid_valid {
+                    Some(v) => [
+                        v[0].min(r[0]),
+                        v[1].min(r[1]),
+                        v[2].max(r[2]),
+                        v[3].max(r[3]),
+                    ],
+                    None => r,
+                };
+                (Some(r), Some(merged))
+            }
+        };
+
+        if self.cur_rects.is_empty() && self.prev_rects.is_empty() && !full_redraw {
+            // 本屏一块玻璃都没有：整帧短路，不清屏、不 Pass B、不 Present、不 Commit。
+            // 多屏时玻璃常常只集中在其中一两块屏，其余屏必须真正零成本。
+            self.last_dirty_px = 0;
+            self.last_drew_blocks = 0;
+            self.last_pass_a = false;
+            self.last_pass_a_px = 0;
+            return Ok(());
+        }
+
+        // 桌面变化时不必整屏重画：只有「足迹与桌面脏区相交」的块才需要重画
+        // （方案 12.5 的矩形级实现）。拿不到脏矩形时才退回整屏。
+        let full = [0, 0, self.width, self.height];
+        let mut dirty: Option<[i32; 4]> = if full_redraw
+            || self.force_full_always
+            || (shot_now && self.force_full_shot)
+            || !self.has_presented
+            || self.prev_rects.len() != self.cur_rects.len()
+        {
+            Some(full)
+        } else {
+            None
+        };
+        let union = |d: &mut Option<[i32; 4]>, r: [i32; 4]| {
+            *d = Some(match *d {
+                None => r,
+                Some(o) => [
+                    o[0].min(r[0]),
+                    o[1].min(r[1]),
+                    o[2].max(r[2]),
+                    o[3].max(r[3]),
+                ],
+            });
+        };
+        if dirty.is_none() && backdrop_changed {
+            match backdrop_dirty {
+                None => dirty = Some(full),
+                Some(d) => {
+                    // 块采样到的最远像素 = 块矩形 ⊕ pad（折射位移 + 色散 +
+                    // 模糊核 + 速度外推）；桌面变化的影响范围再外扩一个模糊核。
+                    let e = [
+                        d[0] - BLUR_REACH - pad,
+                        d[1] - BLUR_REACH - pad,
+                        d[2] + BLUR_REACH + pad,
+                        d[3] + BLUR_REACH + pad,
+                    ];
+                    for &(_, r) in self.cur_rects.iter() {
+                        if r[0] < e[2] && r[2] > e[0] && r[1] < e[3] && r[3] > e[1] {
+                            union(&mut dirty, r);
+                        }
+                    }
+                }
+            }
+        }
+        if dirty.is_none() {
+            // 位置/尺寸变化的块：旧矩形 ∪ 新矩形都要刷新
+            for &(id, r) in self.cur_rects.iter() {
+                match self.prev_rects.iter().find(|(pid, _)| *pid == id) {
+                    None => union(&mut dirty, r),
+                    Some(&(_, pr)) if pr != r => {
+                        union(&mut dirty, pr);
+                        union(&mut dirty, r);
+                    }
+                    Some(_) => {}
+                }
+            }
+            // 鼠标点光/悬停高光是屏幕空间场：光标扫过的块必须重画
+            // （旧位置要擦掉余晖，新位置要画上余晖）。
+            let influence = (params.mouse_radius * 2.5 + 32.0) as i32;
+            let box_x0 = (prev_cursor_canvas[0].min(cursor_canvas[0]).floor() as i32) - influence;
+            let box_y0 = (prev_cursor_canvas[1].min(cursor_canvas[1]).floor() as i32) - influence;
+            let box_x1 = (prev_cursor_canvas[0].max(cursor_canvas[0]).ceil() as i32) + influence;
+            let box_y1 = (prev_cursor_canvas[1].max(cursor_canvas[1]).ceil() as i32) + influence;
+            for &(_, r) in self.cur_rects.iter() {
+                if r[0] < box_x1 && r[2] > box_x0 && r[1] < box_y1 && r[3] > box_y0 {
+                    union(&mut dirty, r);
+                }
+            }
+        }
+        std::mem::swap(&mut self.prev_rects, &mut self.cur_rects);
+        self.cur_rects.clear();
+
+        let Some(dirty_rect) = dirty else {
+            // 没有任何像素变化：不 Present、不 Commit（事件驱动的终点）。
+            self.last_dirty_px = 0;
+            self.last_drew_blocks = 0;
+            self.last_pass_a = false;
+            self.last_pass_a_px = 0;
+            self.pyramid_valid = new_valid;
+            self.background_valid = true;
+            return Ok(());
+        };
+        let dirty_rect = [
+            dirty_rect[0].clamp(0, self.width),
+            dirty_rect[1].clamp(0, self.height),
+            dirty_rect[2].clamp(0, self.width),
+            dirty_rect[3].clamp(0, self.height),
+        ];
+        if dirty_rect[2] <= dirty_rect[0] || dirty_rect[3] <= dirty_rect[1] {
+            self.last_dirty_px = 0;
+            self.last_drew_blocks = 0;
+            self.last_pass_a = false;
+            self.last_pass_a_px = 0;
+            self.pyramid_valid = new_valid;
+            self.background_valid = true;
+            return Ok(());
+        }
+        self.last_dirty_px = (dirty_rect[2] - dirty_rect[0]) as i64
+            * (dirty_rect[3] - dirty_rect[1]) as i64;
+
+        // 只把脏区清成透明黑；其余像素沿用上一帧的同一张后备缓冲。
         unsafe {
+            gfx.ctx
+                .OMSetRenderTargets(Some(&[Some(self.rt.rtv.clone())]), None);
+            gfx.ctx.RSSetState(glass.raster_state());
+            gfx.ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: self.rt.w as f32,
+                Height: self.rt.h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            gfx.ctx.RSSetScissorRects(Some(&[windows::Win32::Foundation::RECT {
+                left: dirty_rect[0],
+                top: dirty_rect[1],
+                right: dirty_rect[2],
+                bottom: dirty_rect[3],
+            }]));
             gfx.ctx
                 .ClearRenderTargetView(&self.rt.rtv, &[0.0, 0.0, 0.0, 0.0]);
         }
-        // Pass A：全屏共享模糊金字塔。
-        // 关键性能约束：它与块数无关，并且静态背景时不重复执行；
+        // Pass A：全屏共享模糊金字塔，但只刷新 run_rect 内的像素。
         // 鼠标/拖拽只进入 Pass B，不触发整屏 down/up-sample。
-        if !self.background_valid {
+        if let Some(region) = run_rect {
             let t = std::time::Instant::now();
             self.pyramid
-                .run(&gfx.ctx, &capture_srv, self.width, self.height);
+                .run(&gfx.ctx, &capture_srv, self.width, self.height, region);
             self.last_stage_us[0] = t.elapsed().as_micros();
-            self.background_valid = true;
+            self.last_pass_a_px =
+                (region[2] - region[0]) as i64 * (region[3] - region[1]) as i64;
+            self.last_pass_a = true;
         } else {
             self.last_stage_us[0] = 0;
+            self.last_pass_a_px = 0;
+            self.last_pass_a = false;
         }
-        // Pass B：逐块 scissor 绘制
+        self.pyramid_valid = new_valid;
+        self.background_valid = true;
+        if let Some(gpu) = &mut self.gpu {
+            gpu.mark(&gfx.ctx, 1);
+        }
+        // Pass B：逐块 scissor 绘制（只画与脏区相交的块）
         let pass_b_start = std::time::Instant::now();
-        let blocks = manager.blocks_sorted();
-        self.glass.draw_blocks(
+        glass.draw_blocks(
             &gfx.ctx,
             &self.rt.rtv,
             self.rt.w,
             self.rt.h,
             &self.pyramid,
             &capture_srv,
-            &blocks,
+            blocks,
+            order,
+            Some(dirty_rect),
             params,
             self.width as f32,
             self.height as f32,
@@ -269,18 +616,26 @@ impl Compositor {
             hover_id,
         );
         self.last_stage_us[1] = pass_b_start.elapsed().as_micros();
-        if let Ok(path) = std::env::var("GLASS_INTERNAL_SHOT") {
-            if !DEBUG_SHOT_DONE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        self.last_drew_blocks = glass.last_drawn();
+        self.has_presented = true;
+        if let Some(gpu) = &mut self.gpu {
+            gpu.mark(&gfx.ctx, 2);
+        }
+        if shot_now {
+            if let Some(path) = self.shot_path.take() {
                 if let Err(e) = self.save_debug_bmp(gfx, &path) {
                     eprintln!("[warn] internal glass screenshot failed: {e}");
                 } else {
+                    self.shot_fired = true;
                     eprintln!("[info] saved internal glass frame: {path}");
                 }
             }
         }
-        let present_start = std::time::Instant::now();
         let result = self.present();
-        self.last_stage_us[2] = present_start.elapsed().as_micros();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.mark(&gfx.ctx, 3);
+            gpu.end_frame(&gfx.ctx);
+        }
         result
     }
 
@@ -444,8 +799,11 @@ impl Compositor {
     fn present(&mut self) -> Result<(), String> {
         let present_start = std::time::Instant::now();
         self.swap.present()?;
-        self.last_stage_us[3] = present_start.elapsed().as_micros();
-        self.dcomp.commit()
+        self.last_stage_us[2] = present_start.elapsed().as_micros();
+        let commit_start = std::time::Instant::now();
+        let result = self.dcomp.commit();
+        self.last_stage_us[3] = commit_start.elapsed().as_micros();
+        result
     }
 }
 

@@ -12,7 +12,9 @@ pub struct DragState {
     pub id: u32,
     pub kind: DragKind,
     pub start_cursor: [f32; 2],
-    pub origin: [f32; 4], // x, y, w, h
+    /// x, y 为虚拟屏物理像素；w, h 为**逻辑单位**（主屏物理像素），
+    /// 这样跨屏拖拽 / 缩放时不会被按下那一刻的像素尺寸锁死（方案 12.2.5）。
+    pub origin: [f32; 4],
     pub velocity: [f32; 2],
     last_cursor: [f32; 2],
     last_time: f64,
@@ -33,8 +35,9 @@ impl DragState {
         }
     }
 
-    /// 每帧应用一次：返回 (x, y, w, h)
-    pub fn apply(&mut self, cursor: [f32; 2], now: f64) -> [f32; 4] {
+    /// 每帧应用一次：返回 (x, y, w_logical, h_logical)。
+    /// `scale` = 块当前所在屏的 DPI 比例，用于把光标位移换算成逻辑单位。
+    pub fn apply(&mut self, cursor: [f32; 2], now: f64, scale: f32) -> [f32; 4] {
         let dt = (now - self.last_time).max(1e-4) as f32;
         let inst = [
             (cursor[0] - self.last_cursor[0]) / dt,
@@ -55,12 +58,15 @@ impl DragState {
                 self.origin[2],
                 self.origin[3],
             ],
-            DragKind::ResizeSE => [
-                self.origin[0],
-                self.origin[1],
-                (self.origin[2] + dx).max(crate::glass::block::MIN_SIZE),
-                (self.origin[3] + dy).max(crate::glass::block::MIN_SIZE),
-            ],
+            DragKind::ResizeSE => {
+                let s = scale.max(1e-3);
+                [
+                    self.origin[0],
+                    self.origin[1],
+                    (self.origin[2] + dx / s).max(crate::glass::block::MIN_SIZE),
+                    (self.origin[3] + dy / s).max(crate::glass::block::MIN_SIZE),
+                ]
+            }
         }
     }
 

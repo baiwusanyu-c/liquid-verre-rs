@@ -221,6 +221,26 @@ impl Default for Params {
 }
 
 impl Params {
+    /// 按显示器 DPI 比例缩放所有「像素量纲」的参数（方案 12.2.5：跨屏时保持
+    /// 逻辑尺寸不变）。主屏 scale = 1.0，逐字段原样返回，视觉零变化。
+    pub fn scaled(&self, s: f32) -> Params {
+        if (s - 1.0).abs() < 1e-4 {
+            return self.clone();
+        }
+        let mut p = self.clone();
+        p.corner_radius *= s;
+        p.bevel_width *= s;
+        p.thickness *= s;
+        p.blur_max *= s;
+        p.blur_min *= s;
+        p.mouse_radius *= s;
+        p.mouse_spread *= s;
+        p.rim_width *= s;
+        p.shadow_margin *= s;
+        p.sanitize();
+        p
+    }
+
     /// 供控制面板读取 / 写入时的夹紧，防止非法值进入 GPU。
     pub fn sanitize(&mut self) {
         self.corner_radius = self.corner_radius.clamp(0.0, 400.0);

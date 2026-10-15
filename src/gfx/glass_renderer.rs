@@ -51,6 +51,8 @@ pub struct GlassRenderer {
     lut_srv: ID3D11ShaderResourceView,
     /// 环境色 EMA（方案 12.6）
     pub env_ema: [f32; 3],
+    /// 本帧真正执行了 Draw 的块数（metrics 用）
+    drawn: std::cell::Cell<usize>,
 }
 
 impl GlassRenderer {
@@ -151,7 +153,17 @@ impl GlassRenderer {
             lut,
             lut_srv,
             env_ema: [0.35, 0.42, 0.5],
+            drawn: std::cell::Cell::new(0),
         })
+    }
+
+    /// Pass A 的清屏需要与 Pass B 相同的光栅化状态（开启 scissor）。
+    pub fn raster_state(&self) -> &ID3D11RasterizerState {
+        &self.raster
+    }
+
+    pub fn last_drawn(&self) -> usize {
+        self.drawn.get()
     }
 
     pub fn update_lut(&self, ctx: &ID3D11DeviceContext, params: &Params) -> Result<(), String> {
@@ -180,7 +192,9 @@ impl GlassRenderer {
         out_h: i32,
         pyramid: &Pyramid,
         capture: &ID3D11ShaderResourceView,
-        blocks: &[&Block],
+        blocks: &[Block],
+        order: &[usize],
+        dirty: Option<[i32; 4]>,
         params: &Params,
         canvas_w: f32,
         canvas_h: f32,
@@ -191,6 +205,7 @@ impl GlassRenderer {
         press: f32,
         hover_id: Option<u32>,
     ) {
+        self.drawn.set(0);
         let (Some(frost), Some(soft), Some(env16)) = (
             pyramid.frost.as_ref(),
             pyramid.soft.as_ref(),
@@ -244,7 +259,10 @@ impl GlassRenderer {
             ctx.PSSetShaderResources(0, Some(&srvs));
         }
 
-        for block in blocks {
+        for &index in order {
+            let Some(block) = blocks.get(index) else {
+                continue;
+            };
             let mut p = params.clone();
             clamp_for_block(&mut p, block.width, block.height);
             p.corner_radius = block
@@ -271,12 +289,23 @@ impl GlassRenderer {
             if ex <= sx || ey <= sy {
                 continue;
             }
-            let _ = (ex - sx, ey - sy); // 宽高仅用于 scissor 边界检查
+            // 脏矩形裁剪（方案 12.4.1 分级重绘）：与脏区不相交的块本帧完全跳过，
+            // 相交的块把 scissor 收窄到交集，光栅化像素数只与脏区面积相关。
+            let (mut fx0, mut fy0, mut fx1, mut fy1) = (sx, sy, ex, ey);
+            if let Some(d) = dirty {
+                fx0 = fx0.max(d[0]);
+                fy0 = fy0.max(d[1]);
+                fx1 = fx1.min(d[2]);
+                fy1 = fy1.min(d[3]);
+                if fx1 <= fx0 || fy1 <= fy0 {
+                    continue;
+                }
+            }
             let scissor = WinRect {
-                left: sx,
-                top: sy,
-                right: ex,
-                bottom: ey,
+                left: fx0,
+                top: fy0,
+                right: fx1,
+                bottom: fy1,
             };
             unsafe {
                 ctx.RSSetScissorRects(Some(&[scissor]));
@@ -397,6 +426,7 @@ impl GlassRenderer {
             unsafe {
                 ctx.Draw(6, 0);
             }
+            self.drawn.set(self.drawn.get() + 1);
         }
 
         unsafe {

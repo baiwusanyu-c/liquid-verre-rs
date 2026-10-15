@@ -5,15 +5,28 @@
 //! the acquired frame into an owned SRV texture before ReleaseFrame.
 
 use windows::core::Interface;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_FLAG, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_DEFAULT,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_FLAG, D3D11_CPU_ACCESS_READ,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING,
 };
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
-    DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
 };
+
+/// 超过这个数量就直接整屏拷贝：几十个 CopySubresourceRegion 的调用开销
+/// 会超过一次全屏 DMA。
+const MAX_DIRTY_RECTS: usize = 24;
+
+/// AcquireNextFrame 超时是**正常**的「桌面没变化」，不是错误。
+const DXGI_ERROR_WAIT_TIMEOUT: i32 = 0x887A_0027u32 as i32;
+/// 独占全屏切换 / 另一个进程接管 duplication / 显示模式变化都会让它失效，
+/// 方案 4.3 要求检测并退避重试，否则主循环会退化成空转。
+const DXGI_ERROR_ACCESS_LOST: i32 = 0x887A_0026u32 as i32;
 
 pub struct DdaCapture {
     duplication: IDXGIOutputDuplication,
@@ -22,6 +35,28 @@ pub struct DdaCapture {
     pub width: i32,
     pub height: i32,
     last_frame_signature: u64,
+    /// 诊断计数：AcquireNextFrame 成功次数 / 真实内容变化次数 / 纯指针更新次数。
+    pub acquired: u64,
+    pub content_changed: u64,
+    pub pointer_only: u64,
+    /// GetFrameDirtyRects / GetFrameMoveRects 的复用缓冲（热路径零分配）。
+    meta: Vec<u8>,
+    /// 本帧桌面脏矩形列表（output 局部像素坐标），用于局部 CopySubresourceRegion。
+    pub dirty: Vec<[i32; 4]>,
+    /// 本帧实际拷贝了多少像素（metrics）。
+    pub copied_px: i64,
+    /// duplication 已失效，需要由调用方重建（方案 4.3）。
+    pub access_lost: bool,
+    /// GLASS_VERIFY_COPY=1：维护一张「永远整屏 CopyResource」的参考纹理，
+    /// 周期性回读并与局部拷贝结果逐像素比对，自证脏矩形没有漏掉任何区域。
+    verify: bool,
+    verify_tex: Option<ID3D11Texture2D>,
+    verify_stage_a: Option<ID3D11Texture2D>,
+    verify_stage_b: Option<ID3D11Texture2D>,
+    verify_frames: u64,
+    /// 本帧桌面脏区并集（output 局部像素坐标）。
+    /// `None` 表示「内容变了但拿不到脏矩形」，调用方必须按整屏处理。
+    pub dirty_union: Option<[i32; 4]>,
 }
 
 impl DdaCapture {
@@ -39,20 +74,92 @@ impl DdaCapture {
             width: 0,
             height: 0,
             last_frame_signature: 0,
+            acquired: 0,
+            content_changed: 0,
+            pointer_only: 0,
+            meta: Vec::new(),
+            dirty: Vec::new(),
+            dirty_union: None,
+            copied_px: 0,
+            verify: std::env::var("GLASS_VERIFY_COPY").ok().as_deref() == Some("1"),
+            verify_tex: None,
+            verify_stage_a: None,
+            verify_stage_b: None,
+            verify_frames: 0,
+            access_lost: false,
         })
     }
 
+    /// 为**指定显示器**创建 duplication（方案 4.1：每个需要玻璃的显示器一个
+    /// 采集会话，不是每块一个）。不同分辨率/不同 DPI 的屏各自独立。
+    pub fn new_for_monitor(device: &ID3D11Device, hmonitor: HMONITOR) -> Result<Self, String> {
+        let dxgi: IDXGIDevice = device.cast().map_err(|e| format!("IDXGIDevice: {e}"))?;
+        let adapter = unsafe { dxgi.GetAdapter() }.map_err(|e| format!("GetAdapter: {e}"))?;
+        let mut index = 0u32;
+        loop {
+            let output = match unsafe { adapter.EnumOutputs(index) } {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            index += 1;
+            let Ok(desc) = (unsafe { output.GetDesc() }) else {
+                continue;
+            };
+            if desc.Monitor != hmonitor || !desc.AttachedToDesktop.as_bool() {
+                continue;
+            }
+            let output1: IDXGIOutput1 = output.cast().map_err(|e| format!("IDXGIOutput1: {e}"))?;
+            let duplication = unsafe { output1.DuplicateOutput(device) }
+                .map_err(|e| format!("DuplicateOutput: {e}"))?;
+            return Ok(Self {
+                duplication,
+                texture: None,
+                srv: None,
+                width: 0,
+                height: 0,
+                last_frame_signature: 0,
+                acquired: 0,
+                content_changed: 0,
+                pointer_only: 0,
+                meta: Vec::new(),
+                dirty: Vec::new(),
+                dirty_union: None,
+                copied_px: 0,
+                verify: std::env::var("GLASS_VERIFY_COPY").ok().as_deref() == Some("1"),
+                verify_tex: None,
+                verify_stage_a: None,
+                verify_stage_b: None,
+                verify_frames: 0,
+                access_lost: false,
+            });
+        }
+        Err("该显示器上没有可用的 DXGI output（可能挂在另一块显卡上）".to_string())
+    }
+
     /// Acquire and copy the newest desktop frame into an owned texture.
+    ///
+    /// `timeout_ms` 同时充当主循环的阻塞点（方案 12.4.1「以采集帧为主时钟」）：
+    /// 桌面有新内容时立即返回，静止时在驱动里内核等待，CPU 占用趋近 0。
     pub fn try_capture(
         &mut self,
         device: &ID3D11Device,
         ctx: &ID3D11DeviceContext,
+        timeout_ms: u32,
     ) -> Result<Option<(ID3D11Texture2D, i32, i32, bool)>, String> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        let acquired = unsafe { self.duplication.AcquireNextFrame(0, &mut info, &mut resource) };
-        if acquired.is_err() {
-            return Ok(None);
+        let acquired =
+            unsafe { self.duplication.AcquireNextFrame(timeout_ms, &mut info, &mut resource) };
+        if let Err(e) = acquired {
+            let code = e.code().0;
+            if code == DXGI_ERROR_WAIT_TIMEOUT {
+                // 桌面没有新内容：正常的静默返回，调用方据此休眠。
+                return Ok(None);
+            }
+            if code == DXGI_ERROR_ACCESS_LOST {
+                self.access_lost = true;
+            }
+            return Err(format!("AcquireNextFrame(0x{code:08X}): {e}"));
         }
         let result = (|| -> Result<Option<(ID3D11Texture2D, i32, i32, bool)>, String> {
             let Some(resource) = resource else { return Ok(None); };
@@ -89,22 +196,247 @@ impl DdaCapture {
                 self.width = desc.Width as i32;
                 self.height = desc.Height as i32;
             }
-            let owned = self.texture.as_ref().ok_or("DDA texture missing")?;
-            unsafe { ctx.CopyResource(owned, &frame); }
-            // AccumulatedFrames==0 can be pointer-only metadata. The desktop
-            // texture still remains valid, but avoid rebuilding Pass A unless
-            // duplication reports actual desktop content.
-            let signature = info.LastPresentTime as u64;
-            // Pointer-only acquisitions have LastPresentTime=0: never replace
-            // the remembered desktop timestamp with zero or refresh the blur.
-            let changed = recreate
-                || (signature != 0 && signature != self.last_frame_signature);
-            if signature != 0 {
-                self.last_frame_signature = signature;
+            let owned = self.texture.as_ref().ok_or("DDA texture missing")?.clone();
+            // 桌面内容是否真的变了（方案 12.4.1 的 NEW_BACKDROP 判据）。
+            //
+            // 旧实现用 `LastPresentTime` 当帧签名 —— 但 DWM 每个 vsync 都会推进
+            // 该时间戳，于是「静止桌面」也被判成每帧都变，Pass A（整屏模糊，
+            // 约 2.6 个全屏当量）在 110 fps 下被无谓地跑了 110 次/秒。
+            // 正确判据是 duplication 自己的元数据：
+            //   AccumulatedFrames      > 0  -> 累积了真实桌面更新
+            //   TotalMetadataBufferSize > 0  -> 带 dirty/move rect 的内容更新
+            // 两者都为 0 时只是指针形状/位置更新，桌面纹理内容未变，
+            // 连 26 MB 的 CopyResource 都可以省掉（owned 纹理仍是上一帧内容）。
+            let content_changed = recreate
+                || info.AccumulatedFrames > 0
+                || info.TotalMetadataBufferSize > 0;
+            self.acquired += 1;
+            if content_changed {
+                self.content_changed += 1;
+            } else {
+                self.pointer_only += 1;
             }
-            Ok(Some((owned.clone(), self.width, self.height, changed)))
+            if content_changed {
+                // 先取脏矩形，再决定拷贝范围：桌面局部更新（打字、光标闪烁、
+                // 播放中的视频窗口）时只搬那几块，而不是整张 26 MB 桌面纹理。
+                let d = self.collect_dirty(&info);
+                self.dirty_union = d;
+                let full_area = (desc.Width as i64) * (desc.Height as i64);
+                let union_area = d.map_or(i64::MAX, |r| {
+                    (r[2] - r[0]).max(0) as i64 * (r[3] - r[1]).max(0) as i64
+                });
+                let use_partial = !recreate
+                    && d.is_some()
+                    && !self.dirty.is_empty()
+                    && self.dirty.len() <= MAX_DIRTY_RECTS
+                    && union_area * 2 < full_area;
+                if use_partial {
+                    let mut copied = 0i64;
+                    for r in self.dirty.iter() {
+                        let left = r[0].clamp(0, desc.Width as i32) as u32;
+                        let top = r[1].clamp(0, desc.Height as i32) as u32;
+                        let right = r[2].clamp(0, desc.Width as i32) as u32;
+                        let bottom = r[3].clamp(0, desc.Height as i32) as u32;
+                        if right <= left || bottom <= top {
+                            continue;
+                        }
+                        let box_ = D3D11_BOX {
+                            left,
+                            top,
+                            right,
+                            bottom,
+                            front: 0,
+                            back: 1,
+                        };
+                        unsafe {
+                            ctx.CopySubresourceRegion(
+                                &owned, 0, left, top, 0, &frame, 0, Some(&box_),
+                            );
+                        }
+                        copied += (right - left) as i64 * (bottom - top) as i64;
+                    }
+                    self.copied_px = copied;
+                } else {
+                    unsafe { ctx.CopyResource(&owned, &frame); }
+                    self.copied_px = full_area;
+                }
+                if self.verify {
+                    self.verify_step(device, ctx, &owned, &frame, &desc);
+                }
+                self.last_frame_signature =
+                    self.last_frame_signature.wrapping_add(1);
+            } else {
+                self.dirty_union = None;
+                self.copied_px = 0;
+            }
+            Ok(Some((owned, self.width, self.height, content_changed)))
         })();
         let _ = unsafe { self.duplication.ReleaseFrame() };
         result
+    }
+
+    /// 参考纹理 = 每帧整屏 CopyResource；每 120 个内容帧回读比对一次。
+    fn verify_step(
+        &mut self,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        owned: &ID3D11Texture2D,
+        frame: &ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+    ) {
+        unsafe {
+            if self.verify_tex.is_none() {
+                let mut ref_desc = *desc;
+                ref_desc.Usage = D3D11_USAGE_DEFAULT;
+                ref_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
+                ref_desc.CPUAccessFlags = 0;
+                ref_desc.MiscFlags = 0;
+                ref_desc.MipLevels = 1;
+                let mut tex = None;
+                if device.CreateTexture2D(&ref_desc, None, Some(&mut tex)).is_err() {
+                    self.verify = false;
+                    return;
+                }
+                self.verify_tex = tex;
+                let mut stage_desc = *desc;
+                stage_desc.Usage = D3D11_USAGE_STAGING;
+                stage_desc.BindFlags = 0;
+                stage_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+                stage_desc.MiscFlags = 0;
+                stage_desc.MipLevels = 1;
+                let mut sa = None;
+                let mut sb = None;
+                if device.CreateTexture2D(&stage_desc, None, Some(&mut sa)).is_err()
+                    || device.CreateTexture2D(&stage_desc, None, Some(&mut sb)).is_err()
+                {
+                    self.verify = false;
+                    return;
+                }
+                self.verify_stage_a = sa;
+                self.verify_stage_b = sb;
+            }
+            let Some(reference) = self.verify_tex.clone() else { return };
+            ctx.CopyResource(&reference, frame);
+            self.verify_frames += 1;
+            if self.verify_frames % 120 != 0 {
+                return;
+            }
+            let (Some(sa), Some(sb)) =
+                (self.verify_stage_a.clone(), self.verify_stage_b.clone())
+            else {
+                return;
+            };
+            ctx.CopyResource(&sa, owned);
+            ctx.CopyResource(&sb, &reference);
+            let mut ma = D3D11_MAPPED_SUBRESOURCE::default();
+            let mut mb = D3D11_MAPPED_SUBRESOURCE::default();
+            if ctx.Map(&sa, 0, D3D11_MAP_READ, 0, Some(&mut ma)).is_err() {
+                return;
+            }
+            if ctx.Map(&sb, 0, D3D11_MAP_READ, 0, Some(&mut mb)).is_err() {
+                ctx.Unmap(&sa, 0);
+                return;
+            }
+            let row = desc.Width as usize * 4;
+            let mut mismatch = 0usize;
+            let mut first = None;
+            for y in 0..desc.Height as usize {
+                let ra = std::slice::from_raw_parts(
+                    (ma.pData as *const u8).add(y * ma.RowPitch as usize),
+                    row,
+                );
+                let rb = std::slice::from_raw_parts(
+                    (mb.pData as *const u8).add(y * mb.RowPitch as usize),
+                    row,
+                );
+                for x in (0..row).step_by(4) {
+                    if ra[x] != rb[x] || ra[x + 1] != rb[x + 1] || ra[x + 2] != rb[x + 2] {
+                        mismatch += 1;
+                        if first.is_none() {
+                            first = Some((x / 4, y));
+                        }
+                    }
+                }
+            }
+            ctx.Unmap(&sa, 0);
+            ctx.Unmap(&sb, 0);
+            eprintln!(
+                "[verify-copy] frames={} mismatch_px={} first={:?} -> {}",
+                self.verify_frames,
+                mismatch,
+                first,
+                if mismatch == 0 { "PASS" } else { "FAIL" }
+            );
+        }
+    }
+
+    /// 收集本帧的脏矩形（dirty + move 的源与目标），返回并集。
+    /// 方案 7.4-2 / 12.5：只有真正变化的桌面区域需要重算模糊金字塔。
+    fn collect_dirty(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO) -> Option<[i32; 4]> {
+        let size = info.TotalMetadataBufferSize;
+        if size == 0 {
+            return None;
+        }
+        if self.meta.len() < size as usize {
+            self.meta.resize(size as usize, 0);
+        }
+        let mut union: Option<[i32; 4]> = None;
+        self.dirty.clear();
+        fn add(u: &mut Option<[i32; 4]>, r: [i32; 4]) {
+            *u = Some(match *u {
+                None => r,
+                Some(o) => [
+                    o[0].min(r[0]),
+                    o[1].min(r[1]),
+                    o[2].max(r[2]),
+                    o[3].max(r[3]),
+                ],
+            });
+        }
+        let ptr = self.meta.as_mut_ptr();
+        unsafe {
+            let mut n: u32 = 0;
+            if self
+                .duplication
+                .GetFrameDirtyRects(size, ptr as *mut RECT, &mut n)
+                .is_ok()
+            {
+                for i in 0..n as usize {
+                    let r = *(ptr as *const RECT).add(i);
+                    let rect = [r.left, r.top, r.right, r.bottom];
+                    add(&mut union, rect);
+                    if self.dirty.len() < MAX_DIRTY_RECTS + 1 {
+                        self.dirty.push(rect);
+                    }
+                }
+            }
+            let mut m: u32 = 0;
+            if self
+                .duplication
+                .GetFrameMoveRects(size, ptr as *mut DXGI_OUTDUPL_MOVE_RECT, &mut m)
+                .is_ok()
+            {
+                for i in 0..m as usize {
+                    let mv = *(ptr as *const DXGI_OUTDUPL_MOVE_RECT).add(i);
+                    let d = mv.DestinationRect;
+                    let w = d.right - d.left;
+                    let h = d.bottom - d.top;
+                    let dst = [d.left, d.top, d.right, d.bottom];
+                    let src = [
+                        mv.SourcePoint.x,
+                        mv.SourcePoint.y,
+                        mv.SourcePoint.x + w,
+                        mv.SourcePoint.y + h,
+                    ];
+                    add(&mut union, dst);
+                    add(&mut union, src);
+                    if self.dirty.len() < MAX_DIRTY_RECTS + 1 {
+                        self.dirty.push(dst);
+                        self.dirty.push(src);
+                    }
+                }
+            }
+        }
+        union
     }
 }

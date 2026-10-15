@@ -1,3 +1,11 @@
+//! [未接入 / 当前不参与编译]
+//! 方案 4.1 的 WGC（Windows.Graphics.Capture）采集后端。`capture/mod.rs` 目前只挂载
+//! `dda`：实测本机 DDA + `WDA_EXCLUDEFROMCAPTURE` 既无自反馈也无黑块，且方案 12.3
+//! 指出 DDA 通常比 WGC 低 2~5 ms 延迟，故以 DDA 为主。
+//! 若要按方案 10.5 做 `pick_backend()` 兜底链，需要：
+//!   1) 在 `capture/mod.rs` 里 `pub mod slot; pub mod wgc;`
+//!   2) 在 Cargo.toml 打开 `Graphics_Capture` / `Graphics_DirectX` 等 WinRT feature
+//!   3) 验证该 build 上 WDA 对 WGC 是否表现为「完全消失」而非「黑块」（方案 4.2 M1 验收项）
 //! Windows.Graphics.Capture 自由线程采集（方案 4.1）。
 //!
 //! 关键点：

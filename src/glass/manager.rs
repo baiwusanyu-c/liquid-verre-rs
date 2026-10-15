@@ -6,8 +6,6 @@ use crate::glass::params::Params;
 pub struct Manager {
     blocks: Vec<Block>,
     next_id: u32,
-    order: Vec<usize>,
-    order_dirty: bool,
 }
 
 impl Default for Manager {
@@ -15,8 +13,6 @@ impl Default for Manager {
         Self {
             blocks: Vec::new(),
             next_id: 1,
-            order: Vec::new(),
-            order_dirty: true,
         }
     }
 }
@@ -38,7 +34,6 @@ impl Manager {
         let mut b = Block::new(id, x, y, width, height);
         b.clamp();
         self.blocks.push(b);
-        self.order_dirty = true;
         id
     }
 
@@ -65,17 +60,11 @@ impl Manager {
     pub fn remove(&mut self, id: u32) -> bool {
         let before = self.blocks.len();
         self.blocks.retain(|b| b.id != id);
-        let changed = self.blocks.len() != before;
-        if changed {
-            self.order_dirty = true;
-        }
-        changed
+        self.blocks.len() != before
     }
 
     pub fn clear(&mut self) {
         self.blocks.clear();
-        self.order.clear();
-        self.order_dirty = false;
     }
 
     pub fn get(&self, id: u32) -> Option<&Block> {
@@ -95,30 +84,12 @@ impl Manager {
             .map(|b| b.id)
     }
 
-    /// 供渲染使用的块列表，按 z 升序。
-    /// 当前块数很小，但每帧排序会制造临时 Vec；调用方可缓存此顺序。
-    pub fn draw_order(&self) -> Vec<&Block> {
-        let mut v: Vec<&Block> = self.blocks.iter().collect();
-        v.sort_by_key(|b| b.z_order);
-        v
-    }
-
-    pub fn blocks_sorted(&mut self) -> Vec<&Block> {
-        if self.order_dirty {
-            self.order = (0..self.blocks.len()).collect();
-            self.order.sort_by_key(|&i| self.blocks[i].z_order);
-            self.order_dirty = false;
-        }
-        self.order.iter().map(|&i| &self.blocks[i]).collect()
-    }
-
     pub fn bring_to_front(&mut self, id: u32, params: &Params) {
         let _ = params;
         let max_z = self.blocks.iter().map(|b| b.z_order).max().unwrap_or(0);
         if let Some(b) = self.get_mut(id) {
             if b.z_order < max_z {
                 b.z_order = max_z + 1;
-                self.order_dirty = true;
             }
         }
     }

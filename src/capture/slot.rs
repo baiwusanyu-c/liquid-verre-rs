@@ -1,3 +1,4 @@
+//! [未接入 / 当前不参与编译] WGC 后端的最新帧发布槽位，随 `wgc.rs` 一起启用。
 //! 最新采集帧的发布槽位（方案 3.2）。
 
 use std::sync::atomic::{AtomicU64, Ordering};

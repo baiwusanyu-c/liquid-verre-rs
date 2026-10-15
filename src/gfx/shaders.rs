@@ -13,7 +13,6 @@ pub const BLUR_VS: &str = include_str!("../../shaders/blur_vs.hlsl");
 pub const GLASS_PS: &str = include_str!("../../shaders/glass_ps.hlsl");
 pub const BLUR_DOWN: &str = include_str!("../../shaders/blur_down.hlsl");
 pub const BLUR_UP: &str = include_str!("../../shaders/blur_up.hlsl");
-pub const BLUR_COPY: &str = include_str!("../../shaders/blur_copy.hlsl");
 
 pub fn compile(src: &str, entry: &str, target: &str) -> Result<ID3DBlob, String> {
     let entry_c = std::ffi::CString::new(entry).unwrap();

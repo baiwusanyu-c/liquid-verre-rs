@@ -1,63 +1,77 @@
 # liquid-glass —— Windows 桌面液态玻璃
 
 严格按《折射渲染方案》v1.1 实现的 Windows 桌面「液态玻璃块」叠加层。
-原生 **WGC + D3D11 + DirectComposition** 管线，不依赖任何 WebView / 前端运行时。
+原生 **DDA + D3D11 + DirectComposition** 管线，不依赖任何 WebView / 前端运行时。
+**多显示器**：每块屏独立采集、独立金字塔、独立画布，分辨率与 DPI 各不相同也各自正确。
 
 ## 架构
 
 ```
-WGC(Graphics Capture API) 采集主显示器
-    -> 1 份共享 D3D11 纹理（CreateFreeThreaded，零拷贝包装）
-    -> 全屏共享模糊金字塔（dual-filter 4 级）+ 块分辨率模糊层 + 1/16 环境色探针
-    -> 单全屏画布（DirectComposition）+ 每个玻璃块一次 scissor 绘制
-    -> 一次 Present + 一次 Commit
+每块显示器（EnumDisplayMonitors + GetDpiForMonitor）
+  ├─ 1 个 DXGI Desktop Duplication（按 HMONITOR 匹配 DXGI output）
+  │     └─ 脏矩形 -> 只 CopySubresourceRegion 变化的区域，不整屏搬 26 MB
+  ├─ 1 份该屏分辨率的共享 D3D11 纹理
+  ├─ 1 套该屏的模糊金字塔，只刷新「DDA 脏矩形 ∩ 块足迹 ⊕ 采样余量」
+  └─ 1 个全屏画布窗口（WS_EX_NOREDIRECTIONBITMAP + WDA_EXCLUDEFROMCAPTURE）
+        └─ 每块玻璃一次 scissor 绘制，只画与脏区相交的块
+        └─ 一次 Present + 一次 DComp Commit
 ```
 
 ### 为什么 20+ 块不卡顿
 
 | 关键点 | 实现 |
 |---|---|
-| 整屏只采集一次 | `src/capture/wgc.rs`，采集成本 O(屏幕)，与块数无关 |
-| 模糊只算一次 | `src/gfx/pyramid.rs`，全屏共享，与块数无关 |
+| 整屏只采集一次 | `src/capture/dda.rs`，成本 O(屏幕)，与块数无关 |
+| **只搬变化的像素** | `GetFrameDirtyRects` / `GetFrameMoveRects` -> 逐矩形 `CopySubresourceRegion` |
+| **模糊只算块看得见的地方** | `src/gfx/pyramid.rs`，Pass A 的 scissor = 桌面脏区 ∩ 块足迹 |
+| **只重画真的变了的块** | `src/gfx/compositor.rs`，Pass B 脏区 = 块位移 ∪ 鼠标点光影响范围 ∪ 桌面脏区 |
 | 每块只画自己的矩形 | `src/gfx/glass_renderer.rs`，per-block viewport + scissor |
-| 位移交给 DWM | 拖动只改窗口/块坐标，不重建位图 |
-| 单设备单交换链 | 一次 Present / 一次 DComp Commit，与块数无关 |
+| 位移交给 DWM | 拖动只改块矩形，不重建位图、不 `ResizeBuffers` |
+| 单设备、每屏一次 Present | 一次 Present / 一次 DComp Commit，与块数无关 |
+| **没有玻璃的屏整帧短路** | 不清屏、不 Pass B、不 Present、不 Commit |
+| **事件驱动** | 无触发源就整帧跳过；静止桌面不 Present、不 Commit |
 | 自反馈根治 | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` |
+| 拖拽期零 `SetWindowRgn` | 按下时一次性扩到整窗，抬起后收紧 |
 
 ### 渲染管线（逐帧）
 
-- **Pass A**（全屏一次）
-  - 下采样：采集纹理 → 1/2 → 1/4 → 1/8 → 1/16（4-tap 角点，`shaders/blur_down.hlsl`）
-  - 上采样：1/16 → 1/8 → 1/4 → 1/2（8-tap tent，`shaders/blur_up.hlsl`）
-  - 块分辨率模糊层：整屏 → 1/2 → 1/2 → 整屏（强模糊 `frost`），另存轻模糊 `soft`
-    > 这一步是相对方案的补强：1/16 层被放大到块尺寸会出现方块颗粒，
-    > 因此在块像素分辨率上再生成一对模糊层，由 `radiusPx` 做二维插值。
-  - 环境色探针：1/16 副本，供自适应染色（GPU 侧，不回读）
+- **门控**：新桌面帧 / 参数变化 / 几何变化 / hover 变化 / 光标进入点光影响半径 /
+  拖拽 / 速度未收敛 / 窗口消息 —— 全为空则整帧跳过。
+- **Pass A**（每屏，仅在需要时）
+  - 下采样：采集纹理 -> 1/2 -> 1/4 -> 1/8 -> 1/16（4-tap 角点，`shaders/blur_down.hlsl`）
+  - 块分辨率模糊层：整屏 -> 1/2 -> 1/2 ×4 次 tent -> 整屏（强模糊 `frost`）
+    > `soft` 与 `frost` 内容逐像素相同，共享同一份 RT/SRV。
+    > 1/16 层直接兼作环境色探针，不再额外拷贝。
+  - 全程 scissor 到「桌面脏区 ∩ 块足迹」，与整屏无关。
 - **Pass B**（每块一次，`shaders/glass_ps.hlsl`）
   - SDF：圆角矩形（精确欧氏）或 squircle（超椭圆）
   - 斜面 LUT：`[slope, tanTheta2]` 256 项 `StructuredBuffer`，CPU 侧由 `src/glass/sdf.rs` 生成
-  - Snell 折射：`offset_px = -grad * tanTheta2 * thickness * refr_strength`
-  - RGB 色散：`tan2 * (1 ∓ δ)` 三次采样
-  - 毛玻璃 ↔ 全透：`clarity` 控制模糊量与清晰混合，边缘始终保留折射（`edgeAlways`）
-  - Beer-Lambert 吸收、Fresnel-Schlick、焦散亮带、鼠标点光、自适应染色
-  - LOD-3：<32×32 的块关闭折射/焦散/鼠标光，只保留模糊 + 描边 + 高光
+  - Snell 折射、RGB 色散、Beer-Lambert 吸收、Fresnel-Schlick、焦散亮带、鼠标点光、自适应染色
+  - 毛玻璃 ↔ 全透：`clarity` 连续控制，边缘始终保留折射（`edgeAlways`）
+  - LOD-3：<32×32 的块关闭折射/焦散/鼠标光
+
+### 多显示器与 DPI
+
+- 块几何以**主屏物理像素**为逻辑单位；落到 scale = `dpi / 主屏 dpi` 的屏上按该比例换算，
+  物理观感保持一致（方案 12.2.5）。主屏 scale 恒为 1.0，因此主屏视觉与单屏版本逐位一致。
+- 默认**钳制在单屏内**（方案 12.10 策略 ①）：块中心越过边界即换屏并按比例换算尺寸，
+  不做跨屏大玻璃，因此不存在两屏采样不连续的接缝问题。
+- `WM_DISPLAYCHANGE` / `WM_DPICHANGED` -> 重建全部画布与采集，块自动重新归位。
+- 采集失效（锁屏安全桌面 / 独占全屏 / 被其他录屏软件抢占）时按 500 ms 退避重建，
+  恢复后自动继续，主循环有速率下限，任何异常下都不会空转。
 
 ## 中文控制面板
 
-启动后自动出现「液态玻璃 · 控制面板」（Win32 原生控件）。
+启动后自动开启一个本地 HTTP 服务并用系统浏览器打开「液态玻璃 · 控制面板」。
 
-- **玻璃块**：宽度 / 高度输入框；`＋ 添加一块`、`＋ 添加 20 块`、`删除最后一块`、`清空全部`
-- **折射与光学参数**：全部通过 **slider（Trackbar）** 实时调节
-  - 圆角半径、透镜覆盖、折射率 IOR、玻璃厚度、折射强度、色散
-  - 清晰度、模糊半径
-  - 高光强度、高光锐度、Fresnel、焦散增益
-  - 染色浓度、自适应染色
-  - 鼠标高光、鼠标半径
-  - 阴影强度
+- **玻璃块**：宽度 / 高度（逻辑单位，跨屏自动换算）；`＋ 添加一块`、`＋ 添加 20 块`、`删除最后一块`、`清空全部`
+- **折射与光学参数**：圆角半径、透镜覆盖、折射率 IOR、玻璃厚度、折射强度、色散、
+  清晰度、模糊半径、高光强度/锐度、Fresnel、焦散增益、染色浓度、自适应染色、
+  鼠标高光/半径、阴影强度
 
 交互：
 
-- 拖动玻璃块任意位置移动；右下角拖拽缩放
+- 拖动玻璃块任意位置移动；右下角拖拽缩放；可直接拖到另一块显示器
 - 点击某块即选中，面板的宽度/高度/圆角作用于该块
 - 快捷键：`+` 增一块、`-` 删一块、`Esc` 退出
 
@@ -69,40 +83,73 @@ WGC(Graphics Capture API) 采集主显示器
 cargo run --release
 ```
 
-### 环境变量
+### 环境变量（全部只影响诊断/布局，不影响视觉）
 
 | 变量 | 作用 |
 |---|---|
-| `GLASS_VISIBLE=1` | 关闭抓屏排除，便于截图 / 录屏验证视觉 |
-| `GLASS_SHOT=<ms>` | 启动后指定毫秒抓一张整屏 BMP 到 `%TEMP%\liquid-glass-shot.bmp` |
+| `GLASS_METRICS=1` | 每 5 秒墙钟窗口输出 CPU / 脏区 / Pass A / DDA / 帧率统计 |
+| `GLASS_GPU_TIMINGS=1` | 额外打开 D3D11 timestamp 计时。**会打断驱动批处理、显著拖慢管线**，只在专门做 GPU 归因时开 |
+| `GLASS_MANY=1` | 启动即 20 块自动布局 |
+| `GLASS_SPREAD=1` | 每块显示器正中各放一块玻璃（多屏验收） |
+| `GLASS_FRAME_LATENCY=<1..8>` | DXGI 渲染队列深度，默认 1（方案 7.4-7，降低光标到画面的滞后） |
+| `GLASS_FORCE_FULL=1` | 关闭 Pass B 脏矩形，每帧整屏重画（A/B 对照） |
+| `GLASS_INTERNAL_SHOT=<path>` | 输出内部取证图（合成结果 / overlay / capture / frost） |
+| `GLASS_INTERNAL_SHOT_AT_MS=<ms>` | 延迟取证，配合下面两项才能测到脏矩形路径 |
+| `GLASS_VERIFY_PASS_A=1` | 同进程再渲一帧「全量 Pass A + 整屏 Pass B」，输出 `.full.bmp` 对照图 |
+| `GLASS_VERIFY_COPY=1` | 并行维护整屏拷贝的参考纹理，周期性逐像素比对局部拷贝结果 |
+| `GLASS_EXTREME_SPEC=1` | 极端高光回归（`spec_intensity=4.0`、`spec_power=1.0`） |
+
+### 自检脚本
+
+```powershell
+python tools/perf_probe.py --case all --seconds 12 --warmup 4 --out tools/final.json
+python tools/verify_dirty.py         # 脏矩形渲染 vs 全量渲染，逐像素
+python tools/verify_crossscreen.py   # 跨屏拖拽 + DPI 换算验收
+```
 
 ## 项目结构
 
 ```
 liquid-glass/
-├─ Cargo.toml
-├─ build.rs
+├─ Cargo.toml / build.rs
 ├─ shaders/
-│  ├─ glass_vs.hlsl         # 逐块矩形全屏三角形，SV_Position 为整屏像素坐标
+│  ├─ glass_vs.hlsl         # 逐块矩形 -> 裁剪空间；SV_Position 为画布像素坐标
 │  ├─ glass_ps.hlsl         # SDF + Snell 折射 + 色散 + Fresnel + 焦散 + 鼠标光
 │  ├─ blur_down.hlsl        # 4-tap 角点下采样
 │  ├─ blur_up.hlsl          # 8-tap tent 上采样
-│  └─ reduce_env.hlsl       # 环境色探针
-└─ src/
-   ├─ main.rs               # 窗口、消息循环、每帧调度
-   ├─ capture/              # WGC 采集 + 最新帧槽位
-   ├─ gfx/                  # 设备 / 着色器 / 金字塔 / 逐块绘制 / DComp / 交换链
-   ├─ glass/                # 参数、SDF/LUT、块模型、管理器
-   ├─ input/                # 光标轮询、拖拽状态机
-   └─ ui/                   # 中文控制面板 + 开发期截图辅助
+│  └─ reduce_env.hlsl       # 备用：独立 pass 版环境色探针（未接入管线）
+├─ src/
+│  ├─ main.rs               # 多屏画布管理、消息循环、事件驱动调度、脏区门控
+│  ├─ capture/dda.rs        # 每屏一个 duplication + 脏矩形 + 局部拷贝 + 失效退避重建
+│  ├─ gfx/
+│  │  ├─ monitors.rs        # 显示器枚举（物理几何 + 每屏 DPI）
+│  │  ├─ device.rs          # D3D11 设备 / DXGI 工厂 / 帧队列深度
+│  │  ├─ shaders.rs         # HLSL 编译与状态对象
+│  │  ├─ pyramid.rs         # Pass A：可裁剪的共享模糊金字塔
+│  │  ├─ glass_renderer.rs  # Pass B：逐块 scissor 绘制
+│  │  ├─ compositor.rs      # 画布、脏区推导、分级重绘、取证
+│  │  ├─ gpu_timer.rs       # D3D11 timestamp（方案 7.6）
+│  │  ├─ dcomp.rs / swapchain.rs
+│  ├─ glass/                # 参数（含 DPI 缩放）、SDF/LUT、块模型、管理器
+│  ├─ input/                # 光标轮询、拖拽状态机（逻辑单位，跨屏安全）
+│  └─ ui/                   # 中文控制面板（内嵌 HTTP）
+└─ tools/                   # 性能探针与逐像素自证脚本
 ```
 
-## 实测（本机 3120×2080，20 块）
+## 实测（本机 3120×2080@120 Hz/200% + 1920×1080@100%，桌面持续重绘 47~110 次/秒）
 
-| 指标 | 实测 |
-|---|---|
-| D3D11 设备 | 硬件（`warp=false`） |
-| 渲染 / 采集帧 | 1200 / 568（12 秒内持续推进） |
-| CPU | ≈0.4% 单核当量 |
-| Release 进程 RSS | ≈67 MB |
-| Release 二进制 | 0.38 MB |
+| 指标 | 改造前（单屏） | 改造后（单屏折算） |
+|---|---|---|
+| Pass A / 帧 | 6.49 Mpx，每帧必跑 | **0.79 Mpx**，最低 **0 次/帧** |
+| Pass B 脏区 / 帧 | 6.49 Mpx（整屏） | **0.50 Mpx**（单块）/ 1.5~2.0 Mpx（20 块） |
+| DDA 拷贝 / 帧 | 6.49 Mpx（整屏） | 1.7~4.0 Mpx（脏矩形） |
+| CPU render 均值 | 0.294 ms | **0.094~0.118 ms** |
+| CPU render 峰值 | 17~31 ms | **0.66~0.94 ms** |
+| 常驻 Private | 182.7 MB | **128.4 MB** |
+| 20 块静止 CPU | 8.83% 单核 | **5.32%** |
+| 20 块拖拽 CPU | 12.34% 单核 | **3.57~10.02%** |
+| 锁屏 / 采集失效 | **83.25%**（96 kHz 空转） | **0.469%** |
+
+视觉零变化取证：Pass A 重构前后 overlay **0 / 6,489,600 像素差异**；
+脏矩形路径 vs 全量路径 **6/6 场景 0 差异**；局部拷贝 vs 整屏参考拷贝 **7 轮 840 帧 0 差异**；
+多屏改造前后主屏 overlay **alpha 通道 0 差异**。详见 `performance_report.md`。

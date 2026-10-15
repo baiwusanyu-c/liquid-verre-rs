@@ -13,3 +13,13 @@ src-tauri/gen/schemas/
 *.log
 tools/enc-test.txt
 tools/repl-test.txt
+
+# 性能探针 / 逐像素取证的产物（体积大，不入库）
+tools/*.bmp
+tools/*.png
+tools/*.log
+tools/_*.py
+tools/_*.rs
+
+# IDE
+.idea/

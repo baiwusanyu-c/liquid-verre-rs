@@ -1,0 +1,246 @@
+[
+ {
+  "case": "single-idle",
+  "pid": 30696,
+  "screen": [
+   3120,
+   2080
+  ],
+  "warmup_s": 3.0,
+  "measure_s": 10.0,
+  "drag": false,
+  "idle": {
+   "wall_s": 10.083,
+   "cpu_pct_of_one_core": 8.83,
+   "working_set_mb": 194.7,
+   "working_set_avg_mb": 194.7,
+   "private_mb": 182.7,
+   "gpu_dedicated_mb": 0.0,
+   "metrics": [
+    {
+     "blocks": 1,
+     "frames": 530,
+     "avg_render_ms": 0.355,
+     "max_render_ms": 31.192,
+     "max_loop_ms": 37.394,
+     "stage_us": [
+      50,
+      9,
+      56,
+      36
+     ]
+    },
+    {
+     "blocks": 1,
+     "frames": 572,
+     "avg_render_ms": 0.234,
+     "max_render_ms": 28.071,
+     "max_loop_ms": 29.95,
+     "stage_us": [
+      36,
+      7,
+      45,
+      31
+     ]
+    }
+   ]
+  },
+  "stderr_tail": [
+   "[metrics] blocks=1 frames=530 avg_render_ms=0.355 max_render_ms=31.192 max_loop_ms=37.394 stage_us=A50 B9 P56 C36",
+   "[metrics] blocks=1 frames=572 avg_render_ms=0.234 max_render_ms=28.071 max_loop_ms=29.950 stage_us=A36 B7 P45 C31"
+  ]
+ },
+ {
+  "case": "single-drag",
+  "pid": 39440,
+  "screen": [
+   3120,
+   2080
+  ],
+  "warmup_s": 3.0,
+  "measure_s": 10.0,
+  "drag": {
+   "wall_s": 10.005,
+   "cpu_pct_of_one_core": 18.58,
+   "probe_max_step_ms": 7.59,
+   "metrics": [
+    {
+     "blocks": 1,
+     "frames": 552,
+     "avg_render_ms": 0.759,
+     "max_render_ms": 27.033,
+     "max_loop_ms": 179.29,
+     "stage_us": [
+      30,
+      6,
+      37,
+      29
+     ]
+    },
+    {
+     "blocks": 1,
+     "frames": 499,
+     "avg_render_ms": 3.295,
+     "max_render_ms": 40.124,
+     "max_loop_ms": 52.646,
+     "stage_us": [
+      0,
+      8,
+      15426,
+      15414
+     ]
+    }
+   ]
+  },
+  "idle": {
+   "wall_s": 4.064,
+   "cpu_pct_of_one_core": 16.15,
+   "working_set_mb": 194.9,
+   "working_set_avg_mb": 194.8,
+   "private_mb": 183.5,
+   "gpu_dedicated_mb": 0.0,
+   "metrics": [
+    {
+     "blocks": 1,
+     "frames": 562,
+     "avg_render_ms": 0.254,
+     "max_render_ms": 19.274,
+     "max_loop_ms": 31.133,
+     "stage_us": [
+      28,
+      5,
+      39,
+      27
+     ]
+    }
+   ]
+  },
+  "stderr_tail": [
+   "[metrics] blocks=1 frames=562 avg_render_ms=0.254 max_render_ms=19.274 max_loop_ms=31.133 stage_us=A28 B5 P39 C27",
+   "[metrics] blocks=1 frames=552 avg_render_ms=0.759 max_render_ms=27.033 max_loop_ms=179.290 stage_us=A30 B6 P37 C29",
+   "[metrics] blocks=1 frames=499 avg_render_ms=3.295 max_render_ms=40.124 max_loop_ms=52.646 stage_us=A0 B8 P15426 C15414"
+  ]
+ },
+ {
+  "case": "many-idle",
+  "pid": 40096,
+  "screen": [
+   3120,
+   2080
+  ],
+  "warmup_s": 3.0,
+  "measure_s": 10.0,
+  "drag": false,
+  "idle": {
+   "wall_s": 10.083,
+   "cpu_pct_of_one_core": 8.83,
+   "working_set_mb": 194.8,
+   "working_set_avg_mb": 194.8,
+   "private_mb": 183.7,
+   "gpu_dedicated_mb": 0.0,
+   "metrics": [
+    {
+     "blocks": 20,
+     "frames": 354,
+     "avg_render_ms": 0.249,
+     "max_render_ms": 17.114,
+     "max_loop_ms": 41.141,
+     "stage_us": [
+      43,
+      17,
+      55,
+      38
+     ]
+    },
+    {
+     "blocks": 20,
+     "frames": 359,
+     "avg_render_ms": 0.199,
+     "max_render_ms": 18.608,
+     "max_loop_ms": 46.424,
+     "stage_us": [
+      42,
+      18,
+      48,
+      33
+     ]
+    }
+   ]
+  },
+  "stderr_tail": [
+   "[metrics] blocks=20 frames=354 avg_render_ms=0.249 max_render_ms=17.114 max_loop_ms=41.141 stage_us=A43 B17 P55 C38",
+   "[metrics] blocks=20 frames=359 avg_render_ms=0.199 max_render_ms=18.608 max_loop_ms=46.424 stage_us=A42 B18 P48 C33"
+  ]
+ },
+ {
+  "case": "many-drag",
+  "pid": 15576,
+  "screen": [
+   3120,
+   2080
+  ],
+  "warmup_s": 3.0,
+  "measure_s": 10.0,
+  "drag": {
+   "wall_s": 10.005,
+   "cpu_pct_of_one_core": 12.34,
+   "probe_max_step_ms": 8.92,
+   "metrics": [
+    {
+     "blocks": 20,
+     "frames": 349,
+     "avg_render_ms": 0.568,
+     "max_render_ms": 23.519,
+     "max_loop_ms": 190.403,
+     "stage_us": [
+      38,
+      18,
+      41,
+      30
+     ]
+    },
+    {
+     "blocks": 20,
+     "frames": 365,
+     "avg_render_ms": 2.297,
+     "max_render_ms": 27.048,
+     "max_loop_ms": 59.055,
+     "stage_us": [
+      72,
+      37,
+      73,
+      58
+     ]
+    }
+   ]
+  },
+  "idle": {
+   "wall_s": 4.062,
+   "cpu_pct_of_one_core": 6.92,
+   "working_set_mb": 194.8,
+   "working_set_avg_mb": 194.0,
+   "private_mb": 182.7,
+   "gpu_dedicated_mb": 0.0,
+   "metrics": [
+    {
+     "blocks": 20,
+     "frames": 358,
+     "avg_render_ms": 0.134,
+     "max_render_ms": 1.834,
+     "max_loop_ms": 47.235,
+     "stage_us": [
+      52,
+      27,
+      117,
+      98
+     ]
+    }
+   ]
+  },
+  "stderr_tail": [
+   "[metrics] blocks=20 frames=358 avg_render_ms=0.134 max_render_ms=1.834 max_loop_ms=47.235 stage_us=A52 B27 P117 C98",
+   "[metrics] blocks=20 frames=349 avg_render_ms=0.568 max_render_ms=23.519 max_loop_ms=190.403 stage_us=A38 B18 P41 C30",
+   "[metrics] blocks=20 frames=365 avg_render_ms=2.297 max_render_ms=27.048 max_loop_ms=59.055 stage_us=A72 B37 P73 C58"
+  ]
+ }
+]

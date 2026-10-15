@@ -1,0 +1,124 @@
+[
+ {
+  "case": "single-idle",
+  "pid": 29764,
+  "screen": [
+   3120,
+   2080
+  ],
+  "warmup_s": 4.0,
+  "measure_s": 12.0,
+  "drag": false,
+  "idle": {
+   "wall_s": 12.042,
+   "cpu_pct_of_one_core": 7.14,
+   "working_set_mb": 166.2,
+   "working_set_avg_mb": 166.2,
+   "private_mb": 156.2,
+   "gpu_dedicated_mb": 222.6,
+   "metrics": []
+  },
+  "stderr_tail": [
+   "[info] 显示器: \\\\.\\DISPLAY1 3120x2080@(0,0) dpi=192 scale=1.00 [主屏] | \\\\.\\DISPLAY2 1920x1080@(3120,0) dpi=96 scale=0.50",
+   "[info] \\\\.\\DISPLAY1 画布已显示 (3120x2080)",
+   "[info] \\\\.\\DISPLAY2 画布已显示 (1920x1080)",
+   "[metrics] win_s=5.01 screens=2 blocks=1 loops=289 frames=280 fps=55.9 idle=9 avg_render_ms=0.763 max_render_ms=30.541 max_loop_ms=48.601 stage_us=A39 B7 P73 C16 dirty_mpx_avg=0.504 dirty_mpx_max=1.008 blocks_avg=0.5 pass_a=0.99/frame pass_a_mpx_avg=0.788 dda_acq=83.0/s dda_changed=60.9/s copy_mpx_avg=3.298 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.03 screens=2 blocks=1 loops=329 frames=323 fps=64.3 idle=6 avg_render_ms=0.646 max_render_ms=22.724 max_loop_ms=55.731 stage_us=A25 B6 P42 C10 dirty_mpx_avg=0.504 dirty_mpx_max=1.008 blocks_avg=0.5 pass_a=1.00/frame pass_a_mpx_avg=0.798 dda_acq=88.4/s dda_changed=67.9/s copy_mpx_avg=3.296 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.01 screens=2 blocks=1 loops=330 frames=315 fps=62.9 idle=15 avg_render_ms=0.560 max_render_ms=20.380 max_loop_ms=82.808 stage_us=A31 B8 P61 C14 dirty_mpx_avg=0.504 dirty_mpx_max=1.008 blocks_avg=0.5 pass_a=0.99/frame pass_a_mpx_avg=0.790 dda_acq=89.5/s dda_changed=67.1/s copy_mpx_avg=3.286 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0"
+  ]
+ },
+ {
+  "case": "single-drag",
+  "pid": 17636,
+  "screen": [
+   3120,
+   2080
+  ],
+  "warmup_s": 4.0,
+  "measure_s": 12.0,
+  "drag": {
+   "wall_s": 12.002,
+   "cpu_pct_of_one_core": 12.89,
+   "probe_max_step_ms": 19.65,
+   "metrics": []
+  },
+  "idle": {
+   "wall_s": 4.844,
+   "cpu_pct_of_one_core": 8.71,
+   "working_set_mb": 166.3,
+   "working_set_avg_mb": 166.3,
+   "private_mb": 156.9,
+   "gpu_dedicated_mb": 222.6,
+   "metrics": []
+  },
+  "stderr_tail": [
+   "[info] \\\\.\\DISPLAY1 画布已显示 (3120x2080)",
+   "[info] \\\\.\\DISPLAY2 画布已显示 (1920x1080)",
+   "[metrics] win_s=5.01 screens=2 blocks=1 loops=304 frames=274 fps=54.7 idle=30 avg_render_ms=0.522 max_render_ms=32.937 max_loop_ms=88.841 stage_us=A0 B20 P111 C11 dirty_mpx_avg=0.504 dirty_mpx_max=1.008 blocks_avg=0.5 pass_a=0.07/frame pass_a_mpx_avg=0.051 dda_acq=82.7/s dda_changed=57.9/s copy_mpx_avg=2.463 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.00 screens=2 blocks=1 loops=351 frames=336 fps=67.2 idle=15 avg_render_ms=0.648 max_render_ms=22.402 max_loop_ms=45.505 stage_us=A0 B15 P62 C14 dirty_mpx_avg=0.504 dirty_mpx_max=1.008 blocks_avg=0.5 pass_a=0.00/frame pass_a_mpx_avg=0.000 dda_acq=92.2/s dda_changed=68.8/s copy_mpx_avg=1.747 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.01 screens=2 blocks=1 loops=487 frames=483 fps=96.5 idle=4 avg_render_ms=4.004 max_render_ms=34.904 max_loop_ms=240.782 stage_us=A0 B19 P2793 C14 dirty_mpx_avg=0.507 dirty_mpx_max=1.173 blocks_avg=0.5 pass_a=0.14/frame pass_a_mpx_avg=0.200 dda_acq=82.7/s dda_changed=63.1/s copy_mpx_avg=2.131 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.01 screens=2 blocks=1 loops=559 frames=559 fps=111.6 idle=0 avg_render_ms=4.983 max_render_ms=35.835 max_loop_ms=36.078 stage_us=A0 B10 P1551 C7 dirty_mpx_avg=0.507 dirty_mpx_max=1.048 blocks_avg=0.5 pass_a=0.18/frame pass_a_mpx_avg=0.246 dda_acq=80.3/s dda_changed=59.5/s copy_mpx_avg=2.238 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0"
+  ]
+ },
+ {
+  "case": "many-idle",
+  "pid": 18096,
+  "screen": [
+   3120,
+   2080
+  ],
+  "warmup_s": 4.0,
+  "measure_s": 12.0,
+  "drag": false,
+  "idle": {
+   "wall_s": 12.046,
+   "cpu_pct_of_one_core": 5.32,
+   "working_set_mb": 166.6,
+   "working_set_avg_mb": 166.6,
+   "private_mb": 156.7,
+   "gpu_dedicated_mb": 222.8,
+   "metrics": []
+  },
+  "stderr_tail": [
+   "[info] 显示器: \\\\.\\DISPLAY1 3120x2080@(0,0) dpi=192 scale=1.00 [主屏] | \\\\.\\DISPLAY2 1920x1080@(3120,0) dpi=96 scale=0.50",
+   "[info] \\\\.\\DISPLAY1 画布已显示 (3120x2080)",
+   "[info] \\\\.\\DISPLAY2 画布已显示 (1920x1080)",
+   "[metrics] win_s=5.00 screens=2 blocks=20 loops=280 frames=224 fps=44.8 idle=56 avg_render_ms=0.568 max_render_ms=25.997 max_loop_ms=46.358 stage_us=A66 B13 P77 C20 dirty_mpx_avg=2.018 dirty_mpx_max=4.049 blocks_avg=10.0 pass_a=0.99/frame pass_a_mpx_avg=2.268 dda_acq=78.4/s dda_changed=47.4/s copy_mpx_avg=3.958 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.00 screens=2 blocks=20 loops=294 frames=231 fps=46.2 idle=63 avg_render_ms=0.312 max_render_ms=22.440 max_loop_ms=38.771 stage_us=A36 B17 P54 C16 dirty_mpx_avg=2.024 dirty_mpx_max=4.049 blocks_avg=10.0 pass_a=1.00/frame pass_a_mpx_avg=2.287 dda_acq=80.1/s dda_changed=48.2/s copy_mpx_avg=3.267 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.01 screens=2 blocks=20 loops=294 frames=235 fps=46.9 idle=59 avg_render_ms=0.420 max_render_ms=34.889 max_loop_ms=42.006 stage_us=A399 B337 P169 C18 dirty_mpx_avg=2.024 dirty_mpx_max=4.049 blocks_avg=10.0 pass_a=1.00/frame pass_a_mpx_avg=2.284 dda_acq=79.7/s dda_changed=48.9/s copy_mpx_avg=3.267 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0"
+  ]
+ },
+ {
+  "case": "many-drag",
+  "pid": 27368,
+  "screen": [
+   3120,
+   2080
+  ],
+  "warmup_s": 4.0,
+  "measure_s": 12.0,
+  "drag": {
+   "wall_s": 12.004,
+   "cpu_pct_of_one_core": 10.02,
+   "probe_max_step_ms": 7.67,
+   "metrics": []
+  },
+  "idle": {
+   "wall_s": 4.814,
+   "cpu_pct_of_one_core": 3.57,
+   "working_set_mb": 166.7,
+   "working_set_avg_mb": 166.7,
+   "private_mb": 157.2,
+   "gpu_dedicated_mb": 222.8,
+   "metrics": []
+  },
+  "stderr_tail": [
+   "[info] \\\\.\\DISPLAY1 画布已显示 (3120x2080)",
+   "[info] \\\\.\\DISPLAY2 画布已显示 (1920x1080)",
+   "[metrics] win_s=5.00 screens=2 blocks=20 loops=271 frames=242 fps=48.4 idle=29 avg_render_ms=0.900 max_render_ms=32.814 max_loop_ms=50.594 stage_us=A39 B13 P88 C16 dirty_mpx_avg=1.916 dirty_mpx_max=4.049 blocks_avg=9.7 pass_a=0.90/frame pass_a_mpx_avg=2.061 dda_acq=78.2/s dda_changed=52.2/s copy_mpx_avg=3.330 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.01 screens=2 blocks=20 loops=300 frames=287 fps=57.3 idle=13 avg_render_ms=0.660 max_render_ms=32.233 max_loop_ms=40.039 stage_us=A87 B19 P122 C33 dirty_mpx_avg=2.024 dirty_mpx_max=4.049 blocks_avg=10.0 pass_a=1.00/frame pass_a_mpx_avg=2.278 dda_acq=81.9/s dda_changed=59.3/s copy_mpx_avg=3.281 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.01 screens=2 blocks=20 loops=326 frames=314 fps=62.7 idle=12 avg_render_ms=5.610 max_render_ms=39.512 max_loop_ms=173.088 stage_us=A27 B12 P16886 C13 dirty_mpx_avg=1.649 dirty_mpx_max=4.184 blocks_avg=8.7 pass_a=0.74/frame pass_a_mpx_avg=1.724 dda_acq=67.3/s dda_changed=44.3/s copy_mpx_avg=2.223 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0",
+   "[metrics] win_s=5.02 screens=2 blocks=20 loops=365 frames=365 fps=72.8 idle=0 avg_render_ms=8.117 max_render_ms=40.226 max_loop_ms=42.886 stage_us=A0 B21 P16189 C13 dirty_mpx_avg=1.471 dirty_mpx_max=4.184 blocks_avg=8.0 pass_a=0.59/frame pass_a_mpx_avg=1.386 dda_acq=63.0/s dda_changed=42.9/s copy_mpx_avg=1.773 gpu_ms_avg=A0.000/B0.000/T0.000 gpu_ms_max=A0.000/B0.000/T0.000 gpu_n=0"
+  ]
+ }
+]
