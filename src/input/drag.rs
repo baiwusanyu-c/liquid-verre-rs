@@ -18,7 +18,6 @@ pub struct DragState {
     pub velocity: [f32; 2],
     last_cursor: [f32; 2],
     last_time: f64,
-    pub active: bool,
 }
 
 impl DragState {
@@ -31,7 +30,6 @@ impl DragState {
             velocity: [0.0, 0.0],
             last_cursor: cursor,
             last_time: now,
-            active: true,
         }
     }
 
@@ -68,10 +66,5 @@ impl DragState {
                 ]
             }
         }
-    }
-
-    pub fn end(&mut self) {
-        self.active = false;
-        self.velocity = [0.0, 0.0];
     }
 }

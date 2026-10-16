@@ -14,8 +14,6 @@ use crate::gfx::DComp;
 use crate::glass::block::Block;
 use crate::glass::params::Params;
 
-static DEBUG_SHOT_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// 交换链后备缓冲：只有 RTV（flip-model 后备缓冲不允许创建 SRV）
 struct BackbufferRt {
     tex: ID3D11Texture2D,
@@ -56,15 +54,33 @@ pub struct Compositor {
     pyramid_valid: Option<[i32; 4]>,
     /// 本帧 Pass A 实际覆盖的像素数（metrics）。
     pub last_pass_a_px: i64,
+    /// Pass A 限频（方案 12.4.3 的一档）。`None` = 不限频，此时行为与
+    /// 未引入本机制时**逐位一致**：每个桌面变化帧都重算金字塔。
+    ///
+    /// 限频只影响 `frost`（重模糊层）与 1/16 环境色探针的新鲜度；清晰层
+    /// `gCapture`、块几何、折射位移、色散、高光、鼠标点光、Pass B 全部仍然
+    /// 每帧更新，位置/形状/光照保持零延迟。
+    pass_a_min_interval: Option<std::time::Duration>,
+    last_pass_a_at: std::time::Instant,
+    /// 因限频被跳过的 Pass A 次数（metrics）
+    pub pass_a_throttled: u64,
     /// 调试截图需要整屏内容，强制全量重画。
     force_full_shot: bool,
     /// GLASS_FORCE_FULL=1：关闭脏矩形优化，每帧整屏重画（A/B 对照用）。
     force_full_always: bool,
+    /// 只作用于下一帧的全量重画（自证用，渲染后自动清除）。
+    force_full_once: bool,
     /// GLASS_INTERNAL_SHOT_AT_MS：延迟到该时刻之后的第一帧再截图，
     /// 用于验证脏矩形路径（首帧本来就是整屏重画，测不出差异）。
     shot_at: Option<std::time::Instant>,
     /// 已经提交过至少一帧（首帧必须全量）。
     has_presented: bool,
+    /// 性能归因开关：分别跳过 Pass A / Pass B / Present，用来定位 GPU 瓶颈。
+    /// 会让画面不正确，**只用于实验**，默认全关。
+    pub skip_pass_a: bool,
+    pub skip_pass_b: bool,
+    pub skip_present: bool,
+    pub skip_clear: bool,
     /// GLASS_INTERNAL_SHOT 的输出路径（拍完即取走）。
     pub shot_path: Option<String>,
     /// 是否已经拍出这一帧（供 GLASS_VERIFY_PASS_A 自检串联第二次全量渲染）。
@@ -118,8 +134,24 @@ impl Compositor {
             last_pass_a: false,
             pyramid_valid: None,
             last_pass_a_px: 0,
+            pass_a_min_interval: {
+                let hz: f64 = std::env::var("GLASS_PASS_A_HZ")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0);
+                if hz > 0.0 {
+                    eprintln!("[info] Pass A 限频 = {hz:.0} Hz（GLASS_PASS_A_HZ）");
+                    Some(std::time::Duration::from_secs_f64(1.0 / hz))
+                } else {
+                    None
+                }
+            },
+            last_pass_a_at: std::time::Instant::now()
+                - std::time::Duration::from_secs(3600),
+            pass_a_throttled: 0,
             force_full_shot: std::env::var("GLASS_INTERNAL_SHOT").is_ok(),
             force_full_always: std::env::var("GLASS_FORCE_FULL").ok().as_deref() == Some("1"),
+            force_full_once: false,
             // 未指定延迟时默认「首帧即拍」，与旧实现一致。
             shot_at: std::env::var("GLASS_INTERNAL_SHOT").ok().map(|_| {
                 let delay = std::env::var("GLASS_INTERNAL_SHOT_AT_MS")
@@ -129,6 +161,10 @@ impl Compositor {
                 std::time::Instant::now() + std::time::Duration::from_millis(delay)
             }),
             has_presented: false,
+            skip_pass_a: std::env::var("GLASS_SKIP_PASS_A").ok().as_deref() == Some("1"),
+            skip_pass_b: std::env::var("GLASS_SKIP_PASS_B").ok().as_deref() == Some("1"),
+            skip_present: std::env::var("GLASS_SKIP_PRESENT").ok().as_deref() == Some("1"),
+            skip_clear: std::env::var("GLASS_SKIP_CLEAR").ok().as_deref() == Some("1"),
             shot_path: std::env::var("GLASS_INTERNAL_SHOT").ok(),
             shot_fired: false,
         })
@@ -236,6 +272,16 @@ impl Compositor {
         Ok(())
     }
 
+    /// 自适应质量 level 1：frost 半分辨率档的运行期开关。
+    pub fn set_frost_half(&mut self, gfx: &Device, on: bool) -> Result<bool, String> {
+        let before = self.pyramid.frost_half_mode();
+        self.pyramid.set_frost_half_mode(&gfx.device, on)?;
+        if before != on {
+            self.invalidate();
+        }
+        Ok(before != on)
+    }
+
     /// 采集源重建后调用：金字塔与后备缓冲都失效，下一帧必须整屏重来。
     pub fn invalidate(&mut self) {
         self.pyramid_valid = None;
@@ -244,13 +290,22 @@ impl Compositor {
         self.has_presented = false;
     }
 
+    /// 解除 Pass A 限频的一次性豁免：自证对照帧必须跑完整金字塔。
+    pub fn pass_a_now(&mut self) {
+        self.last_pass_a_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(3600);
+    }
+
     /// 自检用：把下一帧强制变成「全量 Pass A + 全量 Pass B」。
     pub fn force_full_next(&mut self) {
         self.pyramid_valid = None;
         self.background_valid = false;
         self.prev_rects.clear();
         self.has_presented = false;
-        self.force_full_always = true;
+        self.force_full_once = true;
+        self.pass_a_now();
+        // 同一帧第二次渲染必须复用完全相同的环境色 EMA 结果
+        self.pyramid.set_env_freeze(true);
         self.shot_at = Some(std::time::Instant::now());
     }
 
@@ -454,8 +509,10 @@ impl Compositor {
         // 桌面变化时不必整屏重画：只有「足迹与桌面脏区相交」的块才需要重画
         // （方案 12.5 的矩形级实现）。拿不到脏矩形时才退回整屏。
         let full = [0, 0, self.width, self.height];
+        let force_full = self.force_full_always || self.force_full_once;
+        self.force_full_once = false;
         let mut dirty: Option<[i32; 4]> = if full_redraw
-            || self.force_full_always
+            || force_full
             || (shot_now && self.force_full_shot)
             || !self.has_presented
             || self.prev_rects.len() != self.cur_rects.len()
@@ -570,31 +627,58 @@ impl Compositor {
                 right: dirty_rect[2],
                 bottom: dirty_rect[3],
             }]));
-            gfx.ctx
-                .ClearRenderTargetView(&self.rt.rtv, &[0.0, 0.0, 0.0, 0.0]);
+            if !self.skip_clear {
+                gfx.ctx
+                    .ClearRenderTargetView(&self.rt.rtv, &[0.0, 0.0, 0.0, 0.0]);
+            }
         }
         // Pass A：全屏共享模糊金字塔，但只刷新 run_rect 内的像素。
         // 鼠标/拖拽只进入 Pass B，不触发整屏 down/up-sample。
-        if let Some(region) = run_rect {
-            let t = std::time::Instant::now();
-            self.pyramid
-                .run(&gfx.ctx, &capture_srv, self.width, self.height, region);
-            self.last_stage_us[0] = t.elapsed().as_micros();
-            self.last_pass_a_px =
-                (region[2] - region[0]) as i64 * (region[3] - region[1]) as i64;
-            self.last_pass_a = true;
-        } else {
+        // Pass A 限频：被跳过的帧沿用上一份金字塔，且**不**把 background_valid
+        // 置真，这样下一帧会继续尝试，直到限频窗口过去。
+        let throttled = run_rect.is_some()
+            && !self.skip_pass_a
+            && self
+                .pass_a_min_interval
+                .map_or(false, |iv| self.last_pass_a_at.elapsed() < iv);
+        if throttled {
+            self.pass_a_throttled += 1;
             self.last_stage_us[0] = 0;
             self.last_pass_a_px = 0;
             self.last_pass_a = false;
+        } else {
+            if let Some(region) = run_rect.filter(|_| !self.skip_pass_a) {
+                let t = std::time::Instant::now();
+                // 环境色 EMA 用「块足迹」而不是本次刷新区：足迹在块静止时稳定，
+                // EMA 历史才不会被反复重置（方案 12.6）。
+                self.pyramid.run(
+                    &gfx.ctx,
+                    &capture_srv,
+                    self.width,
+                    self.height,
+                    region,
+                    need.unwrap_or(region),
+                );
+                self.last_stage_us[0] = t.elapsed().as_micros();
+                self.last_pass_a_px =
+                    (region[2] - region[0]) as i64 * (region[3] - region[1]) as i64;
+                self.last_pass_a = true;
+                self.last_pass_a_at = std::time::Instant::now();
+            } else {
+                self.last_stage_us[0] = 0;
+                self.last_pass_a_px = 0;
+                self.last_pass_a = false;
+            }
+            self.pyramid_valid = new_valid;
+            self.background_valid = true;
         }
-        self.pyramid_valid = new_valid;
-        self.background_valid = true;
+        self.pyramid.set_env_freeze(false);
         if let Some(gpu) = &mut self.gpu {
             gpu.mark(&gfx.ctx, 1);
         }
         // Pass B：逐块 scissor 绘制（只画与脏区相交的块）
         let pass_b_start = std::time::Instant::now();
+        if !self.skip_pass_b {
         glass.draw_blocks(
             &gfx.ctx,
             &self.rt.rtv,
@@ -615,6 +699,7 @@ impl Compositor {
             press,
             hover_id,
         );
+        }
         self.last_stage_us[1] = pass_b_start.elapsed().as_micros();
         self.last_drew_blocks = glass.last_drawn();
         self.has_presented = true;
@@ -797,6 +882,11 @@ impl Compositor {
     }
 
     fn present(&mut self) -> Result<(), String> {
+        if self.skip_present {
+            self.last_stage_us[2] = 0;
+            self.last_stage_us[3] = 0;
+            return Ok(());
+        }
         let present_start = std::time::Instant::now();
         self.swap.present()?;
         self.last_stage_us[2] = present_start.elapsed().as_micros();

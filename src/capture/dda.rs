@@ -22,11 +22,75 @@ use windows::Win32::Graphics::Dxgi::{
 /// 会超过一次全屏 DMA。
 const MAX_DIRTY_RECTS: usize = 24;
 
+/// 局部拷贝策略（`GLASS_COPY_MODE`），用于判定"N 次小拷贝"与"1 次并集大拷贝"
+/// 哪个在本机驱动上更便宜：
+///   multi（默认）= 逐脏矩形 CopySubresourceRegion，超过 24 个退回整屏
+///   union        = 只拷脏矩形并集 bbox 一次
+///   full         = 永远整屏 CopyResource
+#[derive(Clone, Copy, PartialEq)]
+pub enum CopyMode {
+    Multi,
+    Union,
+    Full,
+}
+
+/// `GLASS_SIM_DIRTY=<w>x<h>@<n>`：用 n 个固定尺寸、确定性散布的脏矩形取代
+/// 真实脏矩形，使"逐矩形拷 vs 并集拷 vs 整屏拷"的对比在完全相同的搬运量下进行。
+fn sim_dirty(out_w: i32, out_h: i32) -> Option<Vec<[i32; 4]>> {
+    let v = std::env::var("GLASS_SIM_DIRTY").ok()?;
+    let (wh, n) = v.split_once('@')?;
+    let (w, h) = wh.split_once('x')?;
+    let (w, h, n) = (w.parse::<i32>().ok()?, h.parse::<i32>().ok()?, n.parse::<usize>().ok()?);
+    if w <= 0 || h <= 0 || n == 0 {
+        return None;
+    }
+    // 紧凑网格而不是全屏散布：散布会让并集 bbox 超过半屏，从而触发
+    // "并集太大就退回整屏拷贝"的保护，实验就测不到逐矩形拷贝了。
+    let cols = (n as f64).sqrt().ceil().max(1.0) as i32;
+    let rows = ((n as i32) + cols - 1) / cols;
+    let grid_w = (cols * w).min(out_w);
+    let grid_h = (rows * h).min(out_h);
+    let x0 = ((out_w - grid_w) / 2).max(0);
+    let y0 = ((out_h - grid_h) / 2).max(0);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n as i32 {
+        let x = x0 + (i % cols) * w;
+        let y = y0 + (i / cols) * h;
+        out.push([
+            x.clamp(0, out_w),
+            y.clamp(0, out_h),
+            (x + w).clamp(0, out_w),
+            (y + h).clamp(0, out_h),
+        ]);
+    }
+    Some(out)
+}
+
+fn copy_mode() -> CopyMode {
+    match std::env::var("GLASS_COPY_MODE").ok().as_deref() {
+        Some("union") => CopyMode::Union,
+        Some("full") => CopyMode::Full,
+        _ => CopyMode::Multi,
+    }
+}
+
 /// AcquireNextFrame 超时是**正常**的「桌面没变化」，不是错误。
 const DXGI_ERROR_WAIT_TIMEOUT: i32 = 0x887A_0027u32 as i32;
 /// 独占全屏切换 / 另一个进程接管 duplication / 显示模式变化都会让它失效，
 /// 方案 4.3 要求检测并退避重试，否则主循环会退化成空转。
 const DXGI_ERROR_ACCESS_LOST: i32 = 0x887A_0026u32 as i32;
+
+fn union_add(u: &mut Option<[i32; 4]>, r: [i32; 4]) {
+    *u = Some(match *u {
+        None => r,
+        Some(o) => [
+            o[0].min(r[0]),
+            o[1].min(r[1]),
+            o[2].max(r[2]),
+            o[3].max(r[3]),
+        ],
+    });
+}
 
 pub struct DdaCapture {
     duplication: IDXGIOutputDuplication,
@@ -47,6 +111,25 @@ pub struct DdaCapture {
     pub copied_px: i64,
     /// duplication 已失效，需要由调用方重建（方案 4.3）。
     pub access_lost: bool,
+    /// 本帧 dirty/copy 段耗时，用于从 t_pre 里扣掉（避免重复计入）
+    t_dirty_us_last: u128,
+    t_copy_us_last: u128,
+    copy_mode: CopyMode,
+    /// 归因用：跳过实际像素搬运，只保留 AcquireNextFrame + 脏矩形读取
+    skip_copy: bool,
+    /// 归因用：连脏矩形读取（GetFrameDirtyRects/MoveRects）也跳过，
+    /// 用来把 cap 段的耗时精确归到 AcquireNextFrame 还是脏矩形 API 上。
+    skip_dirty: bool,
+    /// 采集段三段细分耗时累加（µs）：AcquireNextFrame / 脏矩形读取 / 像素搬运。
+    /// 用来区分"驱动 API 阻塞"与"我们自己的拷贝开销"。
+    pub t_acq_us: u128,
+    pub t_dirty_us: u128,
+    pub t_copy_us: u128,
+    pub t_acq_max_us: u128,
+    /// 取帧前置（QI/GetDesc/必要时重建纹理）与 ReleaseFrame
+    pub t_pre_us: u128,
+    pub t_rel_us: u128,
+    pub t_rel_max_us: u128,
     /// GLASS_VERIFY_COPY=1：维护一张「永远整屏 CopyResource」的参考纹理，
     /// 周期性回读并与局部拷贝结果逐像素比对，自证脏矩形没有漏掉任何区域。
     verify: bool,
@@ -60,36 +143,6 @@ pub struct DdaCapture {
 }
 
 impl DdaCapture {
-    pub fn new(device: &ID3D11Device) -> Result<Self, String> {
-        let dxgi: IDXGIDevice = device.cast().map_err(|e| format!("IDXGIDevice: {e}"))?;
-        let adapter = unsafe { dxgi.GetAdapter() }.map_err(|e| format!("GetAdapter: {e}"))?;
-        let output = unsafe { adapter.EnumOutputs(0) }.map_err(|e| format!("EnumOutputs: {e}"))?;
-        let output1: IDXGIOutput1 = output.cast().map_err(|e| format!("IDXGIOutput1: {e}"))?;
-        let duplication = unsafe { output1.DuplicateOutput(device) }
-            .map_err(|e| format!("DuplicateOutput: {e}"))?;
-        Ok(Self {
-            duplication,
-            texture: None,
-            srv: None,
-            width: 0,
-            height: 0,
-            last_frame_signature: 0,
-            acquired: 0,
-            content_changed: 0,
-            pointer_only: 0,
-            meta: Vec::new(),
-            dirty: Vec::new(),
-            dirty_union: None,
-            copied_px: 0,
-            verify: std::env::var("GLASS_VERIFY_COPY").ok().as_deref() == Some("1"),
-            verify_tex: None,
-            verify_stage_a: None,
-            verify_stage_b: None,
-            verify_frames: 0,
-            access_lost: false,
-        })
-    }
-
     /// 为**指定显示器**创建 duplication（方案 4.1：每个需要玻璃的显示器一个
     /// 采集会话，不是每块一个）。不同分辨率/不同 DPI 的屏各自独立。
     pub fn new_for_monitor(device: &ID3D11Device, hmonitor: HMONITOR) -> Result<Self, String> {
@@ -131,6 +184,18 @@ impl DdaCapture {
                 verify_stage_b: None,
                 verify_frames: 0,
                 access_lost: false,
+                t_dirty_us_last: 0,
+                t_copy_us_last: 0,
+                copy_mode: copy_mode(),
+                skip_copy: std::env::var("GLASS_SKIP_COPY").ok().as_deref() == Some("1"),
+                skip_dirty: std::env::var("GLASS_SKIP_DIRTY").ok().as_deref() == Some("1"),
+                t_acq_us: 0,
+                t_dirty_us: 0,
+                t_copy_us: 0,
+                t_acq_max_us: 0,
+                t_pre_us: 0,
+                t_rel_us: 0,
+                t_rel_max_us: 0,
             });
         }
         Err("该显示器上没有可用的 DXGI output（可能挂在另一块显卡上）".to_string())
@@ -148,8 +213,12 @@ impl DdaCapture {
     ) -> Result<Option<(ID3D11Texture2D, i32, i32, bool)>, String> {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
+        let t0 = std::time::Instant::now();
         let acquired =
             unsafe { self.duplication.AcquireNextFrame(timeout_ms, &mut info, &mut resource) };
+        let acq_us = t0.elapsed().as_micros();
+        self.t_acq_us += acq_us;
+        self.t_acq_max_us = self.t_acq_max_us.max(acq_us);
         if let Err(e) = acquired {
             let code = e.code().0;
             if code == DXGI_ERROR_WAIT_TIMEOUT {
@@ -161,6 +230,7 @@ impl DdaCapture {
             }
             return Err(format!("AcquireNextFrame(0x{code:08X}): {e}"));
         }
+        let tp0 = std::time::Instant::now();
         let result = (|| -> Result<Option<(ID3D11Texture2D, i32, i32, bool)>, String> {
             let Some(resource) = resource else { return Ok(None); };
             let frame: ID3D11Texture2D = resource.cast().map_err(|e| format!("DDA texture: {e}"))?;
@@ -210,6 +280,7 @@ impl DdaCapture {
             let content_changed = recreate
                 || info.AccumulatedFrames > 0
                 || info.TotalMetadataBufferSize > 0;
+            let skip_copy = self.skip_copy && !recreate;
             self.acquired += 1;
             if content_changed {
                 self.content_changed += 1;
@@ -219,18 +290,45 @@ impl DdaCapture {
             if content_changed {
                 // 先取脏矩形，再决定拷贝范围：桌面局部更新（打字、光标闪烁、
                 // 播放中的视频窗口）时只搬那几块，而不是整张 26 MB 桌面纹理。
+                let td0 = std::time::Instant::now();
                 let d = self.collect_dirty(&info);
                 self.dirty_union = d;
+                let d_us = td0.elapsed().as_micros();
+                self.t_dirty_us += d_us;
+                self.t_dirty_us_last = d_us;
+                let tc0 = std::time::Instant::now();
                 let full_area = (desc.Width as i64) * (desc.Height as i64);
                 let union_area = d.map_or(i64::MAX, |r| {
                     (r[2] - r[0]).max(0) as i64 * (r[3] - r[1]).max(0) as i64
                 });
-                let use_partial = !recreate
+                let use_partial = !skip_copy
+                    && !recreate
+                    && self.copy_mode != CopyMode::Full
                     && d.is_some()
                     && !self.dirty.is_empty()
-                    && self.dirty.len() <= MAX_DIRTY_RECTS
+                    && (self.copy_mode == CopyMode::Union
+                        || self.dirty.len() <= MAX_DIRTY_RECTS)
                     && union_area * 2 < full_area;
-                if use_partial {
+                if use_partial && self.copy_mode == CopyMode::Union {
+                    // 只拷并集 bbox：1 次驱动调用，代价是可能搬一些没变的像素
+                    let u = d.unwrap();
+                    let left = u[0].clamp(0, desc.Width as i32) as u32;
+                    let top = u[1].clamp(0, desc.Height as i32) as u32;
+                    let right = u[2].clamp(0, desc.Width as i32) as u32;
+                    let bottom = u[3].clamp(0, desc.Height as i32) as u32;
+                    if right > left && bottom > top {
+                        let box_ = D3D11_BOX { left, top, right, bottom, front: 0, back: 1 };
+                        unsafe {
+                            ctx.CopySubresourceRegion(
+                                &owned, 0, left, top, 0, &frame, 0, Some(&box_),
+                            );
+                        }
+                        self.copied_px = (right - left) as i64 * (bottom - top) as i64;
+                    } else {
+                        unsafe { ctx.CopyResource(&owned, &frame); }
+                        self.copied_px = full_area;
+                    }
+                } else if use_partial {
                     let mut copied = 0i64;
                     for r in self.dirty.iter() {
                         let left = r[0].clamp(0, desc.Width as i32) as u32;
@@ -256,10 +354,15 @@ impl DdaCapture {
                         copied += (right - left) as i64 * (bottom - top) as i64;
                     }
                     self.copied_px = copied;
-                } else {
+                } else if !skip_copy {
                     unsafe { ctx.CopyResource(&owned, &frame); }
                     self.copied_px = full_area;
+                } else {
+                    self.copied_px = 0;
                 }
+                let c_us = tc0.elapsed().as_micros();
+                self.t_copy_us += c_us;
+                self.t_copy_us_last = c_us;
                 if self.verify {
                     self.verify_step(device, ctx, &owned, &frame, &desc);
                 }
@@ -271,7 +374,14 @@ impl DdaCapture {
             }
             Ok(Some((owned, self.width, self.height, content_changed)))
         })();
+        self.t_pre_us += tp0.elapsed().as_micros()
+            .saturating_sub(self.t_dirty_us_last)
+            .saturating_sub(self.t_copy_us_last);
+        let tr0 = std::time::Instant::now();
         let _ = unsafe { self.duplication.ReleaseFrame() };
+        let rel = tr0.elapsed().as_micros();
+        self.t_rel_us += rel;
+        self.t_rel_max_us = self.t_rel_max_us.max(rel);
         result
     }
 
@@ -373,6 +483,9 @@ impl DdaCapture {
     /// 收集本帧的脏矩形（dirty + move 的源与目标），返回并集。
     /// 方案 7.4-2 / 12.5：只有真正变化的桌面区域需要重算模糊金字塔。
     fn collect_dirty(&mut self, info: &DXGI_OUTDUPL_FRAME_INFO) -> Option<[i32; 4]> {
+        if self.skip_dirty {
+            return None;
+        }
         let size = info.TotalMetadataBufferSize;
         if size == 0 {
             return None;
@@ -382,19 +495,16 @@ impl DdaCapture {
         }
         let mut union: Option<[i32; 4]> = None;
         self.dirty.clear();
-        fn add(u: &mut Option<[i32; 4]>, r: [i32; 4]) {
-            *u = Some(match *u {
-                None => r,
-                Some(o) => [
-                    o[0].min(r[0]),
-                    o[1].min(r[1]),
-                    o[2].max(r[2]),
-                    o[3].max(r[3]),
-                ],
-            });
-        }
         let ptr = self.meta.as_mut_ptr();
         unsafe {
+            if let Some(sim) = sim_dirty(self.width.max(1), self.height.max(1)) {
+                self.dirty = sim;
+                let mut u: Option<[i32; 4]> = None;
+                for r in self.dirty.iter() {
+                    union_add(&mut u, *r);
+                }
+                return u;
+            }
             let mut n: u32 = 0;
             if self
                 .duplication
@@ -404,7 +514,7 @@ impl DdaCapture {
                 for i in 0..n as usize {
                     let r = *(ptr as *const RECT).add(i);
                     let rect = [r.left, r.top, r.right, r.bottom];
-                    add(&mut union, rect);
+                    union_add(&mut union, rect);
                     if self.dirty.len() < MAX_DIRTY_RECTS + 1 {
                         self.dirty.push(rect);
                     }
@@ -428,8 +538,8 @@ impl DdaCapture {
                         mv.SourcePoint.x + w,
                         mv.SourcePoint.y + h,
                     ];
-                    add(&mut union, dst);
-                    add(&mut union, src);
+                    union_add(&mut union, dst);
+                    union_add(&mut union, src);
                     if self.dirty.len() < MAX_DIRTY_RECTS + 1 {
                         self.dirty.push(dst);
                         self.dirty.push(src);

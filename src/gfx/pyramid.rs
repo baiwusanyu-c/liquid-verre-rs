@@ -48,10 +48,29 @@ pub struct Pyramid {
     pub frost: Option<RenderTarget>,
     /// 轻模糊层。与 `frost` 共享同一份资源（见文件头说明）。
     pub soft: Option<RenderTarget>,
-    /// 1/16 环境色探针，直接指向 down[3]
-    pub env16: Option<RenderTarget>,
+    /// 1/16 环境色探针的时域平滑 ping-pong（方案 12.6 / R-20）
+    env_rt: Vec<RenderTarget>,
+    /// 最新 EMA 结果所在的下标；-1 表示还没有历史
+    env_latest: std::cell::Cell<i8>,
+    /// 上次 EMA 覆盖的全屏坐标矩形，用于判断是否需要重置历史
+    env_region: std::cell::Cell<[i32; 4]>,
+    /// 上次跑 EMA 的时刻，用于按真实 dt 计算 alpha
+    env_last: std::cell::Cell<std::time::Instant>,
+    env_enabled: bool,
+    env_tau: f32,
+    /// `GLASS_FROST_HALF=1`：`frost`/`soft` 直接指向 1/2 分辨率的模糊结果，
+    /// 省掉 Pass A 里那次整屏 8-tap tent 上采样（约 1.0 个整屏当量 + 26 MB 常驻）。
+    /// Pass B 用同一个归一化 UV 采样，放大交给双线性采样器。
+    ///
+    /// 默认关闭。**开启后输出不再与默认档逐位一致** —— 模糊层本来就是重模糊图
+    /// （等效 σ≈20 px），差异预计很小，但属于视觉改动，需要显式开启并自行取证。
+    frost_half_mode: bool,
+    /// 冻结 EMA 推进：自证模式下同一帧要连渲两次，第二次必须复用完全相同的
+    /// 环境色纹理，否则 dt 不同会让 alpha 不同，污染逐像素对照结果。
+    env_freeze: std::cell::Cell<bool>,
     down_shader: SimpleShader,
     up_shader: SimpleShader,
+    env_shader: SimpleShader,
     cb: ID3D11Buffer,
     sampler: ID3D11SamplerState,
     states: OpaqueStates,
@@ -75,6 +94,13 @@ impl Pyramid {
             crate::gfx::shaders::BLUR_UP,
             "ps_main",
         )?;
+        let env_shader = make_shader_pair(
+            device,
+            crate::gfx::shaders::BLUR_VS,
+            "vs_main",
+            crate::gfx::shaders::ENV_EMA,
+            "ps_main",
+        )?;
         let cb = make_dynamic_cbuffer(device, std::mem::size_of::<BlurCb>() as u32)?;
         let sampler = make_linear_sampler(device)?;
         let states = make_opaque_states(device)?;
@@ -83,9 +109,23 @@ impl Pyramid {
             frost_half: Vec::new(),
             frost: None,
             soft: None,
-            env16: None,
+            env_rt: Vec::new(),
+            env_latest: std::cell::Cell::new(-1),
+            env_region: std::cell::Cell::new([0, 0, 0, 0]),
+            env_last: std::cell::Cell::new(std::time::Instant::now()),
+            env_enabled: std::env::var("GLASS_ENV_EMA").ok().as_deref() != Some("0"),
+            env_tau: 0.15,
+            frost_half_mode: {
+                let on = std::env::var("GLASS_FROST_HALF").ok().as_deref() == Some("1");
+                if on {
+                    eprintln!("[info] GLASS_FROST_HALF=1：frost 保持 1/2 分辨率（视觉档，非逐位一致）");
+                }
+                on
+            },
+            env_freeze: std::cell::Cell::new(false),
             down_shader,
             up_shader,
+            env_shader,
             cb,
             sampler,
             states,
@@ -104,6 +144,118 @@ impl Pyramid {
     /// 第 i 级模糊层（0=1/2 ... 3=1/16）
     pub fn level(&self, i: usize) -> Option<&RenderTarget> {
         self.down.get(i)
+    }
+
+    /// 环境色探针纹理：开启 EMA 时是最新一张 ping-pong 结果，
+    /// 否则退回 1/16 层本身（与旧实现逐位一致）。
+    pub fn env_rt(&self) -> Option<&RenderTarget> {
+        let i = self.env_latest.get();
+        if self.env_enabled && i >= 0 {
+            return self.env_rt.get(i as usize);
+        }
+        self.down.get(LEVELS - 1)
+    }
+
+    /// 环境色 EMA pass：对 `region`（全屏坐标）内的 1/16 层做时域平滑。
+    /// `region` 用块足迹而不是 Pass A 的刷新区，因为足迹在块静止时是稳定的，
+    /// EMA 历史才不会被反复重置；足迹外的 down[3] 是"更旧但有效"的数据，
+    /// 混合进EMA 恰好就是它应有的收敛值。
+    /// 运行期切换 frost 半分辨率档（自适应质量控制器 level 1 用）。
+    /// 切换会重建金字塔 RT 并使全部缓存失效，是一次几十 ms 的停顿，
+    /// 因此只允许在档位变化时调用，不允许每帧调用。
+    pub fn frost_half_mode(&self) -> bool {
+        self.frost_half_mode
+    }
+
+    pub fn set_frost_half_mode(&mut self, device: &ID3D11Device, on: bool) -> Result<(), String> {
+        if self.frost_half_mode == on {
+            return Ok(());
+        }
+        self.frost_half_mode = on;
+        let (w, h) = (self.width, self.height);
+        self.width = 0; // 强制 resize 重建
+        self.resize(device, w, h)
+    }
+
+    pub fn set_env_freeze(&self, v: bool) {
+        self.env_freeze.set(v);
+    }
+
+    fn run_env_ema(&self, ctx: &ID3D11DeviceContext, region: [i32; 4]) {
+        if !self.env_enabled || self.env_rt.len() != 2 || self.env_freeze.get() {
+            return;
+        }
+        let Some(src) = self.down.get(LEVELS - 1) else {
+            return;
+        };
+        let latest = self.env_latest.get();
+        let next = if latest < 0 { 0 } else { 1 - latest as usize };
+        let first = latest < 0 || {
+            let r = self.env_region.get();
+            !(r[0] <= region[0] && r[1] <= region[1] && r[2] >= region[2] && r[3] >= region[3])
+        };
+        let now = std::time::Instant::now();
+        let dt = now.saturating_duration_since(self.env_last.get()).as_secs_f32();
+        self.env_last.set(now);
+        let alpha = if first {
+            1.0
+        } else {
+            1.0 - (-dt.max(1e-4) / self.env_tau.max(1e-3)).exp()
+        };
+
+        let dst = &self.env_rt[next];
+        let scissor = self.scissor_for(region, dst);
+        let cb_value = BlurCb {
+            texel: [
+                1.0 / src.w.max(1) as f32,
+                1.0 / src.h.max(1) as f32,
+                dst.w as f32 / src.w.max(1) as f32,
+                dst.h as f32 / src.h.max(1) as f32,
+            ],
+            weight_center: alpha,
+            _pad: [if first { 1.0 } else { 0.0 }, 0.0, 0.0],
+        };
+        if update_cbuffer(ctx, &self.cb, &cb_value).is_err() {
+            return;
+        }
+        unsafe {
+            let null: [Option<ID3D11ShaderResourceView>; 9] =
+                [None, None, None, None, None, None, None, None, None];
+            ctx.PSSetShaderResources(0, Some(&null));
+            ctx.OMSetRenderTargets(None, None);
+            ctx.OMSetRenderTargets(Some(&[Some(dst.rtv.clone())]), None);
+            ctx.RSSetScissorRects(Some(&[scissor]));
+            ctx.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: dst.w as f32,
+                Height: dst.h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            ctx.VSSetShader(&self.env_shader.vs, None);
+            ctx.PSSetShader(&self.env_shader.ps, None);
+            ctx.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            let prev_srv = if latest < 0 {
+                None
+            } else {
+                Some(self.env_rt[latest as usize].srv.clone())
+            };
+            ctx.PSSetShaderResources(0, Some(&[Some(src.srv.clone()), prev_srv]));
+            ctx.Draw(3, 0);
+        }
+        self.env_latest.set(next as i8);
+        self.env_region.set(if first {
+            region
+        } else {
+            let r = self.env_region.get();
+            [
+                r[0].min(region[0]),
+                r[1].min(region[1]),
+                r[2].max(region[2]),
+                r[3].max(region[3]),
+            ]
+        });
     }
 
     pub fn resize(&mut self, device: &ID3D11Device, w: i32, h: i32) -> Result<(), String> {
@@ -126,12 +278,26 @@ impl Pyramid {
             self.frost_half
                 .push(make_rt(device, hw, hh, DXGI_FORMAT_B8G8R8A8_UNORM)?);
         }
-        let frost = make_rt(device, w, h, DXGI_FORMAT_B8G8R8A8_UNORM)?;
-        // soft 与 frost 内容一致，共享同一份资源
-        self.soft = Some(frost.clone());
-        self.frost = Some(frost);
-        // 环境色探针直接复用 1/16 层
-        self.env16 = self.down.get(LEVELS - 1).cloned();
+        if self.frost_half_mode {
+            // 半分辨率档：省掉整屏上采样那一步，也省掉一张整屏 RT
+            let half = self.frost_half[0].clone();
+            self.soft = Some(half.clone());
+            self.frost = Some(half);
+        } else {
+            let frost = make_rt(device, w, h, DXGI_FORMAT_B8G8R8A8_UNORM)?;
+            // soft 与 frost 内容一致，共享同一份资源
+            self.soft = Some(frost.clone());
+            self.frost = Some(frost);
+        }
+        // 环境色探针：两张 1/16 RT 做 ping-pong EMA
+        self.env_rt.clear();
+        let (ew, eh) = (self.down[LEVELS - 1].w, self.down[LEVELS - 1].h);
+        for _ in 0..2 {
+            self.env_rt
+                .push(make_rt(device, ew, eh, DXGI_FORMAT_B8G8R8A8_UNORM)?);
+        }
+        self.env_latest.set(-1);
+        self.env_region.set([0, 0, 0, 0]);
         Ok(())
     }
 
@@ -251,6 +417,7 @@ impl Pyramid {
         w: i32,
         h: i32,
         region: [i32; 4],
+        env_region: [i32; 4],
     ) {
         if self.down.len() != LEVELS {
             return;
@@ -276,6 +443,9 @@ impl Pyramid {
             let sc = self.scissor_for(region, &self.down[k]);
             self.draw(ctx, &src, &self.down[k], sw, sh, sc);
         }
+
+        // --- 环境色探针时域平滑（方案 12.6）---
+        self.run_env_ema(ctx, env_region);
 
         // --- 块分辨率模糊链（避免 1/16 金字塔被放大的方块颗粒） ---
         if self.frost_half.len() == 2 {
@@ -306,10 +476,13 @@ impl Pyramid {
                     }
                 }
                 // 最终半分辨率结果上采样回整屏。soft 与 frost 共享，只需一次。
-                let s1 = self.frost_half[0].srv.clone();
-                let (sw, sh) = (self.frost_half[0].w, self.frost_half[0].h);
-                let sc_full = self.scissor_for(region, frost);
-                self.draw_up(ctx, &s1, frost, sw, sh, sc_full);
+                // 半分辨率档直接跳过这一步：frost 就是 frost_half[0]。
+                if !self.frost_half_mode {
+                    let s1 = self.frost_half[0].srv.clone();
+                    let (sw, sh) = (self.frost_half[0].w, self.frost_half[0].h);
+                    let sc_full = self.scissor_for(region, frost);
+                    self.draw_up(ctx, &s1, frost, sw, sh, sc_full);
+                }
             }
         }
         unsafe {

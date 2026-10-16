@@ -13,6 +13,7 @@ pub const BLUR_VS: &str = include_str!("../../shaders/blur_vs.hlsl");
 pub const GLASS_PS: &str = include_str!("../../shaders/glass_ps.hlsl");
 pub const BLUR_DOWN: &str = include_str!("../../shaders/blur_down.hlsl");
 pub const BLUR_UP: &str = include_str!("../../shaders/blur_up.hlsl");
+pub const ENV_EMA: &str = include_str!("../../shaders/env_ema.hlsl");
 
 pub fn compile(src: &str, entry: &str, target: &str) -> Result<ID3DBlob, String> {
     let entry_c = std::ffi::CString::new(entry).unwrap();
@@ -57,15 +58,6 @@ pub fn bytes(b: &ID3DBlob) -> &[u8] {
 pub struct SimpleShader {
     pub vs: ID3D11VertexShader,
     pub ps: ID3D11PixelShader,
-}
-
-pub fn make_shader(
-    device: &ID3D11Device,
-    src: &str,
-    vs_entry: &str,
-    ps_entry: &str,
-) -> Result<SimpleShader, String> {
-    make_shader_pair(device, src, vs_entry, src, ps_entry)
 }
 
 /// VS 与 PS 来自不同文件时使用

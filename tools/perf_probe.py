@@ -123,16 +123,64 @@ def gpu_dedicated_mb(pid: int) -> float:
         return float("nan")
 
 
-METRIC_RE = re.compile(
-    r"win_s=(?P<win>[\d.]+)\s+screens=(?P<screens>\d+)\s+blocks=(?P<blocks>\d+)\s+"
-    r"loops=(?P<loops>\d+)\s+frames=(?P<frames>\d+)\s+fps=(?P<fps>[\d.]+)\s+"
-    r"idle=(?P<idle>\d+)\s+avg_render_ms=(?P<avg>[\d.]+)\s+"
-    r"max_render_ms=(?P<mr>[\d.]+)\s+max_loop_ms=(?P<ml>[\d.]+)\s+"
-    r"stage_us=A(?P<a>\d+)\s+B(?P<b>\d+)\s+P(?P<p>\d+)\s+C(?P<c>\d+)\s+"
-    r"dirty_mpx_avg=(?P<davg>[\d.]+)\s+dirty_mpx_max=(?P<dmax>[\d.]+)\s+"
-    r"blocks_avg=(?P<bavg>[\d.]+)\s+pass_a=(?P<pa>[\d.]+)/frame\s+"
-    r"pass_a_mpx_avg=(?P<pam>[\d.]+)\s+dda_acq=(?P<acq>[\d.]+)/s\s+"
-    r"dda_changed=(?P<chg>[\d.]+)/s\s+copy_mpx_avg=(?P<cp>[\d.]+)")
+def _f(line, key, cast=float):
+    m = re.search(re.escape(key) + r"=(-?[\d.]+)", line)
+    return cast(m.group(1)) if m else None
+
+
+def parse_metrics(line):
+    """逐字段宽松解析 [metrics] 行，字段增删不会让探针失效。"""
+    if "[metrics]" not in line:
+        return None
+    d = {}
+    for key in ("win_s", "screens", "blocks", "loops", "frames", "fps", "idle",
+                "avg_render_ms", "max_render_ms", "max_loop_ms",
+                "dirty_mpx_avg", "dirty_mpx_max", "blocks_avg",
+                "pass_a_mpx_avg", "dda_acq", "dda_changed", "copy_mpx_avg",
+                "cap_max_ms"):
+        v = _f(line, key)
+        if v is not None:
+            d[key] = v
+    for key in ("screens", "blocks", "loops", "frames", "idle"):
+        if key in d:
+            d[key] = int(d[key])
+    m = re.search(r"loop_ms_avg=msg([\d.]+)/cap([\d.]+)/prep([\d.]+)", line)
+    if m:
+        d["loop_ms_msg"] = float(m.group(1))
+        d["loop_ms_cap"] = float(m.group(2))
+        d["loop_ms_prep"] = float(m.group(3))
+    m = re.search(r"stage_us=A(\d+) B(\d+) P(\d+) C(\d+)", line)
+    if m:
+        d["stage_us"] = [int(x) for x in m.groups()]
+    m = re.search(r"cap_split_ms=acq([\d.]+)/dirtyApi([\d.]+)/copy([\d.]+)"
+                  r"/pre([\d.]+)/rel([\d.]+)", line)
+    if m:
+        d["cap_ms_acq"] = float(m.group(1))
+        d["cap_ms_dirtyapi"] = float(m.group(2))
+        d["cap_ms_copy"] = float(m.group(3))
+        d["cap_ms_pre"] = float(m.group(4))
+        d["cap_ms_rel"] = float(m.group(5))
+    m = re.search(r"p50_ms=loop([\d.]+)/cap([\d.]+)/ren([\d.]+)", line)
+    if m:
+        d["p50_loop"] = float(m.group(1))
+        d["p50_cap"] = float(m.group(2))
+        d["p50_ren"] = float(m.group(3))
+    m = re.search(r"p95_ms=loop([\d.]+)/cap([\d.]+)/ren([\d.]+)", line)
+    if m:
+        d["p95_loop"] = float(m.group(1))
+        d["p95_cap"] = float(m.group(2))
+        d["p95_ren"] = float(m.group(3))
+    for k in ("acq_max_ms", "rel_max_ms"):
+        v = _f(line, k)
+        if v is not None:
+            d[k] = v
+    m = re.search(r"pass_a=([\d.]+)/frame", line)
+    if m:
+        d["pass_a_per_frame"] = float(m.group(1))
+    m = re.search(r"pass_a_throttled=([\d.]+)/frame", line)
+    if m:
+        d["pass_a_throttled"] = float(m.group(1))
+    return d or None
 
 
 class LogReader(threading.Thread):
@@ -148,9 +196,10 @@ class LogReader(threading.Thread):
             if not line:
                 continue
             self.lines.append(line)
-            m = METRIC_RE.search(line)
-            if m:
-                d = m.groupdict()
+            d = parse_metrics(line)
+            if d:
+                self.metrics.append(d)
+            if False:
                 self.metrics.append({
                     "screens": int(d["screens"]),
                     "blocks": int(d["blocks"]),
@@ -219,7 +268,7 @@ def run_case(case: str, seconds: float, warmup: float) -> dict:
     time.sleep(warmup * 0.6)
     # GPU 显存计数器的采集会 spawn PowerShell 并短暂拖慢整机，
     # 必须放在测量窗口之外，否则会污染 max_loop 长尾。
-    gpu_mb = gpu_dedicated_mb(proc.pid)
+    gpu_mb = gpu_dedicated_mb(proc.pid) if os.environ.get("PROBE_GPU_MB") == "1" else float("nan")
     time.sleep(warmup * 0.4)
 
     result = {"case": case, "pid": proc.pid, "screen": [sw, sh],

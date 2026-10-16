@@ -11,6 +11,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIDevice1, IDXGIFactory2};
 
+#[allow(dead_code)] // factory / feature_level 供后续后端选择与诊断使用
 pub struct Device {
     pub device: ID3D11Device,
     pub ctx: ID3D11DeviceContext,
@@ -77,8 +78,4 @@ impl Device {
         })
     }
 
-    /// 是否支持 SM 4.1+（Feature Level 10.0 即可跑本方案）
-    pub fn supports_shader_model_41(&self) -> bool {
-        self.feature_level.0 >= D3D_FEATURE_LEVEL_10_0.0
-    }
 }

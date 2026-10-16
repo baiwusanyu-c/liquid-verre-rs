@@ -6,7 +6,7 @@ fn main() {
         "shaders/glass_ps.hlsl",
         "shaders/blur_down.hlsl",
         "shaders/blur_up.hlsl",
-        "shaders/blur_copy.hlsl",
+        "shaders/env_ema.hlsl",
     ] {
         println!("cargo:rerun-if-changed={f}");
     }

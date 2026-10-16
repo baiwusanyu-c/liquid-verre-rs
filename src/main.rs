@@ -27,13 +27,15 @@ mod ui;
 use std::time::Instant;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
 use windows::Win32::Graphics::Gdi::{
-    CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, UpdateWindow, GDI_REGION_TYPE,
-    RGN_OR,
+    CombineRgn, CreateRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn,
+    UpdateWindow, GDI_REGION_TYPE, MONITORINFO, MONITOR_DEFAULTTONEAREST, RGN_OR,
 };
+use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
@@ -42,7 +44,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use capture::DdaCapture;
+use capture::Capture;
 use gfx::{monitors, Compositor, Device, GlassRenderer, MonitorInfo};
 use glass::{Block, Manager, Params};
 use input::{cursor_pos, DragKind, DragState};
@@ -60,7 +62,7 @@ struct MonitorRt {
     info: MonitorInfo,
     hwnd: HWND,
     compositor: Compositor,
-    capture: Option<DdaCapture>,
+    capture: Option<Capture>,
     /// 首帧采集是否已就绪（未就绪的屏不显示，避免黑玻璃）
     ready: bool,
     region_dirty: bool,
@@ -78,6 +80,21 @@ struct MonitorRt {
     /// 失败日志只在状态翻转时打一次：锁屏期间每 500 ms 重试一次，
     /// 否则会刷出成千上万行相同告警。
     capture_error_logged: bool,
+    /// 上次采集时刻：没有玻璃块的屏降到 4 Hz 采集，省掉整条采集开销。
+    last_capture: Instant,
+    /// 本屏当前处于「无块降频采集」状态，用于识别块刚落入本屏的那一帧。
+    idle_capturing: bool,
+    /// 因「独占全屏应用」被我们主动隐藏（方案 R-16）
+    hidden_fs: bool,
+    /// 因「采集失效」被我们主动隐藏
+    hidden_capture: bool,
+    /// 因「本屏没有任何玻璃块」被隐藏。
+    /// 实测：在 60 Hz 副屏上挂一个 DComp 画布（哪怕整帧短路、一次 Present 都不发），
+    /// 也会把 120 Hz 主屏的合成节拍拖到 60 Hz —— 20 块拖拽 fps 82.0 -> 42.3、
+    /// p50 单循环 8.41 ms -> 16.67 ms。所以空屏必须把画布真正隐藏掉。
+    hidden_empty: bool,
+    /// 本屏变空的时刻（1 秒防抖，避免跨屏拖拽时反复显示/隐藏）
+    empty_since: Option<Instant>,
     /// 本屏的缩放参数是否需要重算（避免每帧 clone + sanitize 一遍 Params）
     params_dirty: bool,
 }
@@ -96,7 +113,11 @@ impl MonitorRt {
         let name = info.name.clone();
         let hwnd: HWND = unsafe {
             CreateWindowExW(
-                WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+                WS_EX_NOREDIRECTIONBITMAP
+                    | WS_EX_TOPMOST
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE,
                 class_name,
                 windows::core::w!("liquid glass canvas"),
                 WS_POPUP,
@@ -142,7 +163,7 @@ impl MonitorRt {
                 return None;
             }
         };
-        let capture = match DdaCapture::new_for_monitor(&gfx.device, info.hmonitor) {
+        let capture = match Capture::for_monitor(&gfx.device, info.hmonitor) {
             Ok(c) => Some(c),
             Err(e) => {
                 // 该屏可能挂在另一块显卡上，或被别的录屏软件占用了 duplication。
@@ -166,6 +187,12 @@ impl MonitorRt {
             copied_px: 0,
             retry_at: Instant::now(),
             capture_error_logged: false,
+            last_capture: Instant::now() - std::time::Duration::from_secs(3600),
+            idle_capturing: false,
+            hidden_fs: false,
+            hidden_capture: false,
+            hidden_empty: false,
+            empty_since: None,
             params_dirty: true,
         })
     }
@@ -196,6 +223,7 @@ struct App {
     press: f32,
     drag_velocity: [f32; 2],
     rebuild_monitors: bool,
+    fs_check_at: Instant,
     t0: Instant,
     frames: u64,
 }
@@ -471,7 +499,7 @@ fn collect_monitor_blocks(app: &mut App, mi: usize, refresh_params: bool) {
         if b.monitor != mi {
             continue;
         }
-        let mut local = b.clone();
+        let mut local = *b;
         local.x = b.x - ox;
         local.y = b.y - oy;
         mon.blocks.push(local);
@@ -569,7 +597,7 @@ fn wait_for_captures(app: &mut App, primary_budget: std::time::Duration) {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
                 }
-                match DdaCapture::new_for_monitor(&gfx.device, mon.info.hmonitor) {
+                match Capture::for_monitor(&gfx.device, mon.info.hmonitor) {
                     Ok(cap) => {
                         if mon.capture_error_logged {
                             eprintln!("[info] {} 采集已恢复", mon.info.name);
@@ -615,6 +643,63 @@ fn wait_for_captures(app: &mut App, primary_budget: std::time::Duration) {
                 app.monitors[mi].info.name
             );
         }
+    }
+}
+
+/// 画布可见性 = 采集就绪 且 未被独占全屏应用压制（方案 R-16）。
+fn apply_visibility(mon: &MonitorRt) {
+    unsafe {
+        if mon.ready && !mon.hidden_fs && !mon.hidden_capture && !mon.hidden_empty {
+            mon.show();
+        } else {
+            let _ = ShowWindow(mon.hwnd, SW_HIDE);
+        }
+    }
+}
+
+/// 独占全屏应用检测（方案 R-16 / 12.1.1 C 模式的已知代价）。
+///
+/// 全屏置顶画布会破坏独占全屏与 MPO。判据刻意收紧为「无边框 popup 且恰好铺满
+/// 所在显示器」——普通最大化窗口带 WS_CAPTION，不会被误判，玻璃照常叠加在上面。
+/// 该窗口是不是我们自己的（画布类名固定），用来避免把自家 overlay 误判成
+/// 独占全屏应用 —— 画布本身就是 WS_POPUP + 铺满显示器，完全符合"全屏"的形状判据。
+fn is_own_window(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..n]) == "LiquidGlassCanvas"
+}
+
+fn fullscreen_app_on(mon_hwnd: HWND) -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() || fg == mon_hwnd || is_own_window(fg) {
+            return false;
+        }
+        let style = GetWindowLongPtrW(fg, GWL_STYLE) as u32;
+        // 无边框全屏：有 WS_POPUP，没有标题栏、没有可拖拽边框
+        if style & WS_POPUP.0 == 0 {
+            return false;
+        }
+        if style & (WS_CAPTION.0 | WS_THICKFRAME.0) != 0 {
+            return false;
+        }
+        let mut wr = RECT::default();
+        if GetWindowRect(fg, &mut wr).is_err() {
+            return false;
+        }
+        let hmon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            return false;
+        }
+        let m = mi.rcMonitor;
+        wr.left <= m.left && wr.top <= m.top && wr.right >= m.right && wr.bottom >= m.bottom
     }
 }
 
@@ -718,9 +803,27 @@ struct Metrics {
     blocks_sum: i64,
     pass_a: u64,
     pass_a_px: i64,
+    pass_a_throttled: u64,
     copied_px: i64,
     acquired: u64,
     content: u64,
+    /// 主循环分段 CPU 耗时累加：消息泵 / 采集 / 渲染前准备
+    msg_sum_us: u128,
+    cap_sum_us: u128,
+    cap_max_us: u128,
+    prep_sum_us: u128,
+    /// cap 段细分：AcquireNextFrame / 脏矩形 API / 像素搬运 / 取帧前置 / ReleaseFrame
+    acq_sum_us: u128,
+    acq_max_us: u128,
+    dirtyapi_sum_us: u128,
+    copy_sum_us: u128,
+    pre_sum_us: u128,
+    rel_sum_us: u128,
+    rel_max_us: u128,
+    /// 逐次循环采样 [总耗时, 采集段, 渲染段]。
+    /// 每个窗口只有几十次循环时，一次几百毫秒的离群值就能把均值彻底带偏
+    /// （实测出现过"跳过工作反而更慢"的因果倒置），所以改报分位数。
+    samples: Vec<[u128; 3]>,
 }
 
 impl Metrics {
@@ -738,22 +841,44 @@ impl Metrics {
             blocks_sum: 0,
             pass_a: 0,
             pass_a_px: 0,
+            pass_a_throttled: 0,
             copied_px: 0,
             acquired: 0,
             content: 0,
+            msg_sum_us: 0,
+            cap_sum_us: 0,
+            cap_max_us: 0,
+            prep_sum_us: 0,
+            acq_sum_us: 0,
+            acq_max_us: 0,
+            dirtyapi_sum_us: 0,
+            copy_sum_us: 0,
+            pre_sum_us: 0,
+            rel_sum_us: 0,
+            rel_max_us: 0,
+            samples: Vec::new(),
         }
     }
 }
 
+/// `stage_us` = [消息泵, 采集, 渲染前准备]
 fn report_metrics(
     app: &mut App,
     m: &mut Metrics,
     loop_us: u128,
     render_us: u128,
     rendered: bool,
+    stage_us: [u128; 3],
 ) {
     m.loops += 1;
     m.max_loop_us = m.max_loop_us.max(loop_us);
+    m.msg_sum_us += stage_us[0];
+    m.cap_sum_us += stage_us[1];
+    m.cap_max_us = m.cap_max_us.max(stage_us[1]);
+    m.prep_sum_us += stage_us[2];
+    if m.samples.len() < 20000 {
+        m.samples.push([loop_us, stage_us[1], render_us]);
+    }
     if rendered {
         m.frames += 1;
         m.render_sum_us += render_us;
@@ -769,16 +894,24 @@ fn report_metrics(
             if mon.compositor.last_pass_a {
                 m.pass_a += 1;
             }
+            m.pass_a_throttled += mon.compositor.pass_a_throttled;
+            mon.compositor.pass_a_throttled = 0;
             m.pass_a_px += mon.compositor.last_pass_a_px;
         }
         m.copied_px += mon.copied_px;
         mon.copied_px = 0;
         if let Some(cap) = mon.capture.as_mut() {
-            m.acquired += cap.acquired;
-            m.content += cap.content_changed;
-            cap.acquired = 0;
-            cap.content_changed = 0;
-            cap.pointer_only = 0;
+            let (a, c) = cap.take_stats();
+            m.acquired += a;
+            m.content += c;
+            let t = cap.take_timings();
+            m.acq_sum_us += t[0];
+            m.dirtyapi_sum_us += t[1];
+            m.copy_sum_us += t[2];
+            m.pre_sum_us += t[3];
+            m.rel_sum_us += t[4];
+            m.acq_max_us = m.acq_max_us.max(t[5]);
+            m.rel_max_us = m.rel_max_us.max(t[6]);
         }
     }
 
@@ -786,7 +919,26 @@ fn report_metrics(
     if secs < 5.0 {
         return;
     }
+    // 分位数：对离群值稳健
+    fn pct(v: &mut Vec<u128>, p: f64) -> f64 {
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_unstable();
+        let i = ((v.len() as f64 - 1.0) * p).round() as usize;
+        v[i.min(v.len() - 1)] as f64 / 1000.0
+    }
+    let mut s_loop: Vec<u128> = m.samples.iter().map(|x| x[0]).collect();
+    let mut s_cap: Vec<u128> = m.samples.iter().map(|x| x[1]).collect();
+    let mut s_ren: Vec<u128> = m.samples.iter().map(|x| x[2]).filter(|x| *x > 0).collect();
+    let loop_p50 = pct(&mut s_loop, 0.50);
+    let loop_p95 = pct(&mut s_loop, 0.95);
+    let cap_p50 = pct(&mut s_cap, 0.50);
+    let cap_p95 = pct(&mut s_cap, 0.95);
+    let ren_p50 = pct(&mut s_ren, 0.50);
+    let ren_p95 = pct(&mut s_ren, 0.95);
     let n = m.frames.max(1) as f64;
+    let nl = m.loops.max(1) as f64;
     let screens = app.monitors.len().max(1) as f64;
     let stage = app.monitors[0].compositor.last_stage_us;
     let (gpu_avg, gpu_max, gpu_n) = match app.monitors[0].compositor.gpu.as_mut() {
@@ -796,8 +948,14 @@ fn report_metrics(
     eprintln!(
         "[metrics] win_s={:.2} screens={} blocks={} loops={} frames={} fps={:.1} idle={} \
          avg_render_ms={:.3} max_render_ms={:.3} max_loop_ms={:.3} \
-         stage_us=A{} B{} P{} C{} dirty_mpx_avg={:.3} dirty_mpx_max={:.3} \
-         blocks_avg={:.1} pass_a={:.2}/frame pass_a_mpx_avg={:.3} \
+         stage_us=A{} B{} P{} C{} \
+         loop_ms_avg=msg{:.3}/cap{:.3}/prep{:.3} cap_max_ms={:.3} \
+         p50_ms=loop{:.2}/cap{:.2}/ren{:.2} p95_ms=loop{:.2}/cap{:.2}/ren{:.2} \
+         cap_split_ms=acq{:.3}/dirtyApi{:.3}/copy{:.3}/pre{:.3}/rel{:.3} \
+         acq_max_ms={:.3} rel_max_ms={:.3} \
+         dirty_mpx_avg={:.3} dirty_mpx_max={:.3} \
+         blocks_avg={:.1} pass_a={:.2}/frame pass_a_throttled={:.2}/frame \
+         pass_a_mpx_avg={:.3} \
          dda_acq={:.1}/s dda_changed={:.1}/s copy_mpx_avg={:.3} \
          gpu_ms_avg=A{:.3}/B{:.3}/T{:.3} gpu_ms_max=A{:.3}/B{:.3}/T{:.3} gpu_n={}",
         secs,
@@ -814,10 +972,28 @@ fn report_metrics(
         stage[1],
         stage[2],
         stage[3],
+        m.msg_sum_us as f64 / nl / 1000.0,
+        m.cap_sum_us as f64 / nl / 1000.0,
+        m.prep_sum_us as f64 / nl / 1000.0,
+        m.cap_max_us as f64 / 1000.0,
+        loop_p50,
+        cap_p50,
+        ren_p50,
+        loop_p95,
+        cap_p95,
+        ren_p95,
+        m.acq_sum_us as f64 / nl / 1000.0,
+        m.dirtyapi_sum_us as f64 / nl / 1000.0,
+        m.copy_sum_us as f64 / nl / 1000.0,
+        m.pre_sum_us as f64 / nl / 1000.0,
+        m.rel_sum_us as f64 / nl / 1000.0,
+        m.acq_max_us as f64 / 1000.0,
+        m.rel_max_us as f64 / 1000.0,
         m.dirty_sum as f64 / n / screens / 1e6,
         m.dirty_max as f64 / 1e6,
         m.blocks_sum as f64 / n / screens,
         m.pass_a as f64 / n,
+        m.pass_a_throttled as f64 / n,
         m.pass_a_px as f64 / n / screens / 1e6,
         m.acquired as f64 / secs,
         m.content as f64 / secs,
@@ -831,6 +1007,223 @@ fn report_metrics(
         gpu_n,
     );
     *m = Metrics::new();
+}
+
+/// 显示器刷新率（方案 12.4.2 帧节奏 / 12.4.3 质量预算的基准）
+fn refresh_hz() -> f32 {
+    unsafe {
+        let mut dev = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        if EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut dev).as_bool()
+            && dev.dmDisplayFrequency > 1
+        {
+            return dev.dmDisplayFrequency as f32;
+        }
+    }
+    60.0
+}
+
+fn on_battery() -> bool {
+    unsafe {
+        let mut st = SYSTEM_POWER_STATUS::default();
+        if GetSystemPowerStatus(&mut st).is_ok() {
+            // BatteryFlag 128 = 无电池（台式机）；ACLineStatus 0 = 未接电源
+            return st.BatteryFlag != 128 && st.ACLineStatus == 0;
+        }
+    }
+    false
+}
+
+/// 自适应质量控制器（方案 12.4.3）。
+///
+/// `level 0` = 最高画质 = 本项目的默认视觉，**与未启用控制器时逐位一致**。
+/// 只有实测持续丢 vblank 时才逐级降级，恢复后逐级升回：
+///
+/// 档位顺序按**实测收益**排，而不是按方案原文排：方案把"关焦散/关色散"放在
+/// 限帧之前，但实测这两档只省少量 ALU、几乎不换帧率，会让控制器在真正有效的
+/// 手段之前就白白牺牲视觉。实测收益：frost 半分辨率 +14% fps / −36.5 MB，
+/// 限帧 60 直接把抖动变成平滑 60 fps，关焦散/关色散 ≈ 0。
+///
+/// | level | 动作 | 实测收益 |
+/// |---|---|---|
+/// | 1 | `frost` 保持 1/2 分辨率（省掉 Pass A 的整屏 tent 上采样） | +14% fps、−36.5 MB；模糊层差异 ≤3/255 |
+/// | 2 | + 帧率上限 60（把"忽 8.33 忽 16.67 ms"的抖动变成恒定 16.67 ms） | 消除 judder |
+/// | 3 | + 关闭焦散与 Beer-Lambert 吸收 | 少量 ALU（电池/过热时的余量） |
+/// | 4 | + 关闭 RGB 色散（3 tap → 1 tap） | 省 2 次采样/像素 |
+///
+/// 判据用「丢 vblank 的比例」而不是 GPU timestamp：timestamp query 会打断驱动的
+/// 命令批处理（实测把帧率打到 15 fps），用它做闭环会自我实现地降级。
+/// 丢帧比例 = 单循环耗时 > 1.25 × 垂直消隐间隔 的**渲染帧**占比。
+///
+/// 防抖：连续 2 个 1 秒窗口超阈值才降档；连续 4 个窗口干净**且距上次降档 ≥20 s**
+/// 才升档。后一条是为了避免周期振荡 —— 降到 1 档后变流畅、立刻升回 0 档又卡、
+/// 再降，如此往复会让用户每隔二十几秒看到一次抖动。持续重负载下控制器会稳定
+/// 停在 1 档，只有负载真的掉下来（删块、桌面变静）才升回。
+///
+/// `GLASS_ADAPTIVE=0` 可整体关闭（回到"永远 level 0"）。
+struct QualityCtrl {
+    enabled: bool,
+    level: u8,
+    vblank_us: u128,
+    frames: u64,
+    missed: u64,
+    epoch: Instant,
+    cooldown_until: Instant,
+    last_downgrade: Instant,
+    good_streak: u8,
+    bad_streak: u8,
+    min_interval: std::time::Duration,
+    last_present: Instant,
+    /// 升档探针的最小间隔。升上去 10 秒内又被打回 = 失败探针，间隔翻倍
+    /// （上限 300 s），避免在"撑不住的档位"和"撑得住的档位"之间周期振荡。
+    upgrade_gate: std::time::Duration,
+    last_upgrade: Instant,
+}
+
+impl QualityCtrl {
+    fn new(hz: f32) -> Self {
+        Self {
+            enabled: std::env::var("GLASS_ADAPTIVE").ok().as_deref() != Some("0"),
+            level: 0,
+            vblank_us: (1_000_000.0 / hz.max(1.0)) as u128,
+            frames: 0,
+            missed: 0,
+            epoch: Instant::now(),
+            cooldown_until: Instant::now(),
+            last_downgrade: Instant::now() - std::time::Duration::from_secs(3600),
+            good_streak: 0,
+            bad_streak: 0,
+            min_interval: std::time::Duration::from_secs(0),
+            last_present: Instant::now(),
+            upgrade_gate: std::time::Duration::from_secs(20),
+            last_upgrade: Instant::now() - std::time::Duration::from_secs(3600),
+        }
+    }
+
+    /// level 4 的帧率上限：本帧是否允许提交
+    fn allow_present(&self, now: Instant) -> bool {
+        self.min_interval.is_zero() || now.duration_since(self.last_present) >= self.min_interval
+    }
+
+    fn note_present(&mut self, now: Instant) {
+        self.last_present = now;
+    }
+
+    fn tick(&mut self, loop_us: u128, rendered: bool) {
+        if !self.enabled {
+            return;
+        }
+        if rendered {
+            self.frames += 1;
+            let target = self.min_interval.as_micros().max(self.vblank_us);
+            if loop_us > target + target / 4 {
+                self.missed += 1;
+            }
+        }
+        if self.epoch.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let frames = self.frames;
+        // 渲染帧很少 = 基本空闲 = 没有负载，视为干净窗口。否则降档之后
+        // 一旦桌面变静就永远凑不满判定窗口，档位升不回来。
+        let miss_rate = if frames >= 10 {
+            self.missed as f64 / frames as f64
+        } else {
+            0.0
+        };
+        self.frames = 0;
+        self.missed = 0;
+        self.epoch = Instant::now();
+        if Instant::now() < self.cooldown_until {
+            return;
+        }
+        // 升到更低档位后稳住了 30 s：说明这次探针是成功的，恢复默认探针间隔
+        if self.level > 0
+            && Instant::now().duration_since(self.last_upgrade)
+                >= std::time::Duration::from_secs(30)
+        {
+            self.upgrade_gate = std::time::Duration::from_secs(20);
+        }
+        // 电池供电时更保守：阈值收紧
+        let (bad_th, good_th) = if on_battery() { (0.15, 0.03) } else { (0.25, 0.05) };
+        if miss_rate > bad_th {
+            self.bad_streak += 1;
+            self.good_streak = 0;
+        } else if miss_rate < good_th {
+            self.good_streak += 1;
+            self.bad_streak = 0;
+        } else {
+            self.good_streak = 0;
+            self.bad_streak = 0;
+        }
+        if self.bad_streak >= 2 && frames >= 30 && self.level < 4 {
+            self.set_level(self.level + 1, miss_rate, frames);
+        } else if self.good_streak >= 4
+            && self.level > 0
+            && Instant::now().duration_since(self.last_downgrade) >= self.upgrade_gate
+        {
+            self.set_level(self.level - 1, miss_rate, frames);
+        }
+    }
+
+    fn set_level(&mut self, level: u8, miss_rate: f64, frames: u64) {
+        // 切换档位会重建金字塔，产生一次停顿；清空统计窗口，别让这次停顿
+        // 被算成"还在丢帧"从而触发下一级降级。
+        self.frames = 0;
+        self.missed = 0;
+        self.epoch = Instant::now();
+        let up = level < self.level;
+        if !up && Instant::now().duration_since(self.last_upgrade) < std::time::Duration::from_secs(10)
+        {
+            // 刚升上去就被打回：这次探针失败，下次探针间隔翻倍
+            self.upgrade_gate = (self.upgrade_gate * 2).min(std::time::Duration::from_secs(300));
+        }
+        if up {
+            self.last_upgrade = Instant::now();
+        }
+        self.level = level;
+        self.bad_streak = 0;
+        self.good_streak = 0;
+        self.cooldown_until = Instant::now() + std::time::Duration::from_secs(3);
+        if !up {
+            self.last_downgrade = Instant::now();
+        }
+        self.min_interval = if level >= 2 {
+            std::time::Duration::from_millis(1000 / 60)
+        } else {
+            std::time::Duration::from_secs(0)
+        };
+        eprintln!(
+            "[adaptive] 质量档位{} -> {level}（1 秒窗口 {frames} 帧中丢 vblank {:.0}%）：{}",
+            if up { "回升" } else { "降级" },
+            miss_rate * 100.0,
+            match level {
+                0 => "全部效果开启，与默认视觉逐位一致",
+                1 => "frost 降为 1/2 分辨率（模糊层差异 ≤3/255）",
+                2 => "+ 帧率上限 60（抖动 -> 恒定 60 fps）",
+                3 => "+ 关闭焦散与 Beer-Lambert 吸收",
+                _ => "+ 关闭 RGB 色散",
+            }
+        );
+    }
+
+    fn frost_half(&self) -> bool {
+        self.enabled && self.level >= 1
+    }
+
+    /// 把 level 3/4 的参数降级叠加到面板参数之上（level 0~2 时逐字段原样）
+    fn apply(&self, p: &mut Params) {
+        if !self.enabled || self.level < 3 {
+            return;
+        }
+        p.caustic_gain = 0.0;
+        p.absorption = 0.0;
+        if self.level >= 4 {
+            p.dispersion = 0.0;
+        }
+    }
 }
 
 fn main() {
@@ -882,6 +1275,10 @@ fn main() {
         return;
     }
 
+    // 启动阶段进度日志：驱动异常时 D3D11CreateDevice / D3DCompile 可能长时间
+    // 无响应，没有这些打点就无法判断卡在哪一步。
+    let t_boot = Instant::now();
+    eprintln!("[boot] 创建 D3D11 设备...");
     let gfx = match Device::create() {
         Ok(d) => d,
         Err(e) => {
@@ -889,10 +1286,12 @@ fn main() {
             return;
         }
     };
+    eprintln!("[boot] D3D11 设备就绪 (+{:.0} ms)", t_boot.elapsed().as_secs_f64() * 1000.0);
     if gfx.warp {
         eprintln!("[warn] 回退到 WARP 软件光栅");
     }
     // 着色器 / LUT / 采样器全进程一份，所有显示器画布共享。
+    eprintln!("[boot] 编译着色器...");
     let glass = match GlassRenderer::new(&gfx.device) {
         Ok(g) => g,
         Err(e) => {
@@ -900,10 +1299,19 @@ fn main() {
             return;
         }
     };
+    eprintln!("[boot] 着色器就绪 (+{:.0} ms)", t_boot.elapsed().as_secs_f64() * 1000.0);
 
+    eprintln!("[boot] 创建各屏画布与采集...");
     let mut monitors_rt: Vec<MonitorRt> = Vec::new();
     for info in infos {
         if let Some(mut m) = MonitorRt::create(&gfx, class_name, hinst, info) {
+            if let Some(cap) = m.capture.as_ref() {
+                eprintln!(
+                    "[info] {} 采集后端 = {}",
+                    m.info.name,
+                    cap.backend_name()
+                );
+            }
             if let Err(e) = m.compositor.resize(&gfx, m.info.size[0], m.info.size[1]) {
                 eprintln!("[warn] {} 金字塔初始化失败: {e}", m.info.name);
             }
@@ -918,6 +1326,16 @@ fn main() {
     if monitors_rt.is_empty() {
         eprintln!("没有任何显示器能创建画布");
         return;
+    }
+    // GLASS_MONITORS=<n>：只用前 n 块屏。既是一个实用选项（把玻璃限制在主屏），
+    // 也用于归因「第二块屏的采集/合成到底占多少」。
+    if let Ok(n) = std::env::var("GLASS_MONITORS") {
+        if let Ok(n) = n.parse::<usize>() {
+            if n >= 1 && n < monitors_rt.len() {
+                eprintln!("[info] GLASS_MONITORS={n}，只启用前 {n} 块屏");
+                monitors_rt.truncate(n);
+            }
+        }
     }
 
     // 默认先展示一块完整玻璃；需要压力测试时设置 GLASS_MANY=1。
@@ -999,6 +1417,7 @@ fn main() {
         press: 0.0,
         drag_velocity: [0.0, 0.0],
         rebuild_monitors: false,
+        fs_check_at: Instant::now() - std::time::Duration::from_secs(3600),
         t0: Instant::now(),
         frames: 0,
     };
@@ -1046,8 +1465,8 @@ fn main() {
         app.monitors[mi].ready = app.monitors[mi].compositor.capture_ready();
     }
     for mon in app.monitors.iter() {
+        apply_visibility(mon);
         if mon.ready {
-            mon.show();
             eprintln!("[info] {} 画布已显示 ({}x{})", mon.info.name, mon.info.size[0], mon.info.size[1]);
         }
     }
@@ -1065,8 +1484,38 @@ fn main() {
     // 静止时的等待步长：8 ms ≈ 125 Hz，覆盖 120 Hz 显示器的一个刷新周期，
     // 保证鼠标悬停反馈延迟不超过半帧，同时静止桌面 CPU 趋近 0。
     const IDLE_WAIT_MS: u32 = 8;
+    // 没有玻璃块的屏的采集保活间隔，以及判定"采集已陈旧"的阈值。
+    let idle_capture_interval = std::time::Duration::from_millis(250);
     let mut capture_wait_ms = IDLE_WAIT_MS;
     let mut metrics = Metrics::new();
+    // GLASS_SIM_BACKDROP=<W>x<H>@<HZ>：用固定尺寸、固定节拍的模拟桌面脏区取代
+    // 真实 DDA 脏矩形。真实桌面的活动率会在 4~52 次/秒之间漂移，8 秒的测量
+    // 窗口根本不可比；只有把负载确定性化，分段归因才有意义。
+    let sim = std::env::var("GLASS_SIM_BACKDROP").ok().and_then(|v| {
+        let (wh, sim_hz) = v.split_once('@')?;
+        let (w, h) = wh.split_once('x')?;
+        Some((
+            w.parse::<i32>().ok()?,
+            h.parse::<i32>().ok()?,
+            sim_hz.parse::<f64>().ok()?.max(1.0),
+        ))
+    });
+    let mut sim_next = Instant::now();
+    if let Some((sw_, sh_, shz)) = sim {
+        eprintln!("[info] 模拟桌面脏区 {sw_}x{sh_} @ {shz:.0} Hz（确定性负载）");
+    }
+    let hz = refresh_hz();
+    let mut quality = QualityCtrl::new(hz);
+    let mut frost_half_applied = false;
+    eprintln!(
+        "[info] 显示器刷新率 = {hz:.0} Hz，电源 = {}，自适应质量 = {}",
+        if on_battery() { "电池" } else { "交流电" },
+        if quality.enabled {
+            "开启（默认；level 0 = 与未启用时逐位一致，持续丢帧才降档，GLASS_ADAPTIVE=0 可关）"
+        } else {
+            "关闭（GLASS_ADAPTIVE=0）"
+        }
+    );
     let mut msg = MSG::default();
     loop {
         let loop_start = Instant::now();
@@ -1077,6 +1526,8 @@ fn main() {
             let _ = unsafe { TranslateMessage(&msg) };
             unsafe { DispatchMessageW(&msg) };
         }
+        let msg_us = loop_start.elapsed().as_micros();
+        let cap_start = Instant::now();
 
         if app.rebuild_monitors {
             app.rebuild_monitors = false;
@@ -1087,23 +1538,55 @@ fn main() {
         // DDA 的阻塞等待同时充当主循环唯一的休眠点（方案 12.4.1「以采集帧为
         // 主时钟」）：桌面有新内容立即返回，静止时在驱动里内核等待。
         let mut new_backdrop = false;
+        // 哪些屏上有玻璃块（用上一帧的归属即可，跨屏是低频事件）
+        let mut active = [false; 16];
+        let mut overflow = false;
+        for b in app.manager.blocks() {
+            match active.get_mut(b.monitor) {
+                Some(slot) => *slot = true,
+                None => overflow = true,
+            }
+        }
         {
             let gfx = &app.gfx;
-            for mon in app.monitors.iter_mut() {
+            for (mi, mon) in app.monitors.iter_mut().enumerate() {
                 mon.new_backdrop = false;
                 mon.backdrop_dirty = None;
                 mon.copied_px = 0;
+                // 没有玻璃块的屏：整条采集（AcquireNextFrame + 脏矩形 + 局部拷贝）
+                // 都可以省掉，降到 4 Hz 保活即可。归因实测这一项单独值 +20% 帧率。
+                let has_blocks = overflow || active.get(mi).copied().unwrap_or(true);
+                let age = mon.last_capture.elapsed();
+                if mon.capture.is_some()
+                    && mon.ready
+                    && !has_blocks
+                    && age < idle_capture_interval
+                {
+                    continue;
+                }
+                // 只在「块刚落到这块屏」的那一帧强制阻塞取新帧，避免玻璃里
+                // 闪出一帧旧桌面。其余情况：有块的屏用主循环决定的等待步长
+                // （拖拽时 0，静止时 IDLE_WAIT_MS），没块的屏用 32 ms 保活。
+                // 注意不能按"距上次采集多久"判断陈旧 —— 桌面安静时采集本来就稀疏，
+                // 那样会让有块的屏也一直走 32 ms 阻塞，白降帧率。
+                let just_activated = has_blocks && mon.idle_capturing;
+                mon.idle_capturing = !has_blocks;
+                let wait = if just_activated || !has_blocks {
+                    32
+                } else {
+                    capture_wait_ms
+                };
                 let (outcome, dirty, copied, lost) = match mon.capture.as_mut() {
                     Some(cap) => {
-                        let r = cap.try_capture(&gfx.device, &gfx.ctx, capture_wait_ms);
-                        (r, cap.dirty_union, cap.copied_px, cap.access_lost)
+                        let r = cap.try_capture(&gfx.device, &gfx.ctx, wait);
+                        (r, cap.dirty_union(), cap.copied_px(), cap.access_lost())
                     }
                     // 没有采集源：到点再尝试重建（独占全屏 / 录屏软件抢占后恢复）
                     None => {
                         if Instant::now() >= mon.retry_at {
                             mon.retry_at =
                                 Instant::now() + std::time::Duration::from_millis(500);
-                            match DdaCapture::new_for_monitor(&gfx.device, mon.info.hmonitor) {
+                            match Capture::for_monitor(&gfx.device, mon.info.hmonitor) {
                                 Ok(cap) => {
                                     if mon.capture_error_logged {
                                         eprintln!("[info] {} 采集已恢复", mon.info.name);
@@ -1141,9 +1624,11 @@ fn main() {
                         mon.new_backdrop = changed;
                         mon.backdrop_dirty = dirty;
                         mon.copied_px = copied;
+                        mon.last_capture = Instant::now();
                         if !mon.ready && mon.compositor.capture_ready() {
                             mon.ready = true;
-                            mon.show();
+                            mon.hidden_capture = false;
+                            apply_visibility(mon);
                         }
                     }
                     Ok(None) => {}
@@ -1162,11 +1647,10 @@ fn main() {
                             Instant::now() + std::time::Duration::from_millis(500);
                         mon.capture = None;
                         if mon.ready {
-                            // 画面会冻结在最后一帧，且仍压在独占全屏应用之上，
-                            // 因此采集一失效就隐藏画布，恢复后再显示（方案 R-16）。
-                            unsafe {
-                                let _ = ShowWindow(mon.hwnd, SW_HIDE);
-                            };
+                            // 画面会冻结在最后一帧，因此采集一失效就隐藏画布，
+                            // 恢复后再显示。
+                            mon.hidden_capture = true;
+                            apply_visibility(mon);
                         }
                         mon.ready = false;
                     }
@@ -1178,6 +1662,44 @@ fn main() {
             }
         }
 
+        let cap_us = cap_start.elapsed().as_micros();
+        let prep_start = Instant::now();
+
+        if let Some((sw_, sh_, shz)) = sim {
+            let interval = std::time::Duration::from_secs_f64(1.0 / shz);
+            let now = Instant::now();
+            if now >= sim_next {
+                // 脏区固定放在主屏正中，保证每帧 Pass A / Pass B 的工作量完全一致
+                let (mo, ms) = {
+                    let info = &app.monitors[0].info;
+                    ([info.origin[0], info.origin[1]], [info.size[0], info.size[1]])
+                };
+                let cx = mo[0] + ms[0] / 2;
+                let cy = mo[1] + ms[1] / 2;
+                let rect = [
+                    (cx - sw_ / 2).max(mo[0]),
+                    (cy - sh_ / 2).max(mo[1]),
+                    (cx + sw_ / 2).min(mo[0] + ms[0]),
+                    (cy + sh_ / 2).min(mo[1] + ms[1]),
+                ];
+                for m in app.monitors.iter_mut() {
+                    m.new_backdrop = true;
+                    m.backdrop_dirty = Some(rect);
+                }
+                new_backdrop = true;
+                sim_next += interval;
+                if now.duration_since(sim_next) > interval * 4 {
+                    sim_next = now + interval;
+                }
+            } else {
+                for m in app.monitors.iter_mut() {
+                    m.new_backdrop = false;
+                    m.backdrop_dirty = None;
+                }
+                new_backdrop = false;
+            }
+        }
+
         // ---- 控制面板参数同步（每帧读取原子值，无锁） ----
         let previous_params = app.params.clone();
         app.shared.apply(&mut app.params);
@@ -1186,7 +1708,18 @@ fn main() {
             app.params.spec_intensity = 4.0;
             app.params.spec_power = 1.0;
         }
+        quality.apply(&mut app.params);
         let params_changed = app.params != previous_params;
+        // level 1 的 frost 半分辨率档：切换会重建金字塔，只在档位真的变化时做
+        let want_half = quality.frost_half();
+        if want_half != frost_half_applied {
+            for mon in app.monitors.iter_mut() {
+                if let Err(e) = mon.compositor.set_frost_half(&app.gfx, want_half) {
+                    eprintln!("[warn] {} 切换 frost 档位失败: {e}", mon.info.name);
+                }
+            }
+            frost_half_applied = want_half;
+        }
         if params_changed && (app.params.ior - previous_params.ior).abs() > f32::EPSILON {
             if let Err(e) = app.glass.update_lut(&app.gfx.ctx, &app.params) {
                 eprintln!("update LUT: {e}");
@@ -1363,6 +1896,29 @@ fn main() {
         let mut mouse_relevant = false;
         for mi in 0..app.monitors.len() {
             collect_monitor_blocks(&mut app, mi, params_changed);
+            // 空屏画布隐藏（1 秒防抖）：见 MonitorRt::hidden_empty 的说明。
+            {
+                let empty = app.monitors[mi].blocks.is_empty();
+                let mon = &mut app.monitors[mi];
+                if empty {
+                    match mon.empty_since {
+                        Some(t) if t.elapsed() >= std::time::Duration::from_secs(1) => {
+                            if !mon.hidden_empty {
+                                mon.hidden_empty = true;
+                                apply_visibility(mon);
+                            }
+                        }
+                        Some(_) => {}
+                        None => mon.empty_since = Some(Instant::now()),
+                    }
+                } else {
+                    mon.empty_since = None;
+                    if mon.hidden_empty {
+                        mon.hidden_empty = false;
+                        apply_visibility(mon);
+                    }
+                }
+            }
             let mon_dragging = drag_monitor == Some(mi);
             // 拖拽只影响被拖块所在的那块屏；其他屏的区域不必重建
             // （SetWindowRgn 会让 DWM 重裁剪整个 overlay，是长尾的主要来源）。
@@ -1426,18 +1982,43 @@ fn main() {
             }
         }
 
+        // 独占全屏应用检测（方案 R-16）：4 Hz 轮询，命中就隐藏该屏画布，
+        // 避免全屏置顶画布破坏游戏的独占全屏与 MPO。
+        if app.fs_check_at.elapsed() >= std::time::Duration::from_millis(250) {
+            app.fs_check_at = Instant::now();
+            let drag_active = app.drag.is_some();
+            for mon in app.monitors.iter_mut() {
+                // 拖拽中隐藏画布会释放 SetCapture，把拖拽状态机打断，
+                // 因此拖拽期间推迟到抬起后再处理。
+                let hit = !drag_active && fullscreen_app_on(mon.hwnd);
+                if hit != mon.hidden_fs {
+                    mon.hidden_fs = hit;
+                    apply_visibility(mon);
+                    if hit {
+                        eprintln!("[info] {} 检测到独占全屏应用，暂时隐藏玻璃", mon.info.name);
+                    } else {
+                        eprintln!("[info] {} 独占全屏应用已退出，恢复玻璃", mon.info.name);
+                    }
+                }
+            }
+        }
+
+        let prep_us = prep_start.elapsed().as_micros();
+
         // ---- 渲染门控（方案 12.4.1）：没有任何触发源就整帧跳过 ----
         let velocity_active =
             app.drag_velocity[0].abs() >= 0.01 || app.drag_velocity[1].abs() >= 0.01;
         let requested = RENDER_REQUEST.swap(false, std::sync::atomic::Ordering::Acquire);
-        let need_render = new_backdrop
+        let fps_capped = !quality.allow_present(Instant::now());
+        let need_render = !fps_capped
+            && (new_backdrop
             || params_changed
             || geometry_changed
             || hover_changed
             || mouse_relevant
             || dragging
             || velocity_active
-            || requested;
+            || requested);
 
         if !need_render {
             // 静止：不重画、不 Present、不 Commit。
@@ -1457,6 +2038,7 @@ fn main() {
                     loop_start.elapsed().as_micros(),
                     0,
                     false,
+                    [msg_us, cap_us, prep_us],
                 );
             }
             continue;
@@ -1511,7 +2093,9 @@ fn main() {
 
         if presented {
             app.frames += 1;
+            quality.note_present(Instant::now());
         }
+        quality.tick(loop_start.elapsed().as_micros(), presented);
         if metrics_enabled {
             report_metrics(
                 &mut app,
@@ -1519,6 +2103,7 @@ fn main() {
                 loop_start.elapsed().as_micros(),
                 render_us,
                 presented,
+                [msg_us, cap_us, prep_us],
             );
         }
     }

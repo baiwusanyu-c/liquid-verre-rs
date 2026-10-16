@@ -1,15 +1,17 @@
 # liquid-glass —— Windows 桌面液态玻璃
 
 严格按《折射渲染方案》v1.1 实现的 Windows 桌面「液态玻璃块」叠加层。
-原生 **DDA + D3D11 + DirectComposition** 管线，不依赖任何 WebView / 前端运行时。
+原生 **WGC/DDA + D3D11 + DirectComposition** 管线，不依赖任何 WebView / 前端运行时。
 **多显示器**：每块屏独立采集、独立金字塔、独立画布，分辨率与 DPI 各不相同也各自正确。
 
 ## 架构
 
 ```
 每块显示器（EnumDisplayMonitors + GetDpiForMonitor）
-  ├─ 1 个 DXGI Desktop Duplication（按 HMONITOR 匹配 DXGI output）
-  │     └─ 脏矩形 -> 只 CopySubresourceRegion 变化的区域，不整屏搬 26 MB
+  ├─ 1 个采集会话，按方案 10.5 的 pick_backend() 选后端：
+  │     DDA（优先，提供脏矩形、延迟更低）-> 失败回退 WGC（支持并发采集）
+  │     └─ DDA: 脏矩形 -> 只 CopySubresourceRegion 变化的区域，不整屏搬 26 MB
+  │     └─ 失效（锁屏/独占全屏/被占用）时 500 ms 退避重建，恢复后自动继续
   ├─ 1 份该屏分辨率的共享 D3D11 纹理
   ├─ 1 套该屏的模糊金字塔，只刷新「DDA 脏矩形 ∩ 块足迹 ⊕ 采样余量」
   └─ 1 个全屏画布窗口（WS_EX_NOREDIRECTIONBITMAP + WDA_EXCLUDEFROMCAPTURE）
@@ -30,8 +32,12 @@
 | 单设备、每屏一次 Present | 一次 Present / 一次 DComp Commit，与块数无关 |
 | **没有玻璃的屏整帧短路** | 不清屏、不 Pass B、不 Present、不 Commit |
 | **事件驱动** | 无触发源就整帧跳过；静止桌面不 Present、不 Commit |
-| 自反馈根治 | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` |
+| 自反馈根治 | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`（DDA/WGC 均已验收：不是黑块） |
 | 拖拽期零 `SetWindowRgn` | 按下时一次性扩到整窗，抬起后收紧 |
+| 不抢焦点 | 画布带 `WS_EX_NOACTIVATE`（方案 需求 2） |
+| 独占全屏自动让路 | 无边框 popup 铺满显示器时隐藏该屏画布，退出后恢复（方案 R-16） |
+| 环境色不闪烁 | 1/16 层 GPU ping-pong EMA，τ=150 ms，零回读（方案 12.6 / R-20） |
+| 撑不住时自动降档 | 自适应质量控制器（方案 12.4.3，**默认开启**）：持续丢 vblank 才逐级降，恢复后逐级升回；level 0 与未启用时**逐位一致** |
 
 ### 渲染管线（逐帧）
 
@@ -98,14 +104,43 @@ cargo run --release
 | `GLASS_VERIFY_PASS_A=1` | 同进程再渲一帧「全量 Pass A + 整屏 Pass B」，输出 `.full.bmp` 对照图 |
 | `GLASS_VERIFY_COPY=1` | 并行维护整屏拷贝的参考纹理，周期性逐像素比对局部拷贝结果 |
 | `GLASS_EXTREME_SPEC=1` | 极端高光回归（`spec_intensity=4.0`、`spec_power=1.0`） |
+| `GLASS_BACKEND=dda\|wgc` | 强制指定采集后端（默认 DDA 优先、失败回退 WGC） |
+| `GLASS_WGC_BUFFERS=<2..8>` | WGC 帧池缓冲数（方案 12.7：>90 Hz 用 3） |
+| `GLASS_MONITORS=<n>` | 只启用前 n 块显示器 |
+| `GLASS_ENV_EMA=0` | 关闭环境色时域平滑，回到逐帧直采 1/16 层 |
+| `GLASS_ADAPTIVE=0` | 关闭自适应质量控制器（**默认开启**）。level 0 = 与关闭时逐位一致，只有持续丢帧才降档 |
+| `GLASS_FROST_HALF=1` | 手动强制 frost 保持 1/2 分辨率（自适应控制器的 level 1）。差异 ≤3/255，非逐位一致 |
+| `GLASS_SYNTH_CAP=1` | 用确定性合成图案覆盖采集结果，使跨进程/跨时间的逐像素取证可复现 |
+| `GLASS_SKIP_PASS_A/PASS_B/PRESENT=1` | 归因开关：分别跳过某一段 GPU 工作（画面会不正确，仅实验用） |
 
 ### 自检脚本
 
 ```powershell
+python tools/verify_all.py           # 7 项逐像素取证，期望 ALL PASS（含跨版本对比）
+python tools/verify_adaptive.py      # 自适应控制器行为：降档/回升/显存回收
+python tools/attribute.py            # 拖拽帧时间归因：逐项关掉 Pass A / Pass B / Present
 python tools/perf_probe.py --case all --seconds 12 --warmup 4 --out tools/final.json
-python tools/verify_dirty.py         # 脏矩形渲染 vs 全量渲染，逐像素
+python tools/verify_dirty.py         # 脏矩形渲染 vs 全量渲染，逐像素（含真实拖拽）
 python tools/verify_crossscreen.py   # 跨屏拖拽 + DPI 换算验收
+python tools/measure_frost_half.py   # frost 半分辨率档的视觉代价 + 性能收益量化
 ```
+
+自适应质量档位（方案 12.4.3，按**实测收益**排序）：
+
+| level | 动作 | 触发条件 |
+|---|---|---|
+| 0 | 全部效果开启，与未启用控制器时逐位一致 | 默认 |
+| 1 | frost 保持 1/2 分辨率（+14% fps、−36.5 MB；模糊层差异 ≤3/255） | 1 秒窗口丢 vblank >25% 连续 2 次 |
+| 2 | + 帧率上限 60（把抖动变成恒定 60 fps） | 同上 |
+| 3 | + 关闭焦散与 Beer-Lambert 吸收 | 同上 |
+| 4 | + 关闭 RGB 色散 | 同上 |
+
+升档需要连续 4 个干净窗口**且距上次降档 ≥20 s**；升上去 10 秒内被打回视为失败探针，
+探针间隔翻倍（上限 300 s），避免在两个档位之间周期振荡。
+
+`tools/verify_all.py` 的 7 项：跨版本 overlay / composed / capture 三项逐位对比
+（需要先把 `82a49e8` 拉成 worktree 并打同一份合成采集源补丁，见 `performance_report.md` 第七节）、
+脏矩形 vs 全量、跨屏拖拽、环境色 EMA 开关等价、DDA 局部拷贝 vs 整屏参考拷贝。
 
 ## 项目结构
 
@@ -117,15 +152,19 @@ liquid-glass/
 │  ├─ glass_ps.hlsl         # SDF + Snell 折射 + 色散 + Fresnel + 焦散 + 鼠标光
 │  ├─ blur_down.hlsl        # 4-tap 角点下采样
 │  ├─ blur_up.hlsl          # 8-tap tent 上采样
+│  ├─ env_ema.hlsl          # 1/16 环境色探针时域平滑（方案 12.6 / R-20）
 │  └─ reduce_env.hlsl       # 备用：独立 pass 版环境色探针（未接入管线）
 ├─ src/
-│  ├─ main.rs               # 多屏画布管理、消息循环、事件驱动调度、脏区门控
+│  ├─ main.rs               # 多屏画布管理、消息循环、事件驱动调度、脏区门控、
+│  │                        #   独占全屏检测、自适应质量控制器
+│  ├─ capture/mod.rs        # Capture 统一封装 + pick_backend()（方案 10.5）+ 合成采集源
 │  ├─ capture/dda.rs        # 每屏一个 duplication + 脏矩形 + 局部拷贝 + 失效退避重建
+│  ├─ capture/wgc.rs        # WGC 后端：CreateFreeThreaded + 帧生命周期 + 事件通知
 │  ├─ gfx/
 │  │  ├─ monitors.rs        # 显示器枚举（物理几何 + 每屏 DPI）
 │  │  ├─ device.rs          # D3D11 设备 / DXGI 工厂 / 帧队列深度
 │  │  ├─ shaders.rs         # HLSL 编译与状态对象
-│  │  ├─ pyramid.rs         # Pass A：可裁剪的共享模糊金字塔
+│  │  ├─ pyramid.rs         # Pass A：可裁剪的共享模糊金字塔 + 环境色 EMA
 │  │  ├─ glass_renderer.rs  # Pass B：逐块 scissor 绘制
 │  │  ├─ compositor.rs      # 画布、脏区推导、分级重绘、取证
 │  │  ├─ gpu_timer.rs       # D3D11 timestamp（方案 7.6）

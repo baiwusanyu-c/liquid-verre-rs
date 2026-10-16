@@ -20,19 +20,6 @@ impl Default for Profile {
 }
 
 impl Profile {
-    /// H(u)，u: 0 边缘 → 1 平面
-    pub fn height(self, u: f32) -> f32 {
-        let u = u.clamp(0.0, 1.0);
-        match self {
-            Profile::Circular => {
-                let x = 1.0 - u;
-                (1.0 - x * x).max(0.0).sqrt()
-            }
-            Profile::Parabolic => u * u,
-            Profile::Sinusoidal => (u * std::f32::consts::FRAC_PI_2).sin(),
-        }
-    }
-
     /// |dH/du|
     pub fn slope(self, u: f32) -> f32 {
         let u = u.clamp(0.0, 1.0);

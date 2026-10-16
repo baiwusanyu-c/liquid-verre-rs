@@ -209,7 +209,7 @@ impl GlassRenderer {
         let (Some(frost), Some(soft), Some(env16)) = (
             pyramid.frost.as_ref(),
             pyramid.soft.as_ref(),
-            pyramid.env16.as_ref(),
+            pyramid.env_rt(),
         ) else {
             return;
         };
@@ -434,14 +434,6 @@ impl GlassRenderer {
                 [None, None, None, None, None, None, None, None, None];
             ctx.PSSetShaderResources(0, Some(&null));
             ctx.OMSetRenderTargets(None, None);
-        }
-    }
-
-    /// 供渲染线程读取：更新环境色 EMA（GPU 1x1 ping-pong 的 CPU 回读替代，
-    /// 只在明确允许时才回读，默认走 shader 侧 EMA）。
-    pub fn set_env_ema(&mut self, rgb: [f32; 3]) {
-        for i in 0..3 {
-            self.env_ema[i] = self.env_ema[i] * 0.88 + rgb[i] * 0.12;
         }
     }
 }
