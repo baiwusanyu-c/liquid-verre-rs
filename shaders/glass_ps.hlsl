@@ -206,19 +206,36 @@ float4 ps_main(float4 vpos:SV_POSITION):SV_Target
     // pointer continuously without introducing a per-block CPU allocation.
     float2 lightOffset=mouseOffset-c13.xy*c13.z;
     float2 normalizedMouse=float2(lightOffset.x/max(lensSize.x,1),lightOffset.y/max(lensSize.y,1))*100;
-    float angle=radians(135+normalizedMouse.x*1.2); float2 gradientDirection=float2(sin(angle),-cos(angle));
+    // 鼠标驱动的渐变/描边反馈必须随距离衰减到 0。否则 normalizedMouse 无衰减，
+    // 光标在屏幕任何位置移动都会改变**每一块**玻璃的 border 渐变方向与 overlay
+    // 幅度；再叠加脏矩形重绘（邻居块只重画与脏区相交的部分），就会出现
+    // "拖一块、其余块边缘一起抖"的现象。
+    // prox = 高斯衰减 ∪ 本块被 hover/拖拽：被操作的块保持完整响应，
+    // 其余块在光标远离时 normalizedMouse -> 0，渐变退化为恒定的 135 度中性方向，
+    // 逐帧完全不变。
+    // gate 是**按块中心到光标的距离**的有限支撑窗：超过 3*mouse_radius 精确为 0。
+    // 用有限支撑而不是纯高斯，是因为高斯尾巴永不为零，会让远处块随光标产生
+    // ±1 LSB 的变化；而脏矩形重绘只重画"光标影响盒"内的块，影响盒必须与这个
+    // 支撑半径严格对齐，否则块内会出现"重画区/保留区"两种渲染拼接的移动接缝。
+    float bd=length(c11.xy-blockCenterScreen);
+    float gate=1.0-smoothstep(c11.z*2.5,c11.z*3.0,bd);
+    // 被 hover/拖拽的块保持完整响应（prox=1）；其余块按 高斯*有限窗 衰减，
+    // 远离光标时精确为 0 -> 渐变退化为恒定的 135 度中性方向，逐帧完全不变。
+    float prox=max(fall*gate,c12.y);
+    float2 nMouse=normalizedMouse*prox;
+    float angle=radians(135+nMouse.x*1.2); float2 gradientDirection=float2(sin(angle),-cos(angle));
     float gradientExtent=max(dot(abs(gradientDirection),hs),.0001);
     float2 localTopLeft=local+hs;
     float gradientPosition=dot(localTopLeft-lensSize*.5,gradientDirection)/(gradientExtent*2)+.5;
-    float stopA=clamp((33+normalizedMouse.y*.3)/100,.1,.9),stopB=clamp((66+normalizedMouse.y*.4)/100,.1,.9);
+    float stopA=clamp((33+nMouse.y*.3)/100,.1,.9),stopB=clamp((66+nMouse.y*.4)/100,.1,.9);
     // Use a wider, curvature-aware border field. A one-pixel mask makes the
     // straight-edge/corner transition look segmented at extreme spec settings.
     float borderWidth=max(c9.w*2.0,2.0),borderMask=saturate(1-smoothstep(0,borderWidth,insideDistance))*glassCoverage;
     float insetDirection=saturate(.5-gr.y*.5),insetGlow=exp(-.5*pow(insideDistance/max(borderWidth,.001),2))*insetDirection*.25;
     float insetAlpha=saturate((1-smoothstep(.25,.75,insideDistance))*.5+insetGlow)*borderMask;
-    float screenAlpha=saturate(GradientAlpha(gradientPosition,stopA,stopB,.12+abs(normalizedMouse.x)*.008,.4+abs(normalizedMouse.x)*.012))*borderMask*.2;
+    float screenAlpha=saturate(GradientAlpha(gradientPosition,stopA,stopB,.12+abs(nMouse.x)*.008,.4+abs(nMouse.x)*.012))*borderMask*.2;
     screenAlpha=1-(1-screenAlpha)*(1-insetAlpha*.2); col=1-(1-col)*(1-screenAlpha);
-    float overlayAlpha=saturate(GradientAlpha(gradientPosition,stopA,stopB,.32+abs(normalizedMouse.x)*.008,.6+abs(normalizedMouse.x)*.012))*borderMask;
+    float overlayAlpha=saturate(GradientAlpha(gradientPosition,stopA,stopB,.32+abs(nMouse.x)*.008,.6+abs(nMouse.x)*.012))*borderMask;
     overlayAlpha=1-(1-overlayAlpha)*(1-insetAlpha);
     // Reference mouse light modulates the overlay/diffraction color field over
     // the bevel, not a hard white line. Apply a soft field inside the transition

@@ -1055,7 +1055,23 @@ fn on_battery() -> bool {
 ///
 /// 判据用「丢 vblank 的比例」而不是 GPU timestamp：timestamp query 会打断驱动的
 /// 命令批处理（实测把帧率打到 15 fps），用它做闭环会自我实现地降级。
-/// 丢帧比例 = 单循环耗时 > 1.25 × 垂直消隐间隔 的**渲染帧**占比。
+/// 丢帧比例 = **我们自己那一帧的工作量**（渲染前准备 + Pass A + Pass B + Commit）
+/// > 1.25 × 垂直消隐间隔 的**渲染帧**占比。
+///
+/// 为什么必须排除两段阻塞等待（它们都不是渲染成本）：
+/// 1. 采集阶段等桌面新帧：桌面安静时驱动侧一等就是 8~32 ms；
+/// 2. Present 等 vblank / DWM 背压：实测 6.6~25 ms（1~3 个消隐）。
+///
+/// 旧判据用整循环时长，把这两段都算成「丢帧」，结果单块拖拽也被判成
+/// 「1 秒窗口 56 帧中丢 vblank 55%」、一路降到 level 2 —— 而我们自己的工作只有
+/// 50 µs/帧（8.33 ms 预算的 1/160）。代价是白白把 frost 降成半分辨率（视觉改动），
+/// fps 一点没变好（51.8 -> 51.0，瓶颈在触发节拍与 DWM，不在渲染）。
+///
+/// 已知取舍（诚实记录）：这个判据对「纯 GPU/DWM 背压」是盲的 —— 那种情况下
+/// Present 阻塞变长而我们的提交时间不变。选它是因为误降档在本机是**每次拖拽
+/// 必现**的实测缺陷，而纯 GPU 背压从未实测到过（最坏窗口里 A+B+C 仍只有 50 µs）。
+/// 若将来真出现 GPU 背压场景，正确做法是先用 `DwmGetCompositionTimingInfo`
+/// 拿到 DWM 实际合成节拍（混合刷新率下会变成 60 Hz），再按那个节拍判丢帧。
 ///
 /// 防抖：连续 2 个 1 秒窗口超阈值才降档；连续 4 个窗口干净**且距上次降档 ≥20 s**
 /// 才升档。后一条是为了避免周期振荡 —— 降到 1 档后变流畅、立刻升回 0 档又卡、
@@ -1355,6 +1371,25 @@ fn main() {
         let h = (lh * 0.68).clamp(480.0, 760.0);
         manager.add(((lw - w) * 0.5).max(8.0), ((lh - h) * 0.5).max(8.0), w, h);
     }
+    // GLASS_FAR_GRID=1：4 块互不重叠、分开足够远的确定性布局，
+    // 专供 tools/verify_mouse_isolation.py 做「拖一块，其余块逐位不变」的硬证明。
+    // 为什么不能直接用 GLASS_MANY：那 20 块是密集重叠布局（步长 0.62w/0.60h），
+    // 邻近余晖会沿重叠块的半透明阴影逐块传递，合法余晖与非法串扰无法区分，
+    // 判定集合的传递闭包会吞掉全部 20 块，测试就失去判别力。
+    // 光标落在块 0 内时，其余块的中心距都 > gate 支撑半径 3*mouse_radius=660，
+    // 因此光标落在任一块上时，其余块必须逐位与光标在远处时完全一致。
+    if std::env::var("GLASS_FAR_GRID").ok().as_deref() == Some("1") {
+        manager.clear();
+        // 2x2，块 500x340，横向间距 700 / 纵向间距 660（边到边）。
+        // 判据要求：光标落在块 0 内部（偏心点）时，其余 3 块的**最近边缘**
+        // 到光标的距离都必须 >= 900px，即高斯余晖 fall=exp(-d^2/2R^2) <= 2.4e-4，
+        // 经 glint*hoverGain 两次相乘后 <=1e-8 -> 落到 8bit 必然为 0，可断言严格逐位一致。
+        // （第一版布局纵向只隔 700px，fall=0.0064，实测仍有 2 个像素因舍入边界差 1 LSB。）
+        let cells: [(f32, f32); 4] = [(600.0, 300.0), (1800.0, 300.0), (600.0, 1300.0), (1800.0, 1300.0)];
+        for &(bx, by) in &cells {
+            manager.add(bx.min((lw - 500.0).max(8.0)), by.min((lh - 340.0).max(8.0)), 500.0f32, 340.0f32);
+        }
+    }
     // GLASS_SPREAD=1：在每块显示器正中各放一块玻璃，用于多屏验收。
     // 尺寸以「主屏物理像素」为逻辑单位，落到别的屏时按该屏 DPI 换算，
     // 因此在分辨率 / 缩放各不相同的屏上物理观感一致（方案 12.2.5）。
@@ -1388,10 +1423,21 @@ fn main() {
         .new_height
         .store(400, std::sync::atomic::Ordering::Relaxed);
 
-    let cursor_start = [
-        monitors_rt[0].info.origin[0] as f32 + monitors_rt[0].info.size[0] as f32 * 0.5,
-        monitors_rt[0].info.origin[1] as f32 + monitors_rt[0].info.size[1] as f32 * 0.5,
-    ];
+    // GLASS_CURSOR_AT=x,y：把初始光标位置固定下来（回归测试用）。
+    // 配合 GLASS_SYNTH_CAP 可以在"光标在远处两个不同位置"之间做逐像素对比，
+    // 用来证明非 hover 块不受光标移动影响。
+    let cursor_start = match std::env::var("GLASS_CURSOR_AT")
+        .ok()
+        .and_then(|v| {
+            let (x, y) = v.split_once(',')?;
+            Some([x.parse::<f32>().ok()?, y.parse::<f32>().ok()?])
+        }) {
+        Some(c) => c,
+        None => [
+            monitors_rt[0].info.origin[0] as f32 + monitors_rt[0].info.size[0] as f32 * 0.5,
+            monitors_rt[0].info.origin[1] as f32 + monitors_rt[0].info.size[1] as f32 * 0.5,
+        ],
+    };
     let mut app = App {
         gfx,
         glass,
@@ -1476,6 +1522,15 @@ fn main() {
     let metrics_enabled = std::env::var("GLASS_METRICS").ok().as_deref() == Some("1");
     // 旧实现每帧 std::env::var 会加进程环境锁并分配 String，这里只读一次。
     let extreme_spec = std::env::var("GLASS_EXTREME_SPEC").ok().as_deref() == Some("1");
+    // GLASS_SIM_BUSY=<ms>：给每个渲染帧注入一段确定性 CPU 忙等，用来验证自适应
+    // 控制器的降档/回升闭环。真机上我们的渲染成本只有 0.16 ms/帧，远低于 8.33 ms
+    // 预算，控制器在真实负载下（正确地）不会触发；没有这个开关就无法验证它还能不能工作。
+    // 默认 0 = 关闭。注意它会同时抬高 CPU 占用，只在验证控制器时开。
+    let sim_busy_us: u128 = std::env::var("GLASS_SIM_BUSY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|ms| (ms.max(0.0) * 1000.0) as u128)
+        .unwrap_or(0);
     // GLASS_VERIFY_PASS_A=1：拍一张「脏矩形受限 Pass A」的帧后，立刻用同一张
     // capture 强制跑一次「全量 Pass A + 全量 Pass B」，输出 .full.bmp 对照图。
     let verify_pass_a = std::env::var("GLASS_VERIFY_PASS_A").ok().as_deref() == Some("1");
@@ -1892,7 +1947,8 @@ fn main() {
 
         // ---- 每屏：投影块 + 窗口区域 + 点击穿透 ----
         let margin = app.params.shadow_margin.max(0.0);
-        let influence = app.params.mouse_radius * 2.5 + 32.0 + margin;
+        // 与 glass_ps.hlsl 的 gate 支撑半径、Compositor 的脏区影响盒保持一致
+        let influence = app.params.mouse_radius * 3.0 + 32.0 + margin;
         let mut mouse_relevant = false;
         for mi in 0..app.monitors.len() {
             collect_monitor_blocks(&mut app, mi, params_changed);
@@ -2058,13 +2114,31 @@ fn main() {
             time: app.time(),
         };
         let render_start = Instant::now();
+        // 只在 GLASS_SIM_BUSY>0 且正在拖拽时存在：模拟「拖拽期我们自己的工作超预算」，
+        // 于是 verify_adaptive 的时间线（拖拽 = 重负载 / 松手 = 轻负载）能确定性地
+        // 驱动降档与回升，不依赖桌面当时到底忙不忙。
+        let mut sim_us: u128 = 0;
+        if sim_busy_us > 0 && dragging {
+            let spin = Instant::now();
+            while spin.elapsed().as_micros() < sim_busy_us {
+                std::hint::spin_loop();
+            }
+            sim_us = spin.elapsed().as_micros();
+        }
         let mut presented = false;
+        // 判据只能用「我们自己的工作」：渲染前准备 + Pass A + Pass B + Commit。
+        // 不能用 render_us / loop_us，因为它们里含两段阻塞等待（详见 QualityCtrl 文档）：
+        //   采集阶段等桌面新帧 8~32 ms、Present 等 vblank/DWM 背压 6.6~25 ms。
+        // last_stage_us = [Pass A, Pass B, Present, Commit]，这里故意跳过 Present。
+        let mut own_us: u128 = prep_us + sim_us;
         for mi in 0..app.monitors.len() {
             if !app.monitors[mi].ready {
                 continue;
             }
             if render_monitor(&mut app, mi, &ctx, false) {
                 presented = true;
+                let st = app.monitors[mi].compositor.last_stage_us;
+                own_us += st[0] + st[1] + st[3];
             }
         }
         let render_us = render_start.elapsed().as_micros();
@@ -2095,7 +2169,7 @@ fn main() {
             app.frames += 1;
             quality.note_present(Instant::now());
         }
-        quality.tick(loop_start.elapsed().as_micros(), presented);
+        quality.tick(own_us, presented);
         if metrics_enabled {
             report_metrics(
                 &mut app,

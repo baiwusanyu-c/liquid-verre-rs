@@ -33,10 +33,12 @@
 | **没有玻璃的屏整帧短路** | 不清屏、不 Pass B、不 Present、不 Commit |
 | **事件驱动** | 无触发源就整帧跳过；静止桌面不 Present、不 Commit |
 | 自反馈根治 | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`（DDA/WGC 均已验收：不是黑块） |
+| **HDR 桌面** | HDR/宽色域输出（色彩空间 ≠ SDR G22）下 DDA 复制面是 HDR 参考值（整张桌面过曝）；自动改走 **WGC**，由 DWM 完成 HDR→SDR（实测与 SDR 桌面统计一致）。SDR 输出仍 DDA 优先；`GLASS_BACKEND` 可强制 |
 | 拖拽期零 `SetWindowRgn` | 按下时一次性扩到整窗，抬起后收紧 |
 | 不抢焦点 | 画布带 `WS_EX_NOACTIVATE`（方案 需求 2） |
 | 独占全屏自动让路 | 无边框 popup 铺满显示器时隐藏该屏画布，退出后恢复（方案 R-16） |
 | 环境色不闪烁 | 1/16 层 GPU ping-pong EMA，τ=150 ms，零回读（方案 12.6 / R-20） |
+| **块与块之间零串扰** | 鼠标驱动的 border 渐变乘 `fall × 有限支撑窗(3R)`，脏区「光标影响盒」半径与之严格对齐：**不再被重画的块，其鼠标项精确为 0**（`tools/verify_mouse_isolation.py` 逐位取证） |
 | 撑不住时自动降档 | 自适应质量控制器（方案 12.4.3，**默认开启**）：持续丢 vblank 才逐级降，恢复后逐级升回；level 0 与未启用时**逐位一致** |
 
 ### 渲染管线（逐帧）
@@ -97,6 +99,8 @@ cargo run --release
 | `GLASS_GPU_TIMINGS=1` | 额外打开 D3D11 timestamp 计时。**会打断驱动批处理、显著拖慢管线**，只在专门做 GPU 归因时开 |
 | `GLASS_MANY=1` | 启动即 20 块自动布局 |
 | `GLASS_SPREAD=1` | 每块显示器正中各放一块玻璃（多屏验收） |
+| `GLASS_FAR_GRID=1` | 4 块互不重叠的分离布局（跨块串扰取证用） |
+| `GLASS_CURSOR_AT=x,y` | 固定首帧光标位置，使「光标在 A 处」与「光标在 B 处」两张取证图可逐像素对比 |
 | `GLASS_FRAME_LATENCY=<1..8>` | DXGI 渲染队列深度，默认 1（方案 7.4-7，降低光标到画面的滞后） |
 | `GLASS_FORCE_FULL=1` | 关闭 Pass B 脏矩形，每帧整屏重画（A/B 对照） |
 | `GLASS_INTERNAL_SHOT=<path>` | 输出内部取证图（合成结果 / overlay / capture / frost） |
@@ -108,6 +112,9 @@ cargo run --release
 | `GLASS_WGC_BUFFERS=<2..8>` | WGC 帧池缓冲数（方案 12.7：>90 Hz 用 3） |
 | `GLASS_MONITORS=<n>` | 只启用前 n 块显示器 |
 | `GLASS_ENV_EMA=0` | 关闭环境色时域平滑，回到逐帧直采 1/16 层 |
+| `GLASS_VERIFY_VALIDITY=1` | 漏更新自检：金字塔有效性虚报 / 该重画却漏掉的块，只打印计数不改渲染 |
+| `GLASS_FORCE_HDR_CONV=1` | SDR 源也强制走 HDR->SDR 转换路径（数值校验用） |
+| `GLASS_SIM_BUSY=<ms>` | 拖拽期每帧注入 N ms 忙等，确定性地驱动控制器降档/回升（验证用） |
 | `GLASS_ADAPTIVE=0` | 关闭自适应质量控制器（**默认开启**）。level 0 = 与关闭时逐位一致，只有持续丢帧才降档 |
 | `GLASS_FROST_HALF=1` | 手动强制 frost 保持 1/2 分辨率（自适应控制器的 level 1）。差异 ≤3/255，非逐位一致 |
 | `GLASS_SYNTH_CAP=1` | 用确定性合成图案覆盖采集结果，使跨进程/跨时间的逐像素取证可复现 |
@@ -122,7 +129,11 @@ python tools/attribute.py            # 拖拽帧时间归因：逐项关掉 Pass
 python tools/perf_probe.py --case all --seconds 12 --warmup 4 --out tools/final.json
 python tools/verify_dirty.py         # 脏矩形渲染 vs 全量渲染，逐像素（含真实拖拽）
 python tools/verify_crossscreen.py   # 跨屏拖拽 + DPI 换算验收
+python tools/verify_mouse_isolation.py # 拖一块，其余块必须 0 像素变化（含反向对照）
 python tools/measure_frost_half.py   # frost 半分辨率档的视觉代价 + 性能收益量化
+python tools/ab_memory.py            # 常驻内存受控 A/B（轮转交错 + 稳态窗口中位数）
+python tools/ab_influence.py         # 光标影响盒修复前/后两个二进制的同环境 A/B
+python tools/verify_validity.py        # 漏更新自检（金字塔虚报 / 漏画计数必须为 0）
 ```
 
 自适应质量档位（方案 12.4.3，按**实测收益**排序）：
@@ -130,10 +141,16 @@ python tools/measure_frost_half.py   # frost 半分辨率档的视觉代价 + �
 | level | 动作 | 触发条件 |
 |---|---|---|
 | 0 | 全部效果开启，与未启用控制器时逐位一致 | 默认 |
-| 1 | frost 保持 1/2 分辨率（+14% fps、−36.5 MB；模糊层差异 ≤3/255） | 1 秒窗口丢 vblank >25% 连续 2 次 |
+| 1 | frost 保持 1/2 分辨率（+14% fps；单屏 −27.4 MB / 双屏 −35.5 MB，受控 A/B 实测；模糊层差异 ≤3/255） | 见下 |
 | 2 | + 帧率上限 60（把抖动变成恒定 60 fps） | 同上 |
 | 3 | + 关闭焦散与 Beer-Lambert 吸收 | 同上 |
 | 4 | + 关闭 RGB 色散 | 同上 |
+
+降档判据：1 秒窗口内「**我们自己的工作**（渲染前准备 + Pass A + Pass B + Commit）
+> 1.25 × 目标帧间隔」的渲染帧占比 >25%（电池 15%）连续 2 次。
+**必须排除采集等待与 Present 阻塞**：那两段实测 8.7~25 ms，而我们自己的工作只有
+30~80 µs/帧（8.33 ms 预算的 1/100）；旧判据用整循环时长，把等待算成丢帧，
+结果单块拖拽也会被降到 level 2 —— 白白改视觉、fps 一点没变好。
 
 升档需要连续 4 个干净窗口**且距上次降档 ≥20 s**；升上去 10 秒内被打回视为失败探针，
 探针间隔翻倍（上限 300 s），避免在两个档位之间周期振荡。

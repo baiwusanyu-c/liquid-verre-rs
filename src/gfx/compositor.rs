@@ -85,6 +85,14 @@ pub struct Compositor {
     pub shot_path: Option<String>,
     /// 是否已经拍出这一帧（供 GLASS_VERIFY_PASS_A 自检串联第二次全量渲染）。
     pub shot_fired: bool,
+    /// `GLASS_VERIFY_VALIDITY=1`：自检两类「漏更新」，只打告警、不改渲染。
+    /// 用户看到的「背景闪动/颤抖」只可能来自这两类：
+    ///   1) 金字塔有效性虚报：把没重算过的区域也标记为有效；
+    ///   2) 该重画的块没进脏区：光标扫过 / 位置变化的块被跳过一帧。
+    verify_validity: bool,
+    pub vv_overclaim: u64,
+    pub vv_skipped: u64,
+    vv_last_log: std::time::Instant,
 }
 
 impl Compositor {
@@ -132,6 +140,10 @@ impl Compositor {
             last_dirty_px: 0,
             last_drew_blocks: 0,
             last_pass_a: false,
+            verify_validity: std::env::var("GLASS_VERIFY_VALIDITY").ok().as_deref() == Some("1"),
+            vv_overclaim: 0,
+            vv_skipped: 0,
+            vv_last_log: std::time::Instant::now(),
             pyramid_valid: None,
             last_pass_a_px: 0,
             pass_a_min_interval: {
@@ -275,7 +287,7 @@ impl Compositor {
     /// 自适应质量 level 1：frost 半分辨率档的运行期开关。
     pub fn set_frost_half(&mut self, gfx: &Device, on: bool) -> Result<bool, String> {
         let before = self.pyramid.frost_half_mode();
-        self.pyramid.set_frost_half_mode(&gfx.device, on)?;
+        self.pyramid.set_frost_half_mode(&gfx.device, &gfx.ctx, on)?;
         if before != on {
             self.invalidate();
         }
@@ -455,14 +467,41 @@ impl Compositor {
         };
         let (run_rect, new_valid): (Option<[i32; 4]>, Option<[i32; 4]>) = match need {
             None => (None, self.pyramid_valid),
+            // 足迹没有被现有金字塔完整覆盖（块移动/新建/切档重建，或 pad 因拖拽
+            // 速度变大而外扩）：**必须整块重算**。这个分支必须排在 backdrop_changed 前面：
+            // 旧实现让 backdrop_changed 抢先，只刷「桌面脏区 ∩ 足迹」就把**整个足迹**
+            // 标记为已算有效 —— 从没算过的区域会一直沿用 RT 的旧内容甚至初值，
+            // 玻璃里就出现「背景失真 / 局部过曝 / 随桌面更新一块块闪动」。
+            // 实测（GLASS_VERIFY_VALIDITY=1 + SIM_BACKDROP + 跳变拖拽）：修复前 14 s 内虚报 39 帧。
+            Some(n) if !covered => {
+                let r = clamp_rect([
+                    n[0] - HYSTERESIS,
+                    n[1] - HYSTERESIS,
+                    n[2] + HYSTERESIS,
+                    n[3] + HYSTERESIS,
+                ]);
+                // 只声称本帧真正重算过的 r，**不与旧有效区合并**：旧有效区里可能有
+                // 「桌面已变、但当时不在任何块足迹内因此没刷」的部分，合并进来就是虚报，
+                // 等块移过去时会露出陈旧背景。r 自带 192 px 迟滞，连续拖拽时下一帧
+                // 仍然 covered，不会退化成每帧全量重算。
+                (Some(r), Some(r))
+            }
             Some(n) if backdrop_changed => {
+                // 刷新范围 = 「桌面脏区 ⊕ 模糊核」∩ **我们声称有效的区域**，而不只是当前足迹。
+                // 只刷 ∩n 就必须把有效区收缩到 n，于是下一帧足迹一动又 !covered ->
+                // 每帧整块重算；而高频的分块重算会让重模糊链在 scissor 边界读到
+                // 陈旧 texel，玻璃里的背景出现「扫过式」抖动（verify_stale 实测
+                // 17.9 万像素差异、最大通道差 54）。刷 ∩base 之后 base 内部全部与当前
+                // capture 一致（脏区外本来就没变），有效区可以原样保留，不再来回收缩。
+                // 进到这个分支时 covered 已为真，因此 base ⊇ n。
+                let base = self.pyramid_valid.unwrap_or(n);
                 let region = match backdrop_dirty {
                     Some(d) => {
                         let x = [
-                            (d[0] - BLUR_REACH).max(n[0]),
-                            (d[1] - BLUR_REACH).max(n[1]),
-                            (d[2] + BLUR_REACH).min(n[2]),
-                            (d[3] + BLUR_REACH).min(n[3]),
+                            (d[0] - BLUR_REACH).max(base[0]),
+                            (d[1] - BLUR_REACH).max(base[1]),
+                            (d[2] + BLUR_REACH).min(base[2]),
+                            (d[3] + BLUR_REACH).min(base[3]),
                         ];
                         if x[2] > x[0] && x[3] > x[1] {
                             Some(x)
@@ -470,30 +509,12 @@ impl Compositor {
                             None
                         }
                     }
-                    None => Some(n),
+                    None => Some(base),
                 };
-                // 脏区之外的足迹本来就没变，刷新后整个 need 都与当前 capture 一致。
-                (region, Some(n))
+                (region, Some(base))
             }
-            Some(_) if covered => (None, self.pyramid_valid),
-            Some(n) => {
-                let r = clamp_rect([
-                    n[0] - HYSTERESIS,
-                    n[1] - HYSTERESIS,
-                    n[2] + HYSTERESIS,
-                    n[3] + HYSTERESIS,
-                ]);
-                let merged = match self.pyramid_valid {
-                    Some(v) => [
-                        v[0].min(r[0]),
-                        v[1].min(r[1]),
-                        v[2].max(r[2]),
-                        v[3].max(r[3]),
-                    ],
-                    None => r,
-                };
-                (Some(r), Some(merged))
-            }
+            // covered 且桌面没变：金字塔仍与当前 capture 一致，不用重算。
+            Some(_) => (None, self.pyramid_valid),
         };
 
         if self.cur_rects.is_empty() && self.prev_rects.is_empty() && !full_redraw {
@@ -552,7 +573,12 @@ impl Compositor {
                 }
             }
         }
-        if dirty.is_none() {
+        // 位移与光标影响盒必须**始终**参与并集。旧代码把它们包在
+        // `if dirty.is_none()` 里，于是只要这一帧桌面有变化（本机实测 27~116 次/秒），
+        // 光标扫过的块与刚移动的块就被整帧跳过 —— 内容停更一帧甚至多帧再补，
+        // 用户看到的就是「鼠标在玻璃里移动时背景/边缘颤抖」、「拖一块、其他块闪动」。
+        // 实测（GLASS_VERIFY_VALIDITY=1）：修复前 14 s 内漏画 774 次。
+        {
             // 位置/尺寸变化的块：旧矩形 ∪ 新矩形都要刷新
             for &(id, r) in self.cur_rects.iter() {
                 match self.prev_rects.iter().find(|(pid, _)| *pid == id) {
@@ -566,7 +592,9 @@ impl Compositor {
             }
             // 鼠标点光/悬停高光是屏幕空间场：光标扫过的块必须重画
             // （旧位置要擦掉余晖，新位置要画上余晖）。
-            let influence = (params.mouse_radius * 2.5 + 32.0) as i32;
+            // 必须与 glass_ps.hlsl 里 gate 的支撑半径（3*mouse_radius）一致：
+            // 盒外块的鼠标依赖精确为 0，盒内块整块重画，两者都不会出现拼接缝。
+            let influence = (params.mouse_radius * 3.0 + 32.0) as i32;
             let box_x0 = (prev_cursor_canvas[0].min(cursor_canvas[0]).floor() as i32) - influence;
             let box_y0 = (prev_cursor_canvas[1].min(cursor_canvas[1]).floor() as i32) - influence;
             let box_x1 = (prev_cursor_canvas[0].max(cursor_canvas[0]).ceil() as i32) + influence;
@@ -575,6 +603,56 @@ impl Compositor {
                 if r[0] < box_x1 && r[2] > box_x0 && r[1] < box_y1 && r[3] > box_y0 {
                     union(&mut dirty, r);
                 }
+            }
+        }
+        if self.verify_validity {
+            let contains = |d: Option<[i32; 4]>, r: [i32; 4]| -> bool {
+                match d {
+                    Some(o) => o[0] <= r[0] && o[1] <= r[1] && o[2] >= r[2] && o[3] >= r[3],
+                    None => false,
+                }
+            };
+            // (2) 光标影响盒内 / 位置变化的块，必须被脏区完整包住
+            let infl = (params.mouse_radius * 3.0 + 32.0) as i32;
+            let bx0 = (prev_cursor_canvas[0].min(cursor_canvas[0]).floor() as i32) - infl;
+            let by0 = (prev_cursor_canvas[1].min(cursor_canvas[1]).floor() as i32) - infl;
+            let bx1 = (prev_cursor_canvas[0].max(cursor_canvas[0]).ceil() as i32) + infl;
+            let by1 = (prev_cursor_canvas[1].max(cursor_canvas[1]).ceil() as i32) + infl;
+            for &(id, r) in self.cur_rects.iter() {
+                let in_box = r[0] < bx1 && r[2] > bx0 && r[1] < by1 && r[3] > by0;
+                let moved = match self.prev_rects.iter().find(|(pid, _)| *pid == id) {
+                    None => true,
+                    Some(&(_, pr)) => pr != r,
+                };
+                if (in_box || moved) && !contains(dirty, r) {
+                    self.vv_skipped += 1;
+                }
+            }
+            // (1) 声称有效的区域必须落在「之前已有效 ∪ 本帧重算」里
+            if let Some(v) = new_valid {
+                let u = match (self.pyramid_valid, run_rect) {
+                    (Some(a), Some(b)) => Some([
+                        a[0].min(b[0]),
+                        a[1].min(b[1]),
+                        a[2].max(b[2]),
+                        a[3].max(b[3]),
+                    ]),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                if !contains(u, v) {
+                    self.vv_overclaim += 1;
+                }
+            }
+            if self.vv_overclaim + self.vv_skipped > 0
+                && self.vv_last_log.elapsed() >= std::time::Duration::from_secs(1)
+            {
+                self.vv_last_log = std::time::Instant::now();
+                eprintln!(
+                    "[verify] 漏更新自检：金字塔虚报有效 {} 帧 / 该重画却漏掉的块 {} 次",
+                    self.vv_overclaim, self.vv_skipped
+                );
             }
         }
         std::mem::swap(&mut self.prev_rects, &mut self.cur_rects);

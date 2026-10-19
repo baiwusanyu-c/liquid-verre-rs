@@ -167,14 +167,54 @@ impl Pyramid {
         self.frost_half_mode
     }
 
-    pub fn set_frost_half_mode(&mut self, device: &ID3D11Device, on: bool) -> Result<(), String> {
+    /// 切换 level 1 的半分辨率 frost 档。
+    ///
+    /// **只重建 `frost`/`soft`** —— 这是唯一与档位相关的资源。
+    /// 旧实现把 `width` 置 0 强制走整链 `resize()`，会连带销毁并重建
+    /// `down`(4 张) / `frost_half`(2 张) / `env_rt`(2 张)，而它们与档位完全无关；
+    /// 重建期间新旧两套 RT 在驱动侧同时驻留，实测双屏 Private 峰值 +42 MB
+    /// （158.7 -> 200.2 MB），而 level 1 的本意是**省** 26 MB。
+    pub fn set_frost_half_mode(
+        &mut self,
+        device: &ID3D11Device,
+        ctx: &ID3D11DeviceContext,
+        on: bool,
+    ) -> Result<(), String> {
         if self.frost_half_mode == on {
             return Ok(());
         }
         self.frost_half_mode = on;
-        let (w, h) = (self.width, self.height);
-        self.width = 0; // 强制 resize 重建
-        self.resize(device, w, h)
+        if self.width == 0 {
+            // 还没建过任何资源：下一次 resize 会直接按新模式建。
+            return Ok(());
+        }
+        if on {
+            let Some(half) = self.frost_half.first().cloned() else {
+                self.frost_half_mode = false;
+                return Err("frost 半分辨率链尚未创建".to_string());
+            };
+            // 先放下整屏 frost 再指向半分辨率链，避免两张同时驻留
+            self.frost = None;
+            self.soft = None;
+            self.soft = Some(half.clone());
+            self.frost = Some(half);
+        } else {
+            let (w, h) = (self.width.max(4), self.height.max(4));
+            let frost = make_rt(device, w, h, DXGI_FORMAT_B8G8R8A8_UNORM)?;
+            self.frost = None;
+            self.soft = None;
+            self.soft = Some(frost.clone());
+            self.frost = Some(frost);
+        }
+        // D3D11 的绑定是强引用：上下文里还绑着的旧 RTV/SRV 不摘掉，
+        // 旧纹理就不会真正释放（驱动侧继续驻留）。切档是低频事件，摘一次即可。
+        unsafe {
+            let null: [Option<ID3D11ShaderResourceView>; 9] =
+                [None, None, None, None, None, None, None, None, None];
+            ctx.PSSetShaderResources(0, Some(&null));
+            ctx.OMSetRenderTargets(None, None);
+        }
+        Ok(())
     }
 
     pub fn set_env_freeze(&self, v: bool) {

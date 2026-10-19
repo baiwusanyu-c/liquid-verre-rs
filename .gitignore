@@ -25,3 +25,10 @@ tools/_*.rs
 .idea/
 tools/__pycache__/
 tools/probe_*.log
+
+# A/B 对照用的临时二进制（用 ab_influence.py 头部的步骤重新生成）
+tools/exe_*.exe
+# 单次测量的原始输出（结论已写进 performance_report.md）
+tools/*.txt
+tools/pf*.json
+tools/perf_*.json

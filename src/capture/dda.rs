@@ -13,8 +13,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Gdi::HMONITOR;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    IDXGIDevice, IDXGIOutput1, IDXGIOutput6, IDXGIOutputDuplication, IDXGIResource,
     DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
 };
 
@@ -140,6 +141,33 @@ pub struct DdaCapture {
     /// 本帧桌面脏区并集（output 局部像素坐标）。
     /// `None` 表示「内容变了但拿不到脏矩形」，调用方必须按整屏处理。
     pub dirty_union: Option<[i32; 4]>,
+    hdr_warned: bool,
+}
+
+/// 该显示器输出的色彩空间（DXGI_COLOR_SPACE_TYPE；0 = SDR G22/P709）。
+/// HDR / 宽色域输出上 DDA 的复制面给的是 **HDR 参考值**（实测 HDR 开启时
+/// 无论 FP16 还是 8bit 容器，R/G/B 顶到 255 的比例都是 52%/70%/84%，
+/// 整张桌面死白），我们自己 tonemap 不如让 DWM 做：见 mod.rs 的自动切 WGC。
+pub fn output_color_space(device: &ID3D11Device, hmonitor: HMONITOR) -> Option<i32> {
+    let dxgi: IDXGIDevice = device.cast().ok()?;
+    let adapter = unsafe { dxgi.GetAdapter() }.ok()?;
+    let mut index = 0u32;
+    loop {
+        let output = match unsafe { adapter.EnumOutputs(index) } {
+            Ok(o) => o,
+            Err(_) => return None,
+        };
+        index += 1;
+        let Ok(desc) = (unsafe { output.GetDesc() }) else {
+            continue;
+        };
+        if desc.Monitor != hmonitor || !desc.AttachedToDesktop.as_bool() {
+            continue;
+        }
+        let o6: IDXGIOutput6 = output.cast().ok()?;
+        let d1 = unsafe { o6.GetDesc1() }.ok()?;
+        return Some(d1.ColorSpace.0);
+    }
 }
 
 impl DdaCapture {
@@ -196,6 +224,7 @@ impl DdaCapture {
                 t_pre_us: 0,
                 t_rel_us: 0,
                 t_rel_max_us: 0,
+                hdr_warned: false,
             });
         }
         Err("该显示器上没有可用的 DXGI output（可能挂在另一块显卡上）".to_string())
@@ -242,6 +271,12 @@ impl DdaCapture {
                 od.Width != desc.Width || od.Height != desc.Height || od.Format != desc.Format
             });
             if recreate {
+                if desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && !self.hdr_warned {
+                    self.hdr_warned = true;
+                    eprintln!(
+                        "[warn] DDA 在 HDR 输出上返回 FP16 复制面：内容是 HDR 参考值，玻璃背景会过曝。                         请去掉 GLASS_BACKEND=dda 改用默认（HDR 输出会自动走 WGC）"
+                    );
+                }
                 let owned_desc = D3D11_TEXTURE2D_DESC {
                     Width: desc.Width,
                     Height: desc.Height,

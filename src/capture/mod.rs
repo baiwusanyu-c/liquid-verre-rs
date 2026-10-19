@@ -52,33 +52,53 @@ impl Capture {
         let want_wgc = forced.as_deref() == Some("wgc");
         let want_dda = forced.as_deref() == Some("dda");
 
-        let mut dda_err = String::new();
-        let backend = if !want_wgc {
-            match DdaCapture::new_for_monitor(device, hmonitor) {
-                Ok(c) => Some(Backend::Dda(c)),
-                Err(e) => {
-                    dda_err = e;
-                    None
+        // HDR / 宽色域输出（色彩空间 ≠ SDR G22/P709）：DDA 的复制面给的是
+        // HDR 参考值（实测整张桌面过曝，R/G/B 顶到 255 的比例 52%/70%/84%）。
+        // WGC 请求 B8G8R8A8 时由 DWM 完成 HDR->SDR（实测与 SDR 桌面逐统计一致：
+        // 平均亮度 178.0、裁切 1.8/1.2/0.7%），因此这种输出上**默认走 WGC**。
+        let cs = dda::output_color_space(device, hmonitor);
+        let hdr_out = cs.map_or(false, |c| c != 0);
+        if hdr_out && !want_dda {
+            eprintln!(
+                "[info] 检测到 HDR/宽色域输出（色彩空间 = {}）：DDA 复制面是 HDR 参考值，采集改走 WGC，由 DWM 完成 HDR->SDR",
+                cs.unwrap_or(0)
+            );
+        }
+        let prefer_wgc = want_wgc || (hdr_out && !want_dda);
+
+        let backend = if prefer_wgc {
+            match WgcCapture::new_for_monitor(device, hmonitor) {
+                Ok(c) => Backend::Wgc(c),
+                Err(wgc_err) => {
+                    if want_wgc {
+                        return Err(format!("WGC: {wgc_err}"));
+                    }
+                    match DdaCapture::new_for_monitor(device, hmonitor) {
+                        Ok(c) => {
+                            eprintln!(
+                                "[warn] WGC 不可用（{wgc_err}），HDR 输出上回退到 DDA（背景可能过曝）"
+                            );
+                            Backend::Dda(c)
+                        }
+                        Err(e2) => return Err(format!("WGC: {wgc_err} | DDA: {e2}")),
+                    }
                 }
             }
         } else {
-            None
-        };
-        let backend = match backend {
-            Some(b) => b,
-            None => {
-                if want_dda {
-                    return Err(format!("DDA: {dda_err} | WGC: 已被 GLASS_BACKEND=dda 禁用"));
-                }
-                match WgcCapture::new_for_monitor(device, hmonitor) {
-                    Ok(c) => {
-                        if !dda_err.is_empty() {
-                            eprintln!("[info] DDA 不可用（{dda_err}），已回退到 WGC 采集");
-                        }
-                        Backend::Wgc(c)
+            match DdaCapture::new_for_monitor(device, hmonitor) {
+                Ok(c) => Backend::Dda(c),
+                Err(dda_err) => {
+                    if want_dda {
+                        return Err(format!("DDA: {dda_err} | WGC: 已被 GLASS_BACKEND=dda 禁用"));
                     }
-                    Err(e) => {
-                        return Err(format!("DDA: {dda_err} | WGC: {e}"));
+                    match WgcCapture::new_for_monitor(device, hmonitor) {
+                        Ok(c) => {
+                            if !dda_err.is_empty() {
+                                eprintln!("[info] DDA 不可用（{dda_err}），已回退到 WGC 采集");
+                            }
+                            Backend::Wgc(c)
+                        }
+                        Err(e2) => return Err(format!("DDA: {dda_err} | WGC: {e2}")),
                     }
                 }
             }
