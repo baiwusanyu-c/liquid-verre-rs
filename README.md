@@ -101,7 +101,7 @@ cargo run --release
 | `GLASS_SPREAD=1` | 每块显示器正中各放一块玻璃（多屏验收） |
 | `GLASS_FAR_GRID=1` | 4 块互不重叠的分离布局（跨块串扰取证用） |
 | `GLASS_CURSOR_AT=x,y` | 固定首帧光标位置，使「光标在 A 处」与「光标在 B 处」两张取证图可逐像素对比 |
-| `GLASS_FRAME_LATENCY=<1..8>` | DXGI 渲染队列深度，**默认 2**（吞吐优先：20 块拖拽 73.9→105 fps；1 = 方案 7.4-7 的最低滞后，少 +8ms 光标到光子但 20 块掉到 74 fps） |
+| `GLASS_FRAME_LATENCY=<1..8>` | DXGI 渲染队列深度，**默认 1**（方案 7.4-7，跟手优先）；`=2` 为吞吐档：20 块拖拽 74→105 fps，代价 +8ms 光标到光子 |
 | `GLASS_FORCE_FULL=1` | 关闭 Pass B 脏矩形，每帧整屏重画（A/B 对照） |
 | `GLASS_INTERNAL_SHOT=<path>` | 输出内部取证图（合成结果 / overlay / capture / frost） |
 | `GLASS_INTERNAL_SHOT_AT_MS=<ms>` | 延迟取证，配合下面两项才能测到脏矩形路径 |
