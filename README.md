@@ -124,6 +124,8 @@ cargo run --release
 ### 自检脚本
 
 ```powershell
+cargo test --release                 # 25 个单元测试（矩形运算/sanitize/丢帧判据/夹紧/LUT/EMA/clamp）
+python tools/gate_perf.py            # 性能阀门：硬门槛不过退出码 1（阈值见 BASELINE.md）
 python tools/verify_all.py           # 7 项逐像素取证，期望 ALL PASS（含跨版本对比）
 python tools/verify_adaptive.py      # 自适应控制器行为：降档/回升/显存回收
 python tools/attribute.py            # 拖拽帧时间归因：逐项关掉 Pass A / Pass B / Present
@@ -160,6 +162,14 @@ python tools/repro_tremble.py far      # 拖一块，其他块必须逐帧不变
 `tools/verify_all.py` 的 7 项：跨版本 overlay / composed / capture 三项逐位对比
 （需要先把 `82a49e8` 拉成 worktree 并打同一份合成采集源补丁，见 `performance_report.md` 第七节）、
 脏矩形 vs 全量、跨屏拖拽、环境色 EMA 开关等价、DDA 局部拷贝 vs 整屏参考拷贝。
+
+## 重构基线与质量阀门
+
+- 基线：tag `baseline/pre-refactor`、分支 `backup/pre-refactor-baseline`（= `82fc311`）；
+  重构起点建议 `4dca041`（基线 + 阀门，无行为变化）。快照说明见 `BASELINE.md`。
+- 阀门三件套：`cargo test --release`、`tools/gate_perf.py`、以及下面 8 个回归脚本；
+  阈值与 oracle 选择见 `.trellis/spec/backend/measurement-and-gates.md`。
+- 过程证据与决策记录（含被否决方案）：`performance_report.md` 第一~十四轮。
 
 ## 项目结构
 
