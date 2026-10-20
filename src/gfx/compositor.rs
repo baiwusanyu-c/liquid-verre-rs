@@ -22,6 +22,22 @@ struct BackbufferRt {
     h: i32,
 }
 
+/// 矩形基础运算：脏区并集、金字塔有效区账本、影响盒判定都建在它们上。
+/// 抽成自由函数是为了能单测（重构的质量阀门之一）。
+pub fn rect_contains(outer: &[i32; 4], inner: &[i32; 4]) -> bool {
+    outer[0] <= inner[0] && outer[1] <= inner[1] && outer[2] >= inner[2] && outer[3] >= inner[3]
+}
+pub fn rect_union(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
+    [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]
+}
+pub fn rects_bbox(rs: &[[i32; 4]]) -> Option<[i32; 4]> {
+    rs.iter()
+        .fold(None, |acc, r| Some(acc.map_or(*r, |o| rect_union(o, *r))))
+}
+pub fn rects_hit(a: &[i32; 4], b: &[i32; 4]) -> bool {
+    a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1]
+}
+
 pub struct Compositor {
     swap: CanvasSwapchain,
     rt: BackbufferRt,
@@ -555,12 +571,7 @@ impl Compositor {
         let union = |d: &mut Option<[i32; 4]>, r: [i32; 4]| {
             *d = Some(match *d {
                 None => r,
-                Some(o) => [
-                    o[0].min(r[0]),
-                    o[1].min(r[1]),
-                    o[2].max(r[2]),
-                    o[3].max(r[3]),
-                ],
+                Some(o) => rect_union(o, r),
             });
         };
         if dirty.is_none() && backdrop_changed {
@@ -617,13 +628,10 @@ impl Compositor {
         }
         if self.verify_validity {
             let contains = |d: Option<[i32; 4]>, r: [i32; 4]| -> bool {
-                match d {
-                    Some(o) => o[0] <= r[0] && o[1] <= r[1] && o[2] >= r[2] && o[3] >= r[3],
-                    None => false,
-                }
+                d.map_or(false, |o| rect_contains(&o, &r))
             };
             // (2) 光标影响盒内 / 位置变化的块，必须被脏区完整包住
-            let infl = (params.mouse_radius * 3.0 + 32.0) as i32;
+            let infl = crate::glass::params::cursor_influence_px(params.mouse_radius);
             let bx0 = (prev_cursor_canvas[0].min(cursor_canvas[0]).floor() as i32) - infl;
             let by0 = (prev_cursor_canvas[1].min(cursor_canvas[1]).floor() as i32) - infl;
             let bx1 = (prev_cursor_canvas[0].max(cursor_canvas[0]).ceil() as i32) + infl;
@@ -640,17 +648,14 @@ impl Compositor {
             }
             // (1) 声称有效的区域必须落在「之前已有效 ∪ 本帧重算」里
             if let Some(v) = new_valid {
-                let u = match (self.pyramid_valid, run_rect) {
-                    (Some(a), Some(b)) => Some([
-                        a[0].min(b[0]),
-                        a[1].min(b[1]),
-                        a[2].max(b[2]),
-                        a[3].max(b[3]),
-                    ]),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
+                let mut allv: Vec<[i32; 4]> = Vec::new();
+                if let Some(a) = self.pyramid_valid {
+                    allv.push(a);
+                }
+                if let Some(b) = run_rect {
+                    allv.push(b);
+                }
+                let u = rects_bbox(&allv);
                 if !contains(u, v) {
                     self.vv_overclaim += 1;
                 }
@@ -1019,4 +1024,38 @@ impl Compositor {
 #[allow(dead_code)]
 fn _unused(_t: ID3D11Texture2D) {
     let _ = DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rect_contains, rect_union, rects_bbox, rects_hit};
+
+    #[test]
+    fn contains_is_inclusive() {
+        assert!(rect_contains(&[0, 0, 100, 100], &[0, 0, 100, 100]));
+        assert!(rect_contains(&[0, 0, 100, 100], &[10, 10, 90, 90]));
+        assert!(!rect_contains(&[0, 0, 100, 100], &[90, 90, 110, 110]));
+    }
+    #[test]
+    fn union_is_commutative_and_associative() {
+        let a = [0, 0, 10, 10];
+        let b = [5, 5, 20, 8];
+        assert_eq!(rect_union(a, b), rect_union(b, a));
+        assert_eq!(rect_union(a, b), [0, 0, 20, 10]);
+        let c = [30, 0, 40, 40];
+        assert_eq!(rect_union(rect_union(a, b), c), rect_union(a, rect_union(b, c)));
+    }
+    #[test]
+    fn bbox_of_empty_is_none() {
+        assert_eq!(rects_bbox(&[]), None);
+        assert_eq!(rects_bbox(&[[1, 2, 3, 4]]), Some([1, 2, 3, 4]));
+        assert_eq!(rects_bbox(&[[0, 0, 5, 5], [10, 10, 15, 12]]), Some([0, 0, 15, 12]));
+    }
+    #[test]
+    fn hit_is_open_interval() {
+        // 相切但不重叠不算相交（与脏区语义一致）
+        assert!(rects_hit(&[0, 0, 10, 10], &[5, 5, 20, 20]));
+        assert!(!rects_hit(&[0, 0, 10, 10], &[10, 0, 20, 20]));
+        assert!(!rects_hit(&[0, 0, 10, 10], &[0, 10, 20, 20]));
+    }
 }

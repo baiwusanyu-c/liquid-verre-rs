@@ -29,6 +29,21 @@ cargo run                      # debug 亦可（元数据 sanitize 后 debug 不
 指标口径与未达标项（20 块 ≥90 仅在吞吐档达成；CPU <5% 在高重绘桌面窗口超标）见
 `performance_report.md` 第十三/十四轮。
 
+## 性能指标清单与质量阀门（重构的回归安全网）
+
+指标（方案第 1 章 + M2/M3）：① 块数 1–200 动态增删；② 尺寸 64×64–整屏；③ 20 块常驻显存 <200 MB；
+④ 拖拽 ≥60 fps（120 Hz 屏 ≥90 fps）；⑤ 拖拽 CPU <5% 单核（M2：≤1%）；静止 0 帧 0 CPU；
+无残影/延迟感；多屏 + DPI；M2 ② 交互式 resize 无 stall；M3 24h 内存漂移 <2 MB。
+
+阀门命令（重构前后都必须全绿）：
+
+```powershell
+cargo test --release              # 单元测试 25 个：矩形运算 / DDA 元数据 sanitize / 丢帧判据 1.25x 阈值 /
+                                  # 参数夹紧 / DPI 缩放 / 影响盒与 3σ 支撑对齐 / LUT 单调 / 拖拽 EMA / 块 clamp
+python tools/gate_perf.py         # 性能阀门：硬门单块 fps≥90 且 p50≤9ms、20 块默认≥60、
+                                  # 20 块 lat=2 ≥90、Private<200MB；软门 CPU<5% 与 20 块默认≥90
+```
+
 ## 回归命令与期望（重构后必须全绿）
 
 ```powershell

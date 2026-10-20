@@ -19,6 +19,21 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
 };
 
+/// 把 DDA 元数据矩形收敛到屏幕内：clamp + 丢弃退化矩形。
+/// 元数据是不可信外部输入（可能退化、可能是 ±2e9 的垃圾值），
+/// 不收敛会让后续 i32 加减在 debug 构建下 overflow panic。
+pub fn sanitize_rect(r: [i32; 4], w: i32, h: i32) -> Option<[i32; 4]> {
+    let l = r[0].clamp(0, w);
+    let t = r[1].clamp(0, h);
+    let rr = r[2].clamp(0, w);
+    let b = r[3].clamp(0, h);
+    if rr > l && b > t {
+        Some([l, t, rr, b])
+    } else {
+        None
+    }
+}
+
 /// 超过这个数量就直接整屏拷贝：几十个 CopySubresourceRegion 的调用开销
 /// 会超过一次全屏 DMA。
 const MAX_DIRTY_RECTS: usize = 24;
@@ -536,17 +551,7 @@ impl DdaCapture {
         // 垃圾坐标（±2e9）都会让后续 i32 加减在 debug 构建 overflow panic，
         // 或让 union 跨度超出 i32。统一 clamp 到屏幕并丢弃退化矩形。
         let (sw, sh) = (self.width.max(0), self.height.max(0));
-        let sanitize = |r: [i32; 4]| -> Option<[i32; 4]> {
-            let l = r[0].clamp(0, sw);
-            let t = r[1].clamp(0, sh);
-            let rr = r[2].clamp(0, sw);
-            let b = r[3].clamp(0, sh);
-            if rr > l && b > t {
-                Some([l, t, rr, b])
-            } else {
-                None
-            }
-        };
+        let sanitize = |r: [i32; 4]| sanitize_rect(r, sw, sh);
         let ptr = self.meta.as_mut_ptr();
         unsafe {
             if let Some(sim) = sim_dirty(self.width.max(1), self.height.max(1)) {
@@ -609,5 +614,37 @@ impl DdaCapture {
             }
         }
         union
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_rect;
+
+    #[test]
+    fn sanitize_keeps_valid_rect() {
+        assert_eq!(sanitize_rect([10, 20, 300, 400], 1920, 1080), Some([10, 20, 300, 400]));
+    }
+    #[test]
+    fn sanitize_clamps_to_screen() {
+        assert_eq!(sanitize_rect([-50, -7, 5000, 2000], 1920, 1080), Some([0, 0, 1920, 1080]));
+    }
+    #[test]
+    fn sanitize_rejects_inverted() {
+        assert_eq!(sanitize_rect([300, 400, 10, 20], 1920, 1080), None);
+    }
+    #[test]
+    fn sanitize_rejects_degenerate() {
+        assert_eq!(sanitize_rect([5, 5, 5, 99], 1920, 1080), None);
+        assert_eq!(sanitize_rect([5, 5, 99, 5], 1920, 1080), None);
+    }
+    #[test]
+    fn sanitize_survives_garbage_without_overflow() {
+        // 回归：debug 构建下这些值不得 panic（曾经的崩源）
+        let g = i32::MAX;
+        let m = i32::MIN;
+        assert!(sanitize_rect([m, m, g, g], 1920, 1080).is_some());
+        assert!(sanitize_rect([g, g, m, m], 1920, 1080).is_none());
+        assert!(sanitize_rect([m, 0, g, 0], 1920, 1080).is_none());
     }
 }

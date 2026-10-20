@@ -207,6 +207,13 @@ impl Default for Params {
     }
 }
 
+/// 光标影响盒半径（画布像素）。必须与 glass_ps.hlsl 里 gate 的支撑
+/// 半径 3*mouse_radius 严格对齐：盒外块的鼠标依赖精确为 0，盒内块整块重画，
+/// 两者都不会出现拼接缝。单一来源，避免两处字面量漂移。
+pub fn cursor_influence_px(mouse_radius: f32) -> i32 {
+    (mouse_radius * 3.0 + 32.0) as i32
+}
+
 impl Params {
     /// 按显示器 DPI 比例缩放所有「像素量纲」的参数（方案 12.2.5：跨屏时保持
     /// 逻辑尺寸不变）。主屏 scale = 1.0，逐字段原样返回，视觉零变化。
@@ -278,5 +285,55 @@ impl Params {
         let l = self.light_dir;
         let len = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt().max(1e-4);
         self.light_dir = [l[0] / len, l[1] / len, l[2] / len];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cursor_influence_px, Params};
+
+    #[test]
+    fn sanitize_clamps_every_family() {
+        let mut p = Params::default();
+        p.clarity = 7.0; p.ior = 9.0; p.mouse_radius = 1e6; p.blur_max = 1e4;
+        p.spec_power = 0.0; p.lens_coverage = -3.0; p.shadow_margin = 1e5;
+        p.sanitize();
+        assert!((0.0..=1.0).contains(&p.clarity));
+        assert!((1.0..=2.0).contains(&p.ior));
+        assert!((20.0..=1200.0).contains(&p.mouse_radius));
+        assert!((0.0..=96.0).contains(&p.blur_max));
+        assert!((1.0..=512.0).contains(&p.spec_power));
+        assert!((0.0..=1.0).contains(&p.lens_coverage));
+        assert!((0.0..=96.0).contains(&p.shadow_margin));
+    }
+    #[test]
+    fn sanitize_keeps_blur_min_le_max() {
+        let mut p = Params::default();
+        p.blur_min = 900.0; p.blur_max = 3.0;
+        p.sanitize();
+        assert!(p.blur_min <= p.blur_max);
+    }
+    #[test]
+    fn scaled_is_identity_at_unit_scale() {
+        let p = Params::default();
+        let q = p.scaled(1.0);
+        assert!((q.mouse_radius - p.mouse_radius).abs() < 1e-6);
+        assert!((q.corner_radius - p.corner_radius).abs() < 1e-6);
+    }
+    #[test]
+    fn scaled_scales_pixel_dims() {
+        let p = Params::default();
+        let q = p.scaled(2.0);
+        assert!((q.mouse_radius - p.mouse_radius * 2.0).abs() < 1e-3);
+        assert!((q.shadow_margin - p.shadow_margin * 2.0).abs() < 1e-3);
+        // 无量纲不变
+        assert!((q.clarity - p.clarity).abs() < 1e-6);
+    }
+    #[test]
+    fn influence_box_strictly_covers_shader_gate_support() {
+        // gate 支撑 = 3*mouse_radius；影响盒必须严格更大（还有 32px 余量）
+        for r in [20.0f32, 220.0, 1200.0] {
+            assert!(cursor_influence_px(r) as f32 > r * 3.0);
+        }
     }
 }

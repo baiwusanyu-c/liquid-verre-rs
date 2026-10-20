@@ -45,3 +45,29 @@ impl Block {
 
 pub const MIN_SIZE: f32 = 24.0;
 pub const MAX_SIZE: f32 = 8000.0;
+
+#[cfg(test)]
+mod tests {
+    use super::{Block, MAX_SIZE, MIN_SIZE};
+
+    #[test]
+    fn clamp_enforces_size_and_radius_bounds() {
+        let mut b = Block::new(1, 0.0, 0.0, 1e9, 1e9);
+        b.radius = 1e9;
+        b.clamp();
+        assert_eq!(b.width, MAX_SIZE);
+        assert_eq!(b.height, MAX_SIZE);
+        assert!(b.radius <= 0.5 * b.width.min(b.height));
+        let mut c = Block::new(2, 0.0, 0.0, 1.0, 1.0);
+        c.clamp();
+        assert_eq!(c.width, MIN_SIZE);
+        assert_eq!(c.height, MIN_SIZE);
+    }
+    #[test]
+    fn clamp_allows_half_offscreen_but_bounds_extreme() {
+        let mut b = Block::new(3, -1e9, -1e9, 400.0, 300.0);
+        b.clamp();
+        assert!(b.x >= -b.width * 0.5);
+        assert!(b.y >= -b.height * 0.5);
+    }
+}

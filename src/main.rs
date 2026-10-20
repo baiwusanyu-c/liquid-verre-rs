@@ -1123,6 +1123,11 @@ impl QualityCtrl {
         self.min_interval.is_zero() || now.duration_since(self.last_present) >= self.min_interval
     }
 
+    /// 丢帧判定：渲染段耗时超过 1.25 × 目标帧间隔。抽成纯函数供单测。
+    fn is_miss(loop_us: u128, target_us: u128) -> bool {
+        loop_us > target_us + target_us / 4
+    }
+
     fn note_present(&mut self, now: Instant) {
         self.last_present = now;
     }
@@ -1134,7 +1139,7 @@ impl QualityCtrl {
         if rendered {
             self.frames += 1;
             let target = self.min_interval.as_micros().max(self.vblank_us);
-            if loop_us > target + target / 4 {
+            if Self::is_miss(loop_us, target) {
                 self.missed += 1;
             }
         }
@@ -1948,7 +1953,8 @@ fn main() {
         // ---- 每屏：投影块 + 窗口区域 + 点击穿透 ----
         let margin = app.params.shadow_margin.max(0.0);
         // 与 glass_ps.hlsl 的 gate 支撑半径、Compositor 的脏区影响盒保持一致
-        let influence = app.params.mouse_radius * 3.0 + 32.0 + margin;
+        let influence = crate::glass::params::cursor_influence_px(app.params.mouse_radius) as f32
+            + margin;
         let mut mouse_relevant = false;
         for mi in 0..app.monitors.len() {
             collect_monitor_blocks(&mut app, mi, params_changed);
@@ -2180,5 +2186,26 @@ fn main() {
                 [msg_us, cap_us, prep_us],
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QualityCtrl;
+
+    #[test]
+    fn miss_threshold_is_125_percent_of_target() {
+        let t = 8333u128; // 120 Hz
+        assert!(!QualityCtrl::is_miss(t, t));
+        assert!(!QualityCtrl::is_miss(t + t / 4, t)); // 恰好 1.25x 不算丢
+        assert!(QualityCtrl::is_miss(t + t / 4 + 1, t));
+        // 采集等待不得被计入：判据收到的必须是「我们自己的工作」
+        assert!(!QualityCtrl::is_miss(90, t)); // 90 µs 的真实工作量绝不是丢帧
+    }
+    #[test]
+    fn miss_threshold_respects_fps_cap_level() {
+        let t = 16667u128; // level>=2 的 60 fps 上限
+        assert!(!QualityCtrl::is_miss(16700, t));
+        assert!(QualityCtrl::is_miss(21000, t));
     }
 }

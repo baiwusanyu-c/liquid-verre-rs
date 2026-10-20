@@ -68,3 +68,38 @@ impl DragState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DragKind, DragState};
+
+    #[test]
+    fn move_returns_origin_plus_delta() {
+        let mut d = DragState::begin(7, DragKind::Move, [100.0, 100.0], [10.0, 20.0, 300.0, 200.0], 0.0);
+        let r = d.apply([140.0, 90.0], 0.016, 1.0);
+        assert_eq!(r, [50.0, 10.0, 300.0, 200.0]);
+    }
+    #[test]
+    fn move_ignores_scale() {
+        let mut d = DragState::begin(7, DragKind::Move, [0.0, 0.0], [0.0, 0.0, 100.0, 100.0], 0.0);
+        let r = d.apply([50.0, 50.0], 0.016, 2.0);
+        assert_eq!(r, [50.0, 50.0, 100.0, 100.0]);
+    }
+    #[test]
+    fn velocity_ema_converges_to_constant_speed() {
+        let mut d = DragState::begin(1, DragKind::Move, [0.0, 0.0], [0.0, 0.0, 10.0, 10.0], 0.0);
+        let mut t = 0.0;
+        for i in 1..=200 {
+            t = i as f64 * 0.008;
+            d.apply([i as f32 * 8.0, 0.0], t, 1.0); // 1000 px/s
+        }
+        assert!((d.velocity[0] - 1000.0).abs() < 1.0, "vel={}", d.velocity[0]);
+        assert!(d.velocity[1].abs() < 1e-3);
+    }
+    #[test]
+    fn zero_dt_is_clamped_not_panics() {
+        let mut d = DragState::begin(1, DragKind::Move, [0.0, 0.0], [0.0, 0.0, 10.0, 10.0], 1.0);
+        let _ = d.apply([5.0, 5.0], 1.0, 1.0); // dt = 0 -> 内部 clamp 到 1e-4
+        assert!(d.velocity[0].is_finite());
+    }
+}

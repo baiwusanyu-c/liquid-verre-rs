@@ -41,3 +41,43 @@ pub fn clamp_for_block(params: &mut Params, width: f32, height: f32) {
 pub fn is_lod3(width: f32, height: f32) -> bool {
     width < 32.0 || height < 32.0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{build_refraction_lut, clamp_for_block, is_lod3, Profile};
+    use crate::glass::params::Params;
+
+    #[test]
+    fn lod3_boundary() {
+        assert!(is_lod3(31.9, 500.0));
+        assert!(is_lod3(500.0, 31.9));
+        assert!(!is_lod3(32.0, 32.0));
+    }
+    #[test]
+    fn clamp_for_block_respects_spec_limits() {
+        // 方案 12.9：bevel ≤ 0.45*min(hs)、radius ≤ min(hs)、位移 ≤ ±0.35*blockSize
+        let mut p = Params::default();
+        p.corner_radius = 10_000.0;
+        p.bevel_width = 10_000.0;
+        p.refr_strength = 10_000.0;
+        p.thickness = 40.0;
+        clamp_for_block(&mut p, 200.0, 120.0);
+        let bw = (200.0 - p.shadow_margin * 2.0).max(1.0);
+        let bh = (120.0 - p.shadow_margin * 2.0).max(1.0);
+        let min_hs = bw.min(bh) * 0.5;
+        assert!(p.corner_radius <= min_hs + 1e-3);
+        assert!(p.bevel_width <= 0.45 * min_hs + 1e-3);
+        assert!(p.bevel_width >= 1.0);
+        assert!(p.refr_strength <= 2.0);
+    }
+    #[test]
+    fn lut_is_monotone_and_finite() {
+        let p = Params::default();
+        let lut = build_refraction_lut(&p, Profile::Circular);
+        assert_eq!(lut.len(), 256);
+        for w in lut.windows(2) {
+            assert!(w[0][0] >= w[1][0] - 1e-4, "slope not monotone at {:?}", w);
+            assert!(w[0][1].is_finite() && w[1][1].is_finite());
+        }
+    }
+}
