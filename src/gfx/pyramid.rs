@@ -458,6 +458,7 @@ impl Pyramid {
         h: i32,
         region: [i32; 4],
         env_region: [i32; 4],
+        env_advance: bool,
     ) {
         if self.down.len() != LEVELS {
             return;
@@ -472,20 +473,30 @@ impl Pyramid {
             return;
         }
         self.bind(ctx);
+        // 局部重算必须「幂等」：否则同一区域反复重算会得到不同结果，
+        // 表现为玻璃背景隔帧来回跳变（实测 ±1~3 LSB 整块震荡，偶尔 max 110）。
+        // 下采样链：第 k 级的 4-tap 读第 k-1 级 ±1 texel = 全屏 ±2^k px，
+        // 因此第 k 级的 scissor 外扩 2^(k+1) px，保证读到的都是本 run 或「未变化捕获」的内容。
+        let grow = |r: [i32; 4], g: i32| [r[0] - g, r[1] - g, r[2] + g, r[3] + g];
         // --- 下采样 ---
         {
-            let sc = self.scissor_for(region, &self.down[0]);
+            let sc = self.scissor_for(grow(region, 2), &self.down[0]);
             self.draw(ctx, capture_srv, &self.down[0], w, h, sc);
         }
         for k in 1..LEVELS {
             let src = self.down[k - 1].srv.clone();
             let (sw, sh) = (self.down[k - 1].w, self.down[k - 1].h);
-            let sc = self.scissor_for(region, &self.down[k]);
+            let sc = self.scissor_for(grow(region, 1 << (k + 1)), &self.down[k]);
             self.draw(ctx, &src, &self.down[k], sw, sh, sc);
         }
 
         // --- 环境色探针时域平滑（方案 12.6）---
-        self.run_env_ema(ctx, env_region);
+        // 只有「捕获内容真的变了」才推进 EMA。拖拽/足迹跳变触发的 Pass A
+        // 重算并不改变背景，若 EMA 仍推进，每次都会给全部块一步 ±1~2 LSB
+        // 的色调跳变 —— 每帧重画时就是用户看到的「其他玻璃颤抖」。
+        if env_advance {
+            self.run_env_ema(ctx, env_region);
+        }
 
         // --- 块分辨率模糊链（避免 1/16 金字塔被放大的方块颗粒） ---
         if self.frost_half.len() == 2 {
@@ -502,12 +513,16 @@ impl Pyramid {
                     ctx.PSSetShaderResources(0, Some(&null));
                     ctx.OMSetRenderTargets(None, None);
                 }
+                // ping-pong 链的 scissor 必须逐 pass 收缩：pass p 只能读 pass p-1 本 run
+                // 刷新过的范围。tent 半径按半分辨 8 px（全屏 16 px）估算，
+                // 于是 pass 0 外扩 32、之后每 pass 减 8，最后一 pass 正好覆盖 region。
                 for pass in 0..4 {
                     let src_i = pass & 1;
                     let dst_i = 1 - src_i;
                     let src = self.frost_half[src_i].srv.clone();
                     let (sw, sh) = (self.frost_half[src_i].w, self.frost_half[src_i].h);
-                    let sc = self.scissor_for(region, &self.frost_half[dst_i]);
+                    let g = 32 - 8 * pass as i32;
+                    let sc = self.scissor_for(grow(region, g), &self.frost_half[dst_i]);
                     self.draw_up(ctx, &src, &self.frost_half[dst_i], sw, sh, sc);
                     unsafe {
                         let null = [None::<ID3D11ShaderResourceView>];

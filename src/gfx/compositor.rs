@@ -85,6 +85,11 @@ pub struct Compositor {
     pub shot_path: Option<String>,
     /// 是否已经拍出这一帧（供 GLASS_VERIFY_PASS_A 自检串联第二次全量渲染）。
     pub shot_fired: bool,
+    /// `GLASS_SHOT_EVERY_MS=<n>`：连拍模式，每 n ms 拍一张（序号进文件名）。
+    /// 连拍时**不**强制全量重画（保留增量路径，那才是用户看到的路径），
+    /// 且只写 composed 一个文件，用于逐帧分析「其他块为什么会变」。
+    shot_every: Option<std::time::Duration>,
+    shot_seq: u32,
     /// `GLASS_VERIFY_VALIDITY=1`：自检两类「漏更新」，只打告警、不改渲染。
     /// 用户看到的「背景闪动/颤抖」只可能来自这两类：
     ///   1) 金字塔有效性虚报：把没重算过的区域也标记为有效；
@@ -158,10 +163,10 @@ impl Compositor {
                     None
                 }
             },
-            last_pass_a_at: std::time::Instant::now()
-                - std::time::Duration::from_secs(3600),
+            last_pass_a_at: std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now),
             pass_a_throttled: 0,
-            force_full_shot: std::env::var("GLASS_INTERNAL_SHOT").is_ok(),
+            force_full_shot: std::env::var("GLASS_INTERNAL_SHOT").is_ok()
+                && std::env::var("GLASS_SHOT_EVERY_MS").is_err(),
             force_full_always: std::env::var("GLASS_FORCE_FULL").ok().as_deref() == Some("1"),
             force_full_once: false,
             // 未指定延迟时默认「首帧即拍」，与旧实现一致。
@@ -179,6 +184,11 @@ impl Compositor {
             skip_clear: std::env::var("GLASS_SKIP_CLEAR").ok().as_deref() == Some("1"),
             shot_path: std::env::var("GLASS_INTERNAL_SHOT").ok(),
             shot_fired: false,
+            shot_every: std::env::var("GLASS_SHOT_EVERY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(std::time::Duration::from_millis),
+            shot_seq: 0,
         })
     }
 
@@ -305,7 +315,7 @@ impl Compositor {
     /// 解除 Pass A 限频的一次性豁免：自证对照帧必须跑完整金字塔。
     pub fn pass_a_now(&mut self) {
         self.last_pass_a_at =
-            std::time::Instant::now() - std::time::Duration::from_secs(3600);
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now);
     }
 
     /// 自检用：把下一帧强制变成「全量 Pass A + 全量 Pass B」。
@@ -706,11 +716,14 @@ impl Compositor {
                 bottom: dirty_rect[3],
             }]));
             if !self.skip_clear {
+                // 每帧自包含：flip 模型的 back buffer 在 Present 后内容不保，
+                // 因此「只清脏区 + 只画脏块」不成立（没画的块会整块消失 = 用户看到的闪动）。
+                // 改为整屏清 + 画全部块；Pass A 仍按脏区 scissor（那才是成本大头）。
                 gfx.ctx
                     .ClearRenderTargetView(&self.rt.rtv, &[0.0, 0.0, 0.0, 0.0]);
             }
         }
-        // Pass A：全屏共享模糊金字塔，但只刷新 run_rect 内的像素。
+                // Pass A：全屏共享模糊金字塔，但只刷新 run_rect 内的像素。
         // 鼠标/拖拽只进入 Pass B，不触发整屏 down/up-sample。
         // Pass A 限频：被跳过的帧沿用上一份金字塔，且**不**把 background_valid
         // 置真，这样下一帧会继续尝试，直到限频窗口过去。
@@ -736,6 +749,7 @@ impl Compositor {
                     self.height,
                     region,
                     need.unwrap_or(region),
+                    backdrop_changed,
                 );
                 self.last_stage_us[0] = t.elapsed().as_micros();
                 self.last_pass_a_px =
@@ -766,7 +780,7 @@ impl Compositor {
             &capture_srv,
             blocks,
             order,
-            Some(dirty_rect),
+            None,
             params,
             self.width as f32,
             self.height as f32,
@@ -785,11 +799,27 @@ impl Compositor {
             gpu.mark(&gfx.ctx, 2);
         }
         if shot_now {
-            if let Some(path) = self.shot_path.take() {
-                if let Err(e) = self.save_debug_bmp(gfx, &path) {
+            let burst = self.shot_every.is_some();
+            let path_opt = if burst {
+                self.shot_path.clone().map(|p| {
+                    let seq = self.shot_seq;
+                    self.shot_seq += 1;
+                    let stem = p.strip_suffix(".bmp").unwrap_or(p.as_str());
+                    format!("{stem}.{seq:03}.bmp")
+                })
+            } else {
+                self.shot_path.take()
+            };
+            if let Some(path) = path_opt {
+                if let Err(e) = self.save_debug_bmp(gfx, &path, burst) {
                     eprintln!("[warn] internal glass screenshot failed: {e}");
                 } else {
                     self.shot_fired = true;
+                    if burst {
+                        if let Some(every) = self.shot_every {
+                            self.shot_at = Some(std::time::Instant::now() + every);
+                        }
+                    }
                     eprintln!("[info] saved internal glass frame: {path}");
                 }
             }
@@ -807,7 +837,12 @@ impl Compositor {
     /// - path.overlay.bmp：原始 overlay backbuffer
     /// - path.capture.bmp：原始桌面捕获纹理
     /// 只有第一张与 DComp 最终视觉语义一致。
-    pub fn save_debug_bmp(&self, gfx: &Device, path: &str) -> Result<(), String> {
+    pub fn save_debug_bmp(
+        &self,
+        gfx: &Device,
+        path: &str,
+        composed_only: bool,
+    ) -> Result<(), String> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { self.rt.tex.GetDesc(&mut desc); }
         let staging_desc = D3D11_TEXTURE2D_DESC {
@@ -890,16 +925,22 @@ impl Compositor {
                         out[2] = (out[2] as u16 + bg[2] as u16 * inv / 255).min(255) as u8;
                         out[3] = 255;
                     }
-                    let overlay_path = format!("{path}.overlay.bmp");
-                    let capture_path = format!("{path}.capture.bmp");
-                    Self::write_bmp(&overlay_path, desc.Width, desc.Height, &pixels)?;
-                    Self::write_bmp(&capture_path, desc.Width, desc.Height, &capture_pixels)?;
-                    Self::write_bmp(path, desc.Width, desc.Height, &composed)?;
-                    if let Some(soft) = &self.pyramid.soft {
-                        Self::save_texture_bmp(gfx, &soft.tex, &format!("{path}.soft.bmp"))?;
+                    let want_extra = !composed_only
+                        || std::env::var("GLASS_BURST_OVERLAY").ok().as_deref() == Some("1");
+                    if want_extra {
+                        let overlay_path = format!("{path}.overlay.bmp");
+                        let capture_path = format!("{path}.capture.bmp");
+                        Self::write_bmp(&overlay_path, desc.Width, desc.Height, &pixels)?;
+                        Self::write_bmp(&capture_path, desc.Width, desc.Height, &capture_pixels)?;
                     }
-                    if let Some(frost) = &self.pyramid.frost {
-                        Self::save_texture_bmp(gfx, &frost.tex, &format!("{path}.frost.bmp"))?;
+                    Self::write_bmp(path, desc.Width, desc.Height, &composed)?;
+                    if want_extra {
+                        if let Some(soft) = &self.pyramid.soft {
+                            Self::save_texture_bmp(gfx, &soft.tex, &format!("{path}.soft.bmp"))?;
+                        }
+                        if let Some(frost) = &self.pyramid.frost {
+                            Self::save_texture_bmp(gfx, &frost.tex, &format!("{path}.frost.bmp"))?;
+                        }
                     }
                 }
             }

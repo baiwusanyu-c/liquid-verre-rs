@@ -187,7 +187,7 @@ impl MonitorRt {
             copied_px: 0,
             retry_at: Instant::now(),
             capture_error_logged: false,
-            last_capture: Instant::now() - std::time::Duration::from_secs(3600),
+            last_capture: Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now),
             idle_capturing: false,
             hidden_fs: false,
             hidden_capture: false,
@@ -1108,13 +1108,13 @@ impl QualityCtrl {
             missed: 0,
             epoch: Instant::now(),
             cooldown_until: Instant::now(),
-            last_downgrade: Instant::now() - std::time::Duration::from_secs(3600),
+            last_downgrade: Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now),
             good_streak: 0,
             bad_streak: 0,
             min_interval: std::time::Duration::from_secs(0),
             last_present: Instant::now(),
             upgrade_gate: std::time::Duration::from_secs(20),
-            last_upgrade: Instant::now() - std::time::Duration::from_secs(3600),
+            last_upgrade: Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now),
         }
     }
 
@@ -1463,7 +1463,7 @@ fn main() {
         press: 0.0,
         drag_velocity: [0.0, 0.0],
         rebuild_monitors: false,
-        fs_check_at: Instant::now() - std::time::Duration::from_secs(3600),
+        fs_check_at: Instant::now().checked_sub(std::time::Duration::from_secs(3600)).unwrap_or_else(std::time::Instant::now),
         t0: Instant::now(),
         frames: 0,
     };

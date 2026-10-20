@@ -26,7 +26,7 @@
 | 整屏只采集一次 | `src/capture/dda.rs`，成本 O(屏幕)，与块数无关 |
 | **只搬变化的像素** | `GetFrameDirtyRects` / `GetFrameMoveRects` -> 逐矩形 `CopySubresourceRegion` |
 | **模糊只算块看得见的地方** | `src/gfx/pyramid.rs`，Pass A 的 scissor = 桌面脏区 ∩ 块足迹 |
-| **只重画真的变了的块** | `src/gfx/compositor.rs`，Pass B 脏区 = 块位移 ∪ 鼠标点光影响范围 ∪ 桌面脏区 |
+| **Pass B 每帧画全部块** | flip 模型 back buffer 在 Present 后内容不保，「只画脏块」会让没画的块整块消失（= 其他玻璃闪动）；改为每帧自包含（整屏清 + 画全部块），**Pass A 仍按脏区 scissor** |
 | 每块只画自己的矩形 | `src/gfx/glass_renderer.rs`，per-block viewport + scissor |
 | 位移交给 DWM | 拖动只改块矩形，不重建位图、不 `ResizeBuffers` |
 | 单设备、每屏一次 Present | 一次 Present / 一次 DComp Commit，与块数无关 |
@@ -112,6 +112,7 @@ cargo run --release
 | `GLASS_WGC_BUFFERS=<2..8>` | WGC 帧池缓冲数（方案 12.7：>90 Hz 用 3） |
 | `GLASS_MONITORS=<n>` | 只启用前 n 块显示器 |
 | `GLASS_ENV_EMA=0` | 关闭环境色时域平滑，回到逐帧直采 1/16 层 |
+| `GLASS_SHOT_EVERY_MS=<n>` | 连拍 composed 取证图（不强制全量重画），供 `repro_tremble.py` 逐帧分析 |
 | `GLASS_VERIFY_VALIDITY=1` | 漏更新自检：金字塔有效性虚报 / 该重画却漏掉的块，只打印计数不改渲染 |
 | `GLASS_FORCE_HDR_CONV=1` | SDR 源也强制走 HDR->SDR 转换路径（数值校验用） |
 | `GLASS_SIM_BUSY=<ms>` | 拖拽期每帧注入 N ms 忙等，确定性地驱动控制器降档/回升（验证用） |
@@ -134,6 +135,7 @@ python tools/measure_frost_half.py   # frost 半分辨率档的视觉代价 + �
 python tools/ab_memory.py            # 常驻内存受控 A/B（轮转交错 + 稳态窗口中位数）
 python tools/ab_influence.py         # 光标影响盒修复前/后两个二进制的同环境 A/B
 python tools/verify_validity.py        # 漏更新自检（金字塔虚报 / 漏画计数必须为 0）
+python tools/repro_tremble.py far      # 拖一块，其他块必须逐帧不变（连拍取证）
 ```
 
 自适应质量档位（方案 12.4.3，按**实测收益**排序）：
