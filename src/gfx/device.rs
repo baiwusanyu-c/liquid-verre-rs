@@ -53,14 +53,19 @@ impl Device {
         let device = device.ok_or("D3D11CreateDevice 未返回设备")?;
         let ctx = ctx.ok_or("D3D11CreateDevice 未返回上下文")?;
         let dxgi: IDXGIDevice = device.cast().map_err(|e| format!("IDXGIDevice: {e}"))?;
-        // 方案 7.4-7：把渲染队列深度压到 1 帧。默认 3 帧会让「光标位置」与
-        // 「屏幕上看到的玻璃」之间多出最多 2 个刷新周期（120 Hz 下约 16 ms），
-        // 这正是拖拽时「跟不上手 / 不如原生窗口丝滑」的主观来源之一。
+        // 方案 7.4-7 建议把渲染队列深度压到 1 帧（光标到画面滞后最小）。
+        // 但实测（2026-10-20 轮转交错 A/B，3 次重复）：latency=1 时 Present 与 DWM
+        // 消费串行化，20 块拖拽只有 73.9 fps（p50 13.0 ms，隔一个 vblank 丢一帧）；
+        // latency=2 让提交与消费重叠 -> **105.0 fps、p50 8.34 ms（完美锁相）**，
+        // 单块 100.2 -> 113.9 fps。代价是 +1 帧呈现队列（120 Hz 下约 +8 ms 光标到光子）。
+        // 指标 ④（120 Hz 屏拖拽 ≥ 90 fps）与这 8 ms 之间选前者；
+        // GLASS_FRAME_LATENCY=1 可回到方案字面推荐值。
         let latency: u32 = std::env::var("GLASS_FRAME_LATENCY")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1)
+            .unwrap_or(2)
             .clamp(1, 8);
+        eprintln!("[info] 渲染队列深度 = {latency}（GLASS_FRAME_LATENCY 可改；1 = 最低滞后，2 = 吞吐优先）");
         if let Ok(dxgi1) = dxgi.cast::<IDXGIDevice1>() {
             if let Err(e) = unsafe { dxgi1.SetMaximumFrameLatency(latency) } {
                 eprintln!("[warn] SetMaximumFrameLatency({latency}): {e}");

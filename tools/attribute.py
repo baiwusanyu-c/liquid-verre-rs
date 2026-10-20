@@ -25,6 +25,9 @@ MATRIX = [
     ("skip-PassB", {"GLASS_SKIP_PASS_B": "1"}),
     ("skip-Present", {"GLASS_SKIP_PRESENT": "1"}),
     ("skip-A+B", {"GLASS_SKIP_PASS_A": "1", "GLASS_SKIP_PASS_B": "1"}),
+    ("skip-clear", {"GLASS_SKIP_CLEAR": "1"}),
+    ("skip-dirty", {"GLASS_SKIP_DIRTY": "1"}),
+    ("skip-copy", {"GLASS_SKIP_COPY": "1"}),
 ]
 
 

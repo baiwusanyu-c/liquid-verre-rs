@@ -479,14 +479,19 @@ impl Pyramid {
         // 因此第 k 级的 scissor 外扩 2^(k+1) px，保证读到的都是本 run 或「未变化捕获」的内容。
         let grow = |r: [i32; 4], g: i32| [r[0] - g, r[1] - g, r[2] + g, r[3] + g];
         // --- 下采样 ---
+        // 幂等所需的逐级外扩：第 k 级的 4-tap 读第 k-1 级 ±1 texel = ±2^k px，
+        // 递归展开得 g_{k-1} ≥ g_k + 2^k。取 g3=0 → g2=8 → g1=12 → g0=14。
+        // 旧的 2/4/8/16 在 level 0/1 上不足，会在 scissor 边界留下 ±1~3 LSB
+        // 的残差带（verify_dirty 间歇 FAIL 的来源）。
+        const DOWN_GROW: [i32; LEVELS] = [14, 12, 8, 0];
         {
-            let sc = self.scissor_for(grow(region, 2), &self.down[0]);
+            let sc = self.scissor_for(grow(region, DOWN_GROW[0]), &self.down[0]);
             self.draw(ctx, capture_srv, &self.down[0], w, h, sc);
         }
         for k in 1..LEVELS {
             let src = self.down[k - 1].srv.clone();
             let (sw, sh) = (self.down[k - 1].w, self.down[k - 1].h);
-            let sc = self.scissor_for(grow(region, 1 << (k + 1)), &self.down[k]);
+            let sc = self.scissor_for(grow(region, DOWN_GROW[k]), &self.down[k]);
             self.draw(ctx, &src, &self.down[k], sw, sh, sc);
         }
 

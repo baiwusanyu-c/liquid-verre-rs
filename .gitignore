@@ -32,3 +32,4 @@ tools/exe_*.exe
 tools/*.txt
 tools/pf*.json
 tools/perf_*.json
+tools/audit_*.json
