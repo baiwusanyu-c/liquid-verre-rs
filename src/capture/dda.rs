@@ -334,7 +334,9 @@ impl DdaCapture {
                 let tc0 = std::time::Instant::now();
                 let full_area = (desc.Width as i64) * (desc.Height as i64);
                 let union_area = d.map_or(i64::MAX, |r| {
-                    (r[2] - r[0]).max(0) as i64 * (r[3] - r[1]).max(0) as i64
+                    // 先 widen 到 i64 再减：脏矩形来自 DDA 元数据（不可信），
+                    // i32 直接减在 debug 构建会 overflow panic（release 回绕）。
+                    (r[2] as i64 - r[0] as i64).max(0) * (r[3] as i64 - r[1] as i64).max(0)
                 });
                 let use_partial = !skip_copy
                     && !recreate
@@ -530,6 +532,21 @@ impl DdaCapture {
         }
         let mut union: Option<[i32; 4]> = None;
         self.dirty.clear();
+        // DDA 的脏矩形/移动矩形是**不可信外部输入**：退化矩形（right<left）或
+        // 垃圾坐标（±2e9）都会让后续 i32 加减在 debug 构建 overflow panic，
+        // 或让 union 跨度超出 i32。统一 clamp 到屏幕并丢弃退化矩形。
+        let (sw, sh) = (self.width.max(0), self.height.max(0));
+        let sanitize = |r: [i32; 4]| -> Option<[i32; 4]> {
+            let l = r[0].clamp(0, sw);
+            let t = r[1].clamp(0, sh);
+            let rr = r[2].clamp(0, sw);
+            let b = r[3].clamp(0, sh);
+            if rr > l && b > t {
+                Some([l, t, rr, b])
+            } else {
+                None
+            }
+        };
         let ptr = self.meta.as_mut_ptr();
         unsafe {
             if let Some(sim) = sim_dirty(self.width.max(1), self.height.max(1)) {
@@ -548,7 +565,9 @@ impl DdaCapture {
             {
                 for i in 0..n as usize {
                     let r = *(ptr as *const RECT).add(i);
-                    let rect = [r.left, r.top, r.right, r.bottom];
+                    let Some(rect) = sanitize([r.left, r.top, r.right, r.bottom]) else {
+                        continue;
+                    };
                     union_add(&mut union, rect);
                     if self.dirty.len() < MAX_DIRTY_RECTS + 1 {
                         self.dirty.push(rect);
@@ -564,15 +583,22 @@ impl DdaCapture {
                 for i in 0..m as usize {
                     let mv = *(ptr as *const DXGI_OUTDUPL_MOVE_RECT).add(i);
                     let d = mv.DestinationRect;
-                    let w = d.right - d.left;
-                    let h = d.bottom - d.top;
-                    let dst = [d.left, d.top, d.right, d.bottom];
-                    let src = [
-                        mv.SourcePoint.x,
-                        mv.SourcePoint.y,
-                        mv.SourcePoint.x + w,
-                        mv.SourcePoint.y + h,
-                    ];
+                    // i64 上算宽高并 clamp，避免垃圾 SourcePoint/RECT 触发溢出
+                    let w = (d.right as i64 - d.left as i64).clamp(0, sw as i64);
+                    let h = (d.bottom as i64 - d.top as i64).clamp(0, sh as i64);
+                    let Some(dst) = sanitize([d.left, d.top, d.right, d.bottom]) else {
+                        continue;
+                    };
+                    let sx = mv.SourcePoint.x.clamp(0, sw);
+                    let sy = mv.SourcePoint.y.clamp(0, sh);
+                    let Some(src) = sanitize([
+                        sx,
+                        sy,
+                        (sx as i64 + w).min(sw as i64) as i32,
+                        (sy as i64 + h).min(sh as i64) as i32,
+                    ]) else {
+                        continue;
+                    };
                     union_add(&mut union, dst);
                     union_add(&mut union, src);
                     if self.dirty.len() < MAX_DIRTY_RECTS + 1 {
