@@ -185,3 +185,25 @@ transparent 实测（不健康窗口）：空闲 cpu 0.39%、Private 121.6MB（�
 ### Next Steps
 
 - 重命名文件夹 + 健康窗口复跑 gate_perf/verify_adaptive + 回填 README 性能表
+
+
+## Session 4: 优化轮 2 收尾：border 实芯修复取证 + 全阀门绿 + 提交归档
+<!-- trellis-session: v=2 fp=058977ac0b7df62f -->
+
+**Date**: 2026-10-21
+**Task**: 优化轮 2 收尾：border 实芯修复取证 + 全阀门绿 + 提交归档
+**Branch**: `codex/liquid-verre-rs-refactor`
+
+### Summary
+
+border 加粗根因定位（band 渐隐改实芯+AA，像素剖面与 4x 取证图证明厚度受控）；movable 面板冒烟工具化（tools/smoke_panel.py）；取证放大工具 tools/shot_zoom.py；gate_perf/verify_adaptive/verify_dirty(x4)/cmp_visual/smoke_panel 全绿；文档计数与 border 公式同步（README/CHANGELOG/spec/performance_report）；清理 4.6GB 取证中间产物；单次提交 64768b1 后归档任务。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `64768b1` | refactor!: 库化重构为 liquid-verre-rs workspace（0.4.1 优化轮合入） |
+
+### Status
+
+[OK] **Completed**
