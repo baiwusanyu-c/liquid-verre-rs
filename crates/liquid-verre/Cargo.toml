@@ -9,8 +9,9 @@ build = "build.rs"
 # cargo package 要求 readme 在 crate 目录内（workspace 根的 README 不会被打进 .crate），
 # 因此 crate 自带一份短 README，完整文档在仓库根。
 readme = "README.md"
-# 发布到 GitHub 后填这里（cargo package 会对缺失 repository 告警）：
-# repository = "https://github.com/<owner>/liquid-verre-rs"
+# 仓库地址：缺了 cargo package 会告警，crates.io 页面也靠它给出「源码」链接。
+# ⚠ 仓库名（tarui-glass）与 crate 名（liquid-verre-rs）不一致；任一边改名都要同步这里 + README 的 git 依赖片段。
+repository = "https://github.com/baiwusanyu-c/tarui-glass"
 keywords = ["windows", "glass", "liquid-glass", "d3d11", "directcomposition"]
 categories = ["graphics", "os::windows-apis"]
 

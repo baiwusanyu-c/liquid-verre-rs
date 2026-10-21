@@ -53,16 +53,26 @@ python tools/gate_perf.py                                         # 性能阀门
 ## 发版与 CI（本地助手 + GitHub Actions）
 
 ```powershell
-node scripts/release.mjs --bump patch --dry-run   # 先看会做什么（不落盘）
+node scripts/release.mjs --bump patch --dry-run   # 先看会做什么（不落盘、不动 git）
 node scripts/release.mjs --bump patch             # 改版本号 + CHANGELOG 标题 + check + cargo package 干跑
+node scripts/release.mjs --bump patch --ship      # 一键发版：上面全部 + commit + tag + push（触发发布流水线）
 ```
 
-- `release.mjs` **刻意不 commit / tag / push**（提交必须由人显式发起）。它只把版本号
+- `release.mjs` **默认不 commit / tag / push**（提交必须由人显式发起）。它把版本号
   （根 `Cargo.toml` 的 `[workspace.package] version`）、CHANGELOG 的
   `## [x.y.z-unreleased]` → `## [x.y.z] - 日期`、本地闸门（`node scripts/check.mjs`）与
   `cargo package -p liquid-verre-rs --list --allow-dirty` 干跑准备好，最后打印要人工敲的
   三条 git 命令。**工作区不干净会直接失败**（否则发出去的版本对不上 commit）。
-  `--version x.y.z` 指定版本、`--tag` 覆盖 tag 名、`--publish` 才在本地 `cargo publish`。
+  `--version x.y.z` 指定版本、`--tag` 覆盖 tag 名（必须 `v` + semver，否则不触发 `tags: ["v*"]`）、
+  `--publish` 才在本地 `cargo publish`（排在 push 之前，失败时 tag 还没出去）。
+- **`--ship` 是那句显式授权**：一条命令做完闸门 → 落盘 → `git add -A` + `commit -m "release: x.y.z"`
+  （`--message` 可覆盖）→ 附注 tag → `git push origin HEAD:refs/heads/<branch> refs/tags/<tag>`，
+  推完打印 Actions / Release 链接；`--ship --no-push` 只提交打 tag。两项预检排在闸门**之前**：
+  git（detached HEAD / tag 重名 / 落后上游 / 无 origin）与 CHANGELOG（`--ship` 时必须有
+  `## [x.y.z-unreleased]` 标题，否则 release notes 是空的 ⇒ 拒绝发）。
+- `release.yml` 的 `crates-io` job **不能**用 `if: ${{ secrets.X != '' }}`：GitHub 明确规定 secret
+  不能直接出现在 `if:` 条件里（写了就是静默跳过，配了 token 也不发布）。现实现是 job 只按 ref 过滤，
+  token 有无在第一个 step 里用 job 级 `env` 判、没配就 `::notice::` 一行跳过。改这个 job 时别退回去。
 - 推 `v*` tag 后 `.github/workflows/release.yml` 自动：windows 上 `check.mjs` + `package.mjs` →
   ubuntu 上从 CHANGELOG 抽 `## [x.y.z]` 段做 notes 建 GitHub Release（挂 dist zip + build-info.json）→
   配了 secret `CARGO_REGISTRY_TOKEN` 才 `cargo publish -p liquid-verre-rs --no-verify`，否则跳过。

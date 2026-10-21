@@ -7,6 +7,10 @@
 #
 # crates.io 发布需要的 secret（在仓库 Settings -> Secrets and variables -> Actions 添加）：
 #   CARGO_REGISTRY_TOKEN   # crates.io 的 API token；不配置则只出 GitHub Release，不发布 crate
+# 想免掉长期 token，可改用 crates.io 的 trusted publishing（GitHub Actions OIDC）：
+#   给下面的 crates-io job 加 `permissions: id-token: write`，并把 publish 换成
+#   `cargo publish --package liquid-verre-rs --no-verify --trusted-publishing=always`
+#   （需要较新的 stable cargo；且 crate 必须已经手工首发过一次，配置步骤见 README「发布与分发」）
 name: release
 
 on:
@@ -86,12 +90,27 @@ jobs:
     name: publish to crates.io
     needs: [package, github-release]
     runs-on: ubuntu-latest
-    # 没配 token 就跳过：只出 GitHub Release 也是完全可用的分发方式（git 依赖）
-    if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != '') }}
+    # ⚠ `secrets` 上下文在 job 级 `if:` 里**不可用**（GitHub 官方安全指南：
+    # "Secrets cannot be directly referenced in if: conditionals"）。写成
+    # `if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}` 不会按预期放行，结果是
+    # 配了 token 也静默不发布。所以 job 只按 ref 过滤，token 有无在 step 里用 env 判。
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != '' }}
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
+      - name: has token?
+        id: gate
+        run: |
+          if [ -n "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 secret CARGO_REGISTRY_TOKEN，跳过 crates.io 发布（GitHub Release 与 git 依赖不受影响）"
+          fi
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.publish == 'true'
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.publish == 'true'
       - name: publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        if: steps.gate.outputs.publish == 'true'
         run: cargo publish --package liquid-verre-rs --no-verify

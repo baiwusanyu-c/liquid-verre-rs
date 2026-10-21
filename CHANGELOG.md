@@ -41,18 +41,35 @@
     若配置了 secret `CARGO_REGISTRY_TOKEN` 则 `cargo publish -p liquid-verre-rs --no-verify`，
     否则整个 job 跳过（git 依赖也是完全可用的分发方式）。
 - **`scripts/release.mjs`（本地发版助手）**：工作区必须干净 → 算目标版本
-  （`--bump patch|minor|major` 或 `--version x.y.z`，tag 名默认 `v<version>`、`--tag` 可覆盖）→
-  `node scripts/check.mjs` → `cargo package -p liquid-verre-rs --list --allow-dirty` 干跑 →
-  改根 `Cargo.toml` 的 `[workspace.package] version` + 把 CHANGELOG 的 `## [x.y.z-unreleased]`
-  标题替换成 `## [x.y.z] - YYYY-MM-DD` → 打印接下来要人工执行的 `git commit / git tag / git push`。
-  **刻意不 commit / tag / push**（项目约定：提交必须由人显式发起）；`--dry-run` 只打印不落盘，
-  `--publish` 才在本地直接 `cargo publish`。
+  （`--bump patch|minor|major` 或 `--version x.y.z`，tag 名默认 `v<version>`、`--tag` 可覆盖但必须
+  是 `v` + semver，否则不匹配 `release.yml` 的 `tags: ["v*"]`）→ **git 预检**（detached HEAD /
+  tag 本地或远端重名 / 落后上游 / 没有 origin）→ **CHANGELOG 预检** → `node scripts/check.mjs` →
+  `cargo package -p liquid-verre-rs --list --allow-dirty` 干跑 → 改根 `Cargo.toml` 的
+  `[workspace.package] version` + 把 CHANGELOG 的 `## [x.y.z-unreleased]` 标题替换成
+  `## [x.y.z] - YYYY-MM-DD` → 打印接下来要人工执行的 `git commit / git tag / git push`。
+  git 与 CHANGELOG 两项预检都排在闸门**之前**：tag 重名这类错误不该等 5 分钟 clippy 才发现。
+  **默认不 commit / tag / push**（项目约定：提交必须由人显式发起）；`--dry-run` 只打印不落盘，
+  `--publish` 才在本地直接 `cargo publish`（排在 push 之前，失败时 tag 还没出去，会打印回滚命令）。
+- **`scripts/release.mjs --ship`（一键发版）**：同一条命令做完「闸门 → 改版本号 + CHANGELOG →
+  `git add -A` + `commit -m "release: x.y.z"`（`--message` 可覆盖）→ 附注 tag `vx.y.z` →
+  一条 `git push origin HEAD:refs/heads/<branch> refs/tags/<tag>`」，tag 落地即触发
+  `release.yml`，最后打印 Actions / Release 链接。`--ship --no-push` 只提交打 tag、把 push 留给人；
+  `--ship` 时若 CHANGELOG 没有 `## [x.y.z-unreleased]` 标题会**拒绝发布**（否则 release notes 是空的）。
+  沙盒验证过全链路：真实 git 仓库 + 本地 bare 远端，push 后 `git ls-remote --tags` 能看到 tag；
+  重名 tag / detached HEAD / 脏工作区 / 非法 `--bump` / `--no-push` 不带 `--ship` 五条错误路径都有明确报错。
 - **`crates/liquid-verre/README.md`**：crate 自带短 README —— `cargo package` 要求 `readme`
   指向 **crate 目录内**的文件（workspace 根的 README 不会被打进 `.crate`）；
-  `crates/liquid-verre/Cargo.toml` 的 `readme` 已指向它，`repository` 留了注释占位
-  （等仓库 URL 定下来再填，缺失时 `cargo package` 只告警不失败）。
+  `crates/liquid-verre/Cargo.toml` 的 `readme` 已指向它，`repository` 已填
+  `https://github.com/baiwusanyu-c/tarui-glass`（缺失时 `cargo package` 只告警不失败，
+  但 crates.io 页面会少一个「源码」链接；填完后 `cargo package --list` 已无告警）。
 
 ### Fixed
+- **`release.yml` 的 crates.io job 永远不会跑**（发布链路）：job 级 `if:` 里写了
+  `${{ secrets.CARGO_REGISTRY_TOKEN != '' }}`，而 GitHub 明确规定 **secret 不能直接用在 `if:` 条件里**
+  （官方安全指南原话："Secrets cannot be directly referenced in if: conditionals"）⇒ 即使配好 token
+  也会静默跳过，Actions 页面上看不出原因。改为 job 只按 ref 过滤
+  （`startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''`），token 有无放到第一个
+  step 里用 job 级 `env` 判；没配就留一条 `::notice::` 并跳过后续 step（GitHub Release 与 git 依赖不受影响）。
 - **API 改 z 序不重画**（P0）：`bring_to_front` / `send_to_back` / `set_z_order` 只改
   `Manager` 不脏化合成器，静止桌面上端到端无效。新增 `Compositor::invalidate_present()`
   （只作废 present 账本、不动金字塔账本），`SetZ` 变化时调用。

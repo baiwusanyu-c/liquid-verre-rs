@@ -315,18 +315,37 @@ liquid-verre-rs = { git = "https://github.com/baiwusanyu-c/tarui-glass.git", tag
 liquid-verre-rs = { git = "https://github.com/baiwusanyu-c/tarui-glass.git", tag = "v0.4.1" }
 ```
 
-**② crates.io —— 配好 secret 后由 tag 流水线自动发布**
+**② crates.io —— 一次性配好凭据后，由 tag 流水线自动发布**
 
 ```toml
 [dependencies]
 liquid-verre-rs = "0.4"
 ```
 
-在仓库 Settings → Secrets and variables → Actions 里配好 `CARGO_REGISTRY_TOKEN`
-（crates.io 的 API token）后，推 `v*` tag 会在建完 GitHub Release 之后自动
-`cargo publish -p liquid-verre-rs --no-verify`；**没配 token 则这个 job 直接跳过** ——
-只出 GitHub Release、靠 git 依赖分发也是完全可用的方式。跨平台宿主同样写
-`[target.'cfg(windows)'.dependencies]`。
+crate 名 `liquid-verre-rs` 目前在 crates.io 上**还没被占用**（2026-10-21 查 `/api/v1/crates/liquid-verre-rs`
+返回 404 = 可注册）。要让别的项目能 `cargo add liquid-verre-rs`，需要三步：
+
+1. **首发必须手工做一次**（crate 在 crates.io 上还不存在时，流水线与 trusted publishing 都无从谈起）：
+   到 <https://crates.io/settings/tokens> 生成 API token（scope 勾 `publish-new` + `publish-update`），
+   本地 `cargo login`（token 落进 `%USERPROFILE%\.cargo\credentials.toml`，只需一次），
+   再 `node scripts/release.mjs --bump patch --publish`（或去掉 `--publish`，改由 CI 发）。
+2. **之后自动发布，二选一**：
+   - **token 路线（现成可用）**：仓库 Settings → Secrets and variables → Actions →
+     New repository secret，名字必须正好是 `CARGO_REGISTRY_TOKEN`。推 `v*` tag 后
+     `release.yml` 的 `crates-io` job 会 `cargo publish -p liquid-verre-rs --no-verify`；
+     **没配这个 secret 就跳过并在日志里留一条 notice** —— 只出 GitHub Release、靠 git 依赖分发
+     也是完全可用的方式。token 建议设过期时间，泄露时在同一页 revoke。
+     ⚠ 判定写在 step 里而不是 job 级 `if:`：**secret 不能直接用在 `if:` 条件里**
+     （GitHub 官方安全指南原话 "Secrets cannot be directly referenced in if: conditionals"）。
+   - **trusted publishing 路线（免长期 token，crates.io 2025 起支持 GitHub Actions OIDC）**：
+     首发完成后，在 crate 页面 Settings → Trusted publishers 填 publisher `baiwusanyu-c`、
+     repository `tarui-glass`、workflow `release.yml`、environment 留空；再给 `crates-io` job 加
+     `permissions: id-token: write`，publish 命令换成
+     `cargo publish -p liquid-verre-rs --no-verify --trusted-publishing=always`
+     （需要较新的 stable cargo，先 `cargo --version` 确认认得这个旗标）。
+   - 两条路线**别同时开**：本地 `--publish` 之后 CI 再发同一版本会因「已存在」失败
+     （GitHub Release 不受影响，只是多一个红叉）。
+3. 跨平台宿主同样写 `[target.'cfg(windows)'.dependencies]`。
 
 **③ GitHub Release 的 zip —— 给人看的产物 + 溯源，不是给 Cargo 用的**
 
@@ -345,30 +364,37 @@ zip 的定位是「**给人看的产物 + `build-info.json` 溯源**」；机器
 
 ### 发版流程
 
-**本地三步（`scripts/release.mjs`）**：
+**本地发版（`scripts/release.mjs`）**：
 
 ```powershell
-node scripts/release.mjs --bump patch --dry-run   # 先看会做什么，不落盘
-node scripts/release.mjs --bump patch             # 改版本号 + 改 CHANGELOG 标题 + 跑 check + package 干跑
-git add -A && git commit -m "release: 0.4.1"      # 这三条由人执行：脚本会打印它们，但刻意不代劳
-git tag v0.4.1
-git push origin HEAD --tags
+node scripts/release.mjs --bump patch --dry-run          # 先看会做什么：不落盘、不动 git
+node scripts/release.mjs --bump patch --ship             # 一键发版：闸门 + 改版本号/CHANGELOG + commit + tag + push
+node scripts/release.mjs --bump patch --ship --no-push   # 同上，但 push 留给人复核
 ```
+
+不带 `--ship` 时脚本只落盘「版本号 + CHANGELOG 标题」，然后打印要人工敲的三条 git 命令
+（项目约定：提交必须由人显式发起）；`--ship` 就是那句显式授权，tag 一推上去 `release.yml` 立刻跑。
 
 `release.mjs` 依次做：① **工作区必须干净**（否则发出去的版本对不上 commit）；
 ② 算目标版本（`--bump patch|minor|major` 或 `--version x.y.z`，tag 名默认 `v<version>`，
-`--tag` 可覆盖）；③ `node scripts/check.mjs`（= fmt + clippy `-D warnings` + test）；
-④ `cargo package -p liquid-verre-rs --list --allow-dirty` 干跑（验 readme / license /
-路径依赖等可发布性）；⑤ 改根 `Cargo.toml` 的 `[workspace.package] version`，并把 CHANGELOG 的
-`## [x.y.z-unreleased]` 标题替换成 `## [x.y.z] - YYYY-MM-DD`；⑥ 打印后续 git 命令。
-加 `--publish` 才会在本地直接 `cargo publish`（需先 `cargo login`）。
+`--tag` 可覆盖，但必须匹配 `v` + semver —— 否则不触发 `release.yml` 的 `tags: ["v*"]`）；
+③ **git 预检**：detached HEAD / tag 本地或远端重名 / 落后上游 / 没有 origin，一律在耗时的闸门**之前**失败；
+④ **CHANGELOG 预检**：`--ship` 时必须有 `## [x.y.z-unreleased]` 标题，否则拒绝发布（release notes 会是空的）；
+⑤ `node scripts/check.mjs`（= fmt + clippy `-D warnings` + test）；
+⑥ `cargo package -p liquid-verre-rs --list --allow-dirty` 干跑（验 readme / license /
+路径依赖等可发布性）；⑦ 改根 `Cargo.toml` 的 `[workspace.package] version`，并把 CHANGELOG 的
+`## [x.y.z-unreleased]` 标题替换成 `## [x.y.z] - YYYY-MM-DD`；
+⑧ `--ship` 时 `git add -A` + `git commit -m "release: x.y.z"`（`--message` 可覆盖）+ 附注 tag
++ **一条命令同时推分支与 tag**，最后打印 Actions / Release 链接；
+⑨ `--publish` 才会在本地直接 `cargo publish`（需先 `cargo login`），排在 push **之前** ——
+失败时 tag 还没出去，脚本会打印回滚命令（`git tag -d <tag>` + `git reset --hard HEAD~1`）。
 
 **推 tag 之后（`.github/workflows/release.yml`）**：
 
 1. `windows-latest`：`node scripts/check.mjs` → `node scripts/package.mjs` → 上传 `dist/` artifact；
 2. `ubuntu-latest`：从 `CHANGELOG.md` 里抽出 `## [x.y.z]` 那一段当 release notes，建 GitHub Release
    并挂 `dist/*.zip` + `dist/*/build-info.json`（版本号含 `-` 时自动标 prerelease）；
-3. 若配了 secret `CARGO_REGISTRY_TOKEN`：`cargo publish -p liquid-verre-rs --no-verify`。
+3. 若配了 secret `CARGO_REGISTRY_TOKEN`：`cargo publish -p liquid-verre-rs --no-verify`（token 有无在 step 里判，没配则跳过 + 一条 notice；secret 不能写在 job 级 `if:` 里）。
 
 也可以不推 tag：Actions 页面手动触发 `release`（`workflow_dispatch`，可填 tag 名；留空则只构建不发布）。
 
@@ -383,8 +409,8 @@ CI 的无交互会话里测出来的数字没有意义（口径见 `.trellis/spe
 
 | 项 | 用在哪 | 现状 |
 |---|---|---|
-| GitHub 仓库 URL | `crates/liquid-verre/Cargo.toml` 的 `repository`（缺失时 `cargo package` 会告警）+ 本节与「安装」一节的 git 依赖片段 | crate 的 `repository` 目前是**注释占位**；仓库 remote 是 `https://github.com/baiwusanyu-c/tarui-glass.git`。若日后改名为 `liquid-verre-rs`，这两处要一起改 |
-| 是否开 crates.io | 决定要不要配 Actions secret `CARGO_REGISTRY_TOKEN` | 不配 = 只出 GitHub Release，git 依赖照常用 |
+| GitHub 仓库 URL | `crates/liquid-verre/Cargo.toml` 的 `repository`（缺失时 `cargo package` 会告警）+ 本节与「安装」一节的 git 依赖片段 | **已填** `repository = "https://github.com/baiwusanyu-c/tarui-glass"`（`cargo package --list` 已无告警）。仓库若改名为 `liquid-verre-rs`，这里 + 本节与「安装」一节的 git 依赖片段要一起改 |
+| 是否开 crates.io | 决定要不要配 Actions secret `CARGO_REGISTRY_TOKEN`（或改用 trusted publishing） | **未配**：不配 = 只出 GitHub Release，git 依赖照常用。开的话首发必须本地 `cargo login` + `--publish` 手工做一次，详见上文 ② |
 | tag 命名约定 | `release.yml` 的触发条件是 `tags: ["v*"]`，`release.mjs` 默认生成 `v<version>` | **`v` + semver**（例 `v0.4.1`）；`baseline/pre-refactor` 这类非 `v*` tag 不会触发发布 |
 | crate 内 README | `cargo package` 要求 `readme` 指向 **crate 目录内**的文件（workspace 根的 README 不会被打进 `.crate`） | 已有 `crates/liquid-verre/README.md`（短版 + 指回仓库根） |
 
