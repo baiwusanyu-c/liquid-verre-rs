@@ -8,7 +8,7 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
-## [0.4.1-unreleased] — 自检轮（独立审查修复）
+## [0.4.1] - 2026-10-21
 
 ### Added
 - **「是否可拖拽移动」参数（两种玻璃模式共用）**：`WindowConfig.movable`（默认 `true`，
