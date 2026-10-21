@@ -75,3 +75,60 @@ python tools/ab_memory.py               # 常驻内存受控 A/B（level 0 vs le
 12.1 双模渲染器/W 模式、12.2 输入壳窗口、12.5 瓦片级检测、7.4-3 capture_scale、
 5.10 累积缓冲、M3 崩溃恢复/开机自启/24h 浸泡、M4 可选项、7.6 PresentMon 口径、
 12.4.1 Pass B 分级重绘（因不变量 1 主动放弃）、7.4-7 队列深度（默认 1 为跟手，2 为吞吐档）。
+
+
+---
+
+# 重构后状态（0.4.0 / liquid-verre-rs，2026-10-20）
+
+上面全部内容仍是**重构前基线快照**，保留不动（它是逐位比对的参照系）。
+本节记录重构落地后的口径变化与验收结果；细节过程见
+`.trellis/tasks/10-20-lib-refactor-liquid-verre/` 与 `CHANGELOG.md`。
+
+## 命令口径变化
+
+| 旧 | 新 |
+|---|---|
+| `cargo build --release` → `target/release/liquid-glass.exe` | `cargo build --release --workspace` → `target/release/liquid-verre-playground.exe`（dev playground；库本体是 `libliquid_verre.rlib`） |
+| `cargo test --release`（25 个） | `cargo test --release --workspace`（**147 个**：lib 129 + 集成 11 + playground 5 + doctest 2） |
+| — | `cargo clippy --workspace --all-targets --release -- -D warnings`（0 warning） |
+| — | `cargo fmt --all --check` |
+| — | `node scripts/check.mjs` / `build.mjs` / `package.mjs` / `gate.mjs`（等价于 `cargo xtask <cmd>`；脚本已从 PowerShell 迁到 Node） |
+| 8 个回归脚本 | 同 8 个，但被测 EXE 变为 playground 产物；**必须带 `GLASS_DEFAULT_BLOCK=1`**（脚本已内置）—— 库默认不再自建窗口 |
+
+## 视觉验收（tools/cmp_visual.py，新口径）
+
+- 口径：稳态帧（`GLASS_INTERNAL_SHOT_AT_MS=2500`）+ 光标 `SetCursorPos` 物理停放（看门狗持续复位）
+  + 停放点离玻璃 > 3*mouse_radius；四段 oracle = deep / interior / ring / outside。
+- **single 跨版本（重构前 exe vs 重构后）：四段全 0 差异 = 逐位一致。**
+- many 同一构建两次：全 0（确定性）。
+- many 跨版本：差异 100% 归因到圆角半径的**有意变更**（圆角邻域 r+6 内 36729 px / 最大 136；
+  邻域外 3105 px / 最大 2 = 阴影尾部残差，≤ 阈值 2）。原因：旧主循环圆角滑杆只写「选中块」，
+  20 块里 19 块的 radius 永远停在 `Block::new` 的硬编码 28；新库统一由样式派生（需求 F1）。
+- 光标在深内部两点移动：deep 段 0 差异（背景不颤抖）。
+
+## 回归阀门结果（2026-10-20）
+
+| 脚本 | 结果 |
+|---|---|
+| verify_dirty ×3 | PASS |
+| verify_mouse_isolation | PASS |
+| verify_validity | PASS |
+| verify_crossscreen | PASS |
+| verify_env_ema ×3 | PASS（补 `GLASS_ADAPTIVE=0` 后） |
+| verify_adaptive | **环境阻塞**：当前机器 `rel_max ≈ 200~257 ms`（DDA `ReleaseFrame` 阻塞），远超健康窗口 `rel_max<5ms`；旧二进制同条件同样 FAIL，背靠背 A/B 无差别 → 非回归 |
+| gate_perf | 同上，环境阻塞；`own_us`（我们自己的工作）40~84 µs，与基线同量级 |
+
+> 性能结论只在健康窗口给出（见 `.trellis/spec/backend/measurement-and-gates.md`）。
+> **待办：在 `rel_max<5ms 且 acq_max<25ms` 的窗口复跑 gate_perf 与 verify_adaptive 并回填本节。**
+
+## 不变量增补（在原 9 条之上）
+
+10. **缩放反馈掩码源头互斥**：`ResizeEdges::to_shader_edges()` 在对角时全 0、
+    `to_shader_corners()` 在单边时全 0；border 由独立 pass（`border_ps.hlsl`）绘制，
+    只作用于 hover 块，其余块零状态切换。
+11. **影响盒单一出口**：`MonitorRt::influence_px() = max(3R+32, 2*grip+16) + ceil(shadow_margin)`，
+    脏区推导 / verify_validity / mouse_relevant 三处共用，禁止手写外扩。
+12. **默认参数即视觉基线**：`LiquidParams::default()` 的 `blur_min` 必须写成表达式 `20.0 * 0.12`
+    （f32 下 = 2.3999999，字面量 2.4 差 1 ULP ≈ 2400 个 ±1 LSB 像素）；改默认值 = 改基线，
+    必须同步取证图与本节。

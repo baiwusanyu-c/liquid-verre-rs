@@ -26,7 +26,9 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "target", "release", "liquid-glass.exe")
+# 被测可执行文件 = dev playground 产物；可用 VERRE_EXE 覆盖（例如指向旧基线做 A/B）。
+EXE = os.environ.get("VERRE_EXE") or os.path.join(
+    ROOT, "target", "release", "liquid-verre-playground.exe")
 SW, SH = 3120, 2080
 MARGIN = 30
 # 与 shader 的 gate 支撑半径（3*mouse_radius=660）+ 余量对齐：
@@ -79,6 +81,13 @@ def load(path):
 def shot(tag, cursor, far_grid=False):
     base = os.path.join(ROOT, "tools", "mi_%s.bmp" % tag)
     env = dict(os.environ)
+    # 库默认**不**自建玻璃窗口（上层应用负责 create_window）；
+    # 取证脚本需要一块确定性的默认玻璃，因此显式打开。
+    env["GLASS_DEFAULT_BLOCK"] = "1"
+    # 像素等价证明不允许自适应降档中途改视觉（level>=1 会换 frost 分辨率 /
+    # 关焦散色散），否则同一份代码两次跑都会对不上。cmp_visual.py 早就关了，
+    # 这里补齐其余脚本。
+    env["GLASS_ADAPTIVE"] = "0"
     env.update({"GLASS_MANY": "1", "GLASS_SYNTH_CAP": "1",
                 "GLASS_MONITORS": "1",
                 "GLASS_INTERNAL_SHOT": base,

@@ -22,7 +22,9 @@ except Exception:
 user32 = ctypes.windll.user32
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "target", "release", "liquid-glass.exe")
+# 被测可执行文件 = dev playground 产物；可用 VERRE_EXE 覆盖（例如指向旧基线做 A/B）。
+EXE = os.environ.get("VERRE_EXE") or os.path.join(
+    ROOT, "target", "release", "liquid-verre-playground.exe")
 BASE = os.path.join(ROOT, "tools", "dirty")
 
 
@@ -62,6 +64,13 @@ def run_case(label, extra_env, drag_target):
     for f in glob.glob(os.path.join(ROOT, "tools", "dirty*")):
         os.remove(f)
     env = dict(os.environ)
+    # 库默认**不**自建玻璃窗口（上层应用负责 create_window）；
+    # 取证脚本需要一块确定性的默认玻璃，因此显式打开。
+    env["GLASS_DEFAULT_BLOCK"] = "1"
+    # 像素等价证明不允许自适应降档中途改视觉（level>=1 会换 frost 分辨率 /
+    # 关焦散色散），否则同一份代码两次跑都会对不上。cmp_visual.py 早就关了，
+    # 这里补齐其余脚本。
+    env["GLASS_ADAPTIVE"] = "0"
     env["GLASS_METRICS"] = "1"
     env["GLASS_VERIFY_PASS_A"] = "1"
     env["GLASS_INTERNAL_SHOT"] = BASE

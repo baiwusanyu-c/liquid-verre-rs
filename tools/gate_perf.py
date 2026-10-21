@@ -27,6 +27,9 @@ PROBE = os.path.join(ROOT, "tools", "perf_probe.py")
 
 def run(case, extra=None, seconds=10.0):
     env = dict(os.environ)
+    # 库默认**不**自建玻璃窗口（上层应用负责 create_window）；
+    # 取证脚本需要一块确定性的默认玻璃，因此显式打开。
+    env["GLASS_DEFAULT_BLOCK"] = "1"
     env.pop("GLASS_FRAME_LATENCY", None)
     if extra:
         env.update(extra)
@@ -57,18 +60,29 @@ def main():
     rows.append(("many-drag  (lat=2, 合成120Hz负载)",
                  run("many-drag", {"GLASS_FRAME_LATENCY": "2",
                                    "GLASS_SIM_BACKDROP": "900x700@120"})))
+    # 需求 F3.1 / 验收 A9：透明玻璃模式必须满足与液态单块**同一套硬门槛**。
+    # 透明模式跳过整条 Pass A，own_us 理论上应明显低于液态；若反而更高说明
+    # 跳过链路断了（例如 needs_backdrop 汇总口径错），用 WARN 提示而不是硬判，
+    # 因为 own_us 的绝对值受机器状态影响，硬判会制造假 FAIL。
+    rows.append(("transparent-drag (透明模式)", run("transparent-drag")))
 
     hard = []
     warn = []
-    s0, m1, m2 = rows[0][1], rows[1][1], rows[2][1]
+    s0, m1, m2, t0 = rows[0][1], rows[1][1], rows[2][1], rows[3][1]
     if not (s0["fps"] >= 90 and s0["p50"] <= 9.0):
         hard.append("单块拖拽 fps/p50 未达标: %.1f fps / %.2f ms" % (s0["fps"], s0["p50"]))
     if m1["fps"] < 60:
         hard.append("20 块默认档 fps < 60: %.1f" % m1["fps"])
     if m2["fps"] < 90:
         hard.append("20 块吞吐档(lat=2, 合成负载) fps < 90: %.1f" % m2["fps"])
-    if max(r["priv"] for r in (s0, m1, m2)) >= 200:
-        hard.append("Private >= 200 MB: %s" % [round(r["priv"], 1) for r in (s0, m1, m2)])
+    if not (t0["fps"] >= 90 and t0["p50"] <= 9.0):
+        hard.append("透明模式单块拖拽 fps/p50 未达标: %.1f fps / %.2f ms" % (t0["fps"], t0["p50"]))
+    if max(r["priv"] for r in (s0, m1, m2, t0)) >= 200:
+        hard.append("Private >= 200 MB: %s" % [round(r["priv"], 1) for r in (s0, m1, m2, t0)])
+    if t0["own"] > s0["own"] + 10:
+        warn.append("透明模式 own_us=%.0f 高于液态单块 %.0f（跳过 Pass A 后本应更低）："
+                    "检查 needs_backdrop 汇总 / FrameInput / compositor 跳过链路"
+                    % (t0["own"], s0["own"]))
     if m1["fps"] < 90:
         warn.append("20 块默认档 fps < 90（%.1f）：桌面重绘 %0.f/s、dirty %.2f Mpx 时受触发节拍/DWM 背压限制"
                     % (m1["fps"], m1["dda"], m1["dirty"]))

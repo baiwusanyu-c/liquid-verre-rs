@@ -25,7 +25,9 @@ except Exception:
     pass
 u = ctypes.windll.user32
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "target", "release", "liquid-glass.exe")
+# 被测可执行文件 = dev playground 产物；可用 VERRE_EXE 覆盖（例如指向旧基线做 A/B）。
+EXE = os.environ.get("VERRE_EXE") or os.path.join(
+    ROOT, "target", "release", "liquid-verre-playground.exe")
 SW, SH = 3120, 2080
 BASE = os.path.join(ROOT, "tools", "tr.bmp")
 EVERY = 160
@@ -71,6 +73,9 @@ def main():
     for f in glob.glob(BASE + ".m0.*"):
         os.remove(f)
     env = dict(os.environ)
+    # 库默认**不**自建玻璃窗口（上层应用负责 create_window）；
+    # 取证脚本需要一块确定性的默认玻璃，因此显式打开。
+    env["GLASS_DEFAULT_BLOCK"] = "1"
     env.update({"GLASS_SYNTH_CAP": "1", "GLASS_MONITORS": "1", "GLASS_ADAPTIVE": "0",
                 "GLASS_SHOT_EVERY_MS": str(EVERY), "GLASS_INTERNAL_SHOT": BASE,
                 "GLASS_METRICS": "1"})

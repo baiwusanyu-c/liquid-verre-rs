@@ -1,0 +1,28 @@
+# dev playground —— **不是库的业务代码**。
+#
+# 重构前这里是 `src/ui/`（tiny_http + 浏览器页面），和渲染代码同层，
+# 导致库的依赖图里混进了 HTTP 服务器。现在它是独立 crate，
+# 只通过 `liquid_verre` 的**公共 API** 驱动引擎，因此同时兼作 API 的活文档：
+# 上层应用能做的事，这里全部用公共 API 做一遍。
+#
+# 运行：`cargo run --release --bin liquid-verre-playground`
+# 或   `cargo xtask build` 后直接跑 `target/release/liquid-verre-playground.exe`
+[package]
+name = "liquid-verre-playground"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "liquid-verre-rs 的开发期控制面板（dev playground，非发布物）"
+publish = false
+
+[[bin]]
+name = "liquid-verre-playground"
+path = "src/main.rs"
+
+[dependencies]
+liquid-verre-rs = { path = "../crates/liquid-verre" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tiny_http = { workspace = true }
+log = { workspace = true }

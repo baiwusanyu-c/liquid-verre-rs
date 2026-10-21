@@ -1,0 +1,12 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "backend spec 总入口，改代码前必读的约定清单"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "现有模块职责边界；重构后必须同步更新"}
+{"file": ".trellis/spec/backend/rendering-pipeline.md", "reason": "逐帧管线契约 + 9 条不可破坏的不变量"}
+{"file": ".trellis/spec/backend/graphics-d3d11-gotchas.md", "reason": "D3D11/DXGI 静默陷阱（hazard 丢绘制、Clear 忽略 scissor、flip 不持久）"}
+{"file": ".trellis/spec/backend/measurement-and-gates.md", "reason": "性能测量方法论与阀门阈值、oracle 选择"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Result<String>/退避/warn-once 现状；阶段 3 要收敛为 Error 类型"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "日志前缀语义与 metrics 行语法；tools/*.py 依赖它解析"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "禁止/必须模式与测试要求（热路径零分配等）"}
+{"file": ".trellis/spec/guides/graphics-change-checklist.md", "reason": "改 gfx/shaders/capture/主循环前的 8 问检查单"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "常量单一来源、避免重复实现（矩形运算抽取）"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "api/runtime/platform/gfx 跨层数据流检查"}
+{"file": "BASELINE.md", "reason": "基线指标表、8 个回归脚本、9 条不变量、已知偏离清单"}

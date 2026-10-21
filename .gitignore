@@ -3,11 +3,9 @@ node_modules/
 dist/
 
 # Rust
-src-tauri/target/
 target/
 
 # 生成物
-src-tauri/gen/schemas/
 
 # 临时文件
 *.log
@@ -35,3 +33,8 @@ tools/perf_*.json
 tools/audit_*.json
 
 TODO.md
+
+# 打包与构建脚本的产物（xtask 输出目录 / cargo xtask 的 stdout、stderr 重定向）
+/dist/
+.build_out.log
+.build_err.log

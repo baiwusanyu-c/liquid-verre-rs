@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>liquid-verre-rs 控制面板</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --fg:#e8eaed; --mut:#9aa0a6; --acc:#7aa2f7; --line:#2a2e35; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.5 "Segoe UI",system-ui,sans-serif; }
+  header { position:sticky; top:0; z-index:5; background:#1b1e24; border-bottom:1px solid var(--line);
+           padding:10px 16px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:14px; margin:0; font-weight:600; }
+  header .stat { color:var(--mut); font-variant-numeric:tabular-nums; }
+  main { display:grid; grid-template-columns: 300px 1fr; gap:16px; padding:16px; align-items:start; }
+  aside, section { background:#191c22; border:1px solid var(--line); border-radius:10px; padding:12px; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin:0 0 8px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+  button, select, input[type=number] { background:#23272f; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:5px 9px; font:inherit; }
+  button { cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button.on { background:var(--acc); color:#0b0d10; border-color:var(--acc); font-weight:600; }
+  details { border-top:1px solid var(--line); padding:8px 0; }
+  details:first-of-type { border-top:0; }
+  summary { cursor:pointer; font-weight:600; color:var(--acc); }
+  .ctl { display:grid; grid-template-columns: 132px 1fr 62px; gap:8px; align-items:center; margin:5px 0; }
+  .ctl label { color:var(--mut); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ctl output { font-variant-numeric:tabular-nums; text-align:right; color:var(--fg); }
+  input[type=range] { width:100%; accent-color:var(--acc); }
+  input[type=color] { width:34px; height:24px; padding:0; border:1px solid var(--line); background:none; }
+  .colors { display:flex; gap:6px; align-items:center; }
+  .win { border:1px solid var(--line); border-radius:8px; padding:8px; margin-bottom:8px; }
+  .win.sel { border-color:var(--acc); }
+  .win .t { font-weight:600; display:flex; gap:8px; align-items:center; }
+  .tag { font-size:11px; padding:1px 6px; border-radius:99px; background:#2a2e35; color:var(--mut); }
+  .tag.live { background:#2b4a2b; color:#a7e3a7; }
+  .muted { color:var(--mut); }
+  .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+  #log { max-height:180px; overflow:auto; font-family:ui-monospace,Consolas,monospace; font-size:11px;
+         color:var(--mut); white-space:pre-wrap; }
+  .hint { color:var(--mut); font-size:11px; margin:6px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>liquid-verre-rs</h1>
+  <span class="stat" id="stat">连接中…</span>
+  <span style="flex:1"></span>
+  <label>作用域
+    <select id="scope">
+      <option value="default">引擎默认（所有继承窗口）</option>
+      <option value="window">当前选中窗口</option>
+    </select>
+  </label>
+  <label>层级
+    <select id="level">
+      <option value="alwaysOnTop">一直在最前</option>
+      <option value="normal">普通</option>
+      <option value="clickToFront">点击到最前</option>
+      <option value="alwaysOnBottom">一直被覆盖</option>
+    </select>
+  </label>
+  <button id="btnReset">恢复默认</button>
+</header>
+
+<main>
+  <aside>
+    <h2>窗口</h2>
+    <div class="row">
+      <button id="btnAddLiquid">+ 液态</button>
+      <button id="btnAddTransparent">+ 透明</button>
+      <button id="btnClose">删除选中</button>
+      <button id="btnClear">清空</button>
+    </div>
+    <div class="row">
+      <button id="btnFront">置顶</button>
+      <button id="btnBack">置底</button>
+      <button id="btnFit">铺满主屏 62%</button>
+    </div>
+    <div class="row">
+      <button id="btnMovable" class="on">可拖拽移动</button>
+      <span class="muted">关掉后按住内部不移动；边缘/圆角缩放仍可用</span>
+    </div>
+    <div class="grid3">
+      <label class="muted">X<input type="number" id="rx" step="1"></label>
+      <label class="muted">Y<input type="number" id="ry" step="1"></label>
+      <label class="muted">W<input type="number" id="rw" step="1" min="24"></label>
+      <label class="muted">H<input type="number" id="rh" step="1" min="24"></label>
+      <button id="btnRect" style="grid-column:span 2">应用矩形</button>
+    </div>
+    <div id="winList" style="margin-top:10px"></div>
+    <h2 style="margin-top:14px">显示器</h2>
+    <div id="monList" class="muted"></div>
+    <h2 style="margin-top:14px">事件</h2>
+    <div id="log"></div>
+  </aside>
+
+  <section>
+    <div class="row">
+      <h2 style="margin:0">外观参数</h2>
+      <span style="flex:1"></span>
+      <button id="modeLiquid" class="on">液态玻璃</button>
+      <button id="modeTransparent">透明玻璃</button>
+    </div>
+    <p class="hint">
+      控件由 <code>/api/schema</code> 动态生成 —— 库里新增一个参数字段，面板自动多一个滑杆。
+      「作用域 = 引擎默认」会改所有继承默认样式的窗口；「当前选中窗口」会把它钉住（不再继承）。
+    </p>
+    <div id="params"></div>
+    <h2 style="margin-top:16px">缩放交互（边缘 / 对角拖拽）</h2>
+    <p class="hint">
+      把光标移到玻璃<b>边缘</b>：白色 border 只画到圆角切点为止；移到<b>圆角</b>：border 沿弧拐弯。
+      按住即可拖拽改变大小；下面的开关可以分别禁用。
+    </p>
+    <div id="resizeParams"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let SCHEMA = null, STATE = null, SELECTED = null, MODE = "liquid";
+
+async function jget(u) { const r = await fetch(u); return r.json(); }
+async function jpost(u, b) {
+  const r = await fetch(u, { method: "POST", headers: { "Content-Type": "application/json" },
+                             body: JSON.stringify(b || {}) });
+  return r.json();
+}
+const scope = () => $("scope").value;
+const target = () => (scope() === "window" && SELECTED != null ? { scope: "window", id: SELECTED }
+                                                              : { scope: "default" });
+
+function currentStyle() {
+  if (scope() === "window" && SELECTED != null) {
+    const w = STATE?.windows?.find((x) => x.id === SELECTED);
+    if (w) return w.style;
+  }
+  return STATE?.defaultStyle;
+}
+function styleParams(style) {
+  if (!style) return {};
+  return style.liquid ?? style.transparent ?? {};
+}
+
+// ---------- 控件渲染 ----------
+function numCtl(f, value, onInput) {
+  const wrap = document.createElement("div"); wrap.className = "ctl";
+  const lab = document.createElement("label"); lab.textContent = f.label; lab.title = f.key;
+  const rng = document.createElement("input");
+  rng.type = "range"; rng.min = f.min; rng.max = f.max; rng.step = f.step;
+  rng.value = Number.isFinite(value) ? value : f.min;
+  const out = document.createElement("output"); out.textContent = (+rng.value).toFixed(3);
+  rng.addEventListener("input", () => { out.textContent = (+rng.value).toFixed(3); });
+  rng.addEventListener("change", () => onInput(+rng.value));
+  wrap.append(lab, rng, out);
+  // 外部状态变化时同步滑杆（例如切换作用域 / 恢复默认）
+  wrap._sync = (v) => { if (Number.isFinite(v)) { rng.value = v; out.textContent = (+v).toFixed(3); } };
+  return wrap;
+}
+
+function colorCtl(f, value, onInput) {
+  const n = f.kind === "color3" ? 3 : 4;
+  const wrap = document.createElement("div"); wrap.className = "ctl";
+  const lab = document.createElement("label"); lab.textContent = f.label; lab.title = f.key;
+  const box = document.createElement("div"); box.className = "colors";
+  const pick = document.createElement("input"); pick.type = "color";
+  const alpha = document.createElement("input");
+  alpha.type = "range"; alpha.min = 0; alpha.max = 1; alpha.step = 0.01; alpha.style.width = "70px";
+  const arr = Array.isArray(value) ? value.slice(0, n) : new Array(n).fill(0);
+  while (arr.length < n) arr.push(n === 4 ? 1 : 0);
+  const toHex = (c) => "#" + c.slice(0, 3).map((x) =>
+    Math.round(Math.min(1, Math.max(0, x)) * 255).toString(16).padStart(2, "0")).join("");
+  pick.value = toHex(arr);
+  if (n === 4) { alpha.value = arr[3]; box.append(pick, alpha); } else { box.append(pick); }
+  const emit = () => {
+    const hex = pick.value.slice(1);
+    const rgb = [0, 1, 2].map((i) => parseInt(hex.substr(i * 2, 2), 16) / 255);
+    onInput(n === 4 ? [...rgb, +alpha.value] : rgb);
+  };
+  pick.addEventListener("change", emit);
+  if (n === 4) alpha.addEventListener("change", emit);
+  wrap.append(lab, box, document.createElement("span"));
+  wrap._sync = (v) => { if (Array.isArray(v)) { pick.value = toHex(v); if (n === 4) alpha.value = v[3] ?? 1; } };
+  return wrap;
+}
+
+function vec3Ctl(f, value, onInput) {
+  const wrap = document.createElement("div"); wrap.className = "ctl";
+  const lab = document.createElement("label"); lab.textContent = f.label; lab.title = f.key;
+  const box = document.createElement("div"); box.className = "colors";
+  const inputs = [0, 1, 2].map((i) => {
+    const el = document.createElement("input");
+    el.type = "number"; el.step = 0.01; el.style.width = "58px";
+    el.value = Array.isArray(value) ? value[i] : 0;
+    el.addEventListener("change", () => onInput(inputs.map((x) => +x.value)));
+    box.append(el); return el;
+  });
+  wrap.append(lab, box, document.createElement("span"));
+  wrap._sync = (v) => { if (Array.isArray(v)) inputs.forEach((el, i) => { el.value = v[i]; }); };
+  return wrap;
+}
+
+function enumCtl(f, value, onInput) {
+  const wrap = document.createElement("div"); wrap.className = "ctl";
+  const lab = document.createElement("label"); lab.textContent = f.label; lab.title = f.key;
+  const sel = document.createElement("select");
+  for (const o of f.options) { const op = document.createElement("option"); op.value = o; op.textContent = o; sel.append(op); }
+  sel.value = value ?? f.options[0];
+  sel.addEventListener("change", () => onInput(sel.value));
+  wrap.append(lab, sel, document.createElement("span"));
+  wrap._sync = (v) => { if (v != null) sel.value = v; };
+  return wrap;
+}
+
+function boolCtl(f, value, onInput) {
+  const wrap = document.createElement("div"); wrap.className = "ctl";
+  const lab = document.createElement("label"); lab.textContent = f.label; lab.title = f.key;
+  const btn = document.createElement("button");
+  const paint = (v) => { btn.textContent = v ? "开" : "关"; btn.classList.toggle("on", !!v); };
+  paint(value);
+  let cur = !!value;
+  btn.addEventListener("click", () => { cur = !cur; paint(cur); onInput(cur); });
+  wrap.append(lab, btn, document.createElement("span"));
+  wrap._sync = (v) => { cur = !!v; paint(cur); };
+  return wrap;
+}
+
+function readPath(obj, key) { return key.includes(".") ? key.split(".").reduce((a, k) => a?.[k], obj) : obj?.[key]; }
+function writePath(obj, key, v) {
+  if (!key.includes(".")) { obj[key] = v; return; }
+  const parts = key.split("."); const last = parts.pop();
+  const holder = parts.reduce((a, k) => (a[k] ??= {}), obj);
+  holder[last] = v;
+}
+
+const SYNCABLE = [];
+function buildControls(container, fields, values, onPatch) {
+  container.innerHTML = "";
+  const groups = new Map();
+  for (const f of fields) {
+    if (!groups.has(f.group)) groups.set(f.group, []);
+    groups.get(f.group).push(f);
+  }
+  for (const [name, list] of groups) {
+    const det = document.createElement("details"); det.open = true;
+    const sum = document.createElement("summary"); sum.textContent = name; det.append(sum);
+    for (const f of list) {
+      const v = readPath(values, f.key);
+      let ctl;
+      if (f.kind === "float") ctl = numCtl(f, v, (x) => onPatch(f.key, x));
+      else if (f.kind === "color3" || f.kind === "color4") ctl = colorCtl(f, v, (x) => onPatch(f.key, x));
+      else if (f.kind === "vec3") ctl = vec3Ctl(f, v, (x) => onPatch(f.key, x));
+      else if (f.kind === "enum") ctl = enumCtl(f, v, (x) => onPatch(f.key, x));
+      else ctl = boolCtl(f, v, (x) => onPatch(f.key, x));
+      det.append(ctl);
+      SYNCABLE.push({ key: f.key, el: ctl });
+    }
+    container.append(det);
+  }
+}
+
+function syncControls() {
+  const style = currentStyle();
+  const params = styleParams(style);
+  const resize = (scope() === "window" && SELECTED != null)
+    ? STATE?.windows?.find((w) => w.id === SELECTED)?.resize
+    : STATE?.defaultResize;
+  for (const { key, el } of SYNCABLE) {
+    const src = key.startsWith("feedback.") || ["enabled","edges","corners","gripPx","minWidth","minHeight"].includes(key)
+      ? resize : params;
+    el._sync?.(readPath(src, key));
+  }
+  MODE = style?.transparent ? "transparent" : "liquid";
+  $("modeLiquid").classList.toggle("on", MODE === "liquid");
+  $("modeTransparent").classList.toggle("on", MODE === "transparent");
+  $("level").value = STATE?.windowLevel ?? "alwaysOnTop";
+}
+
+function renderParams() {
+  SYNCABLE.length = 0;
+  const style = currentStyle();
+  const isTransparent = !!style?.transparent;
+  const fields = isTransparent ? SCHEMA.transparent : SCHEMA.liquid;
+  buildControls($("params"), fields, styleParams(style), (key, value) => {
+    if (isTransparent) {
+      const t = { ...(style.transparent || {}) };
+      writePath(t, key, value);
+      jpost("/api/mode", { ...target(), mode: "transparent",
+        cornerRadius: t.cornerRadius, opacity: t.opacity, color: t.color });
+    } else {
+      jpost("/api/style", { ...target(), params: { [key]: value } });
+    }
+  });
+  buildControls($("resizeParams"), SCHEMA.resize,
+    (scope() === "window" && SELECTED != null)
+      ? STATE?.windows?.find((w) => w.id === SELECTED)?.resize
+      : STATE?.defaultResize,
+    (key, value) => jpost("/api/resize", { ...target(), options: { [key]: value }, applyToAll: scope() === "default" }));
+}
+
+// ---------- 窗口列表 ----------
+function renderWindows() {
+  const box = $("winList"); box.innerHTML = "";
+  for (const w of STATE?.windows ?? []) {
+    const d = document.createElement("div");
+    d.className = "win" + (w.id === SELECTED ? " sel" : "");
+    const tags = [];
+    if (w.hovered) tags.push('<span class="tag live">hover</span>');
+    if (w.moving) tags.push('<span class="tag live">move</span>');
+    if (w.resizing) tags.push('<span class="tag live">resize</span>');
+    if (!w.inheritsStyle) tags.push('<span class="tag">已钉住</span>');
+    if (!w.visible) tags.push('<span class="tag">隐藏</span>');
+    d.innerHTML = `<div class="t">#${w.id} <span class="tag">${w.mode}</span> ${tags.join("")}</div>
+      <div class="muted">${w.rect.map((v) => Math.round(v)).join(", ")} · z=${w.zOrder} · 屏${w.monitorIndex} · ×${w.scale.toFixed(2)}</div>`;
+    d.addEventListener("click", () => { SELECTED = w.id; $("scope").value = "window"; render(); });
+    box.append(d);
+  }
+  const mon = $("monList");
+  mon.innerHTML = (STATE?.monitors ?? []).map((m) =>
+    `${m.name} ${m.size[0]}×${m.size[1]} @${m.dpi.toFixed(0)}dpi ×${m.scale.toFixed(2)} ${m.captureBackend}`).join("<br>") || "（等待引擎发布快照）";
+  $("stat").textContent =
+    `窗口 ${STATE?.windows?.length ?? 0} · 显示器 ${STATE?.monitors?.length ?? 0} · 质量档 ${STATE?.qualityLevel ?? 0}` +
+    ` · ${STATE?.refreshHz?.toFixed(0) ?? "?"}Hz${STATE?.onBattery ? " · 电池" : ""}` +
+    ` · 作用域 ${scope() === "window" ? "#" + SELECTED : "默认"}`;
+  const sel = (STATE?.windows ?? []).find((w) => w.id === SELECTED);
+  if (sel) { $("rx").value = Math.round(sel.rect[0]); $("ry").value = Math.round(sel.rect[1]);
+             $("rw").value = Math.round(sel.rect[2]); $("rh").value = Math.round(sel.rect[3]);
+             const bm = $("btnMovable");
+             bm.classList.toggle("on", !!sel.movable);
+             bm.textContent = sel.movable ? "可拖拽移动" : "禁止拖拽移动"; }
+}
+
+let lastSignature = "";
+function render() {
+  renderWindows();
+  const signature = JSON.stringify([
+    MODE, scope(), SELECTED,
+    (STATE?.windows ?? []).map((w) => [w.id, w.inheritsStyle, w.resize.enabled, w.resize.edges, w.resize.corners]),
+  ]);
+  // 只有「模式 / 作用域 / 选中项 / 缩放开关」变了才重建控件，
+  // 否则拖动滑杆时会被状态刷新打断（控件重建 = 焦点丢失）。
+  if (signature !== lastSignature) { lastSignature = signature; renderParams(); }
+  else syncControls();
+}
+
+// ---------- 事件 ----------
+async function poll() {
+  try {
+    const r = await jget("/api/events");
+    const box = $("log");
+    for (const e of r.events ?? []) {
+      const line = document.createElement("div"); line.textContent = e.event; box.append(line);
+    }
+    if (box.childNodes.length > 200) box.removeChild(box.firstChild);
+    if ((r.events ?? []).length) box.scrollTop = box.scrollHeight;
+  } catch { /* 引擎退出后忽略 */ }
+}
+
+async function tick() {
+  try { STATE = await jget("/api/state"); render(); }
+  catch { $("stat").textContent = "引擎已断开"; }
+}
+
+// ---------- 按钮 ----------
+$("scope").addEventListener("change", () => { lastSignature = ""; render(); });
+$("level").addEventListener("change", (e) => jpost("/api/level", { level: e.target.value }));
+$("modeLiquid").addEventListener("click", () => jpost("/api/mode", { ...target(), mode: "liquid" }));
+$("modeTransparent").addEventListener("click", () =>
+  jpost("/api/mode", { ...target(), mode: "transparent", opacity: 0.4, cornerRadius: 28, color: [1, 1, 1, 1] }));
+$("btnAddLiquid").addEventListener("click", async () => {
+  const r = await jpost("/api/window", { action: "create", mode: "liquid", rect: randomRect() });
+  if (r.ok) { SELECTED = r.id; $("scope").value = "window"; }
+});
+$("btnAddTransparent").addEventListener("click", async () => {
+  const r = await jpost("/api/window", { action: "create", mode: "transparent", rect: randomRect() });
+  if (r.ok) { SELECTED = r.id; $("scope").value = "window"; }
+});
+$("btnClose").addEventListener("click", () => jpost("/api/window", { action: "close", id: SELECTED }));
+$("btnClear").addEventListener("click", () => jpost("/api/window", { action: "clear" }));
+$("btnFront").addEventListener("click", () => jpost("/api/window", { action: "front", id: SELECTED }));
+$("btnBack").addEventListener("click", () => jpost("/api/window", { action: "back", id: SELECTED }));
+$("btnMovable").addEventListener("click", async () => {
+  if (SELECTED == null) return;
+  const cur = (STATE?.windows ?? []).find((w) => w.id === SELECTED)?.movable ?? true;
+  await jpost("/api/window", { action: "movable", id: SELECTED, value: !cur });
+});
+$("btnRect").addEventListener("click", () => jpost("/api/window", {
+  action: "rect", id: SELECTED,
+  rect: [+$("rx").value, +$("ry").value, +$("rw").value, +$("rh").value] }));
+$("btnFit").addEventListener("click", () => {
+  const m = STATE?.monitors?.[0]; if (!m) return;
+  const w = Math.round(m.size[0] * 0.62), h = Math.round(m.size[1] * 0.62);
+  jpost("/api/window", { action: "rect", id: SELECTED,
+    rect: [Math.round((m.size[0] - w) / 2), Math.round((m.size[1] - h) / 2), w, h] });
+});
+$("btnReset").addEventListener("click", async () => {
+  await jpost("/api/style", { scope: "default", params: null, reset: true });
+  location.reload();
+});
+function randomRect() {
+  const m = STATE?.monitors?.[0];
+  const W = m?.size?.[0] ?? 1920, H = m?.size?.[1] ?? 1080;
+  const w = 320 + Math.round(Math.random() * 420), h = 220 + Math.round(Math.random() * 300);
+  return [Math.round(Math.random() * Math.max(1, W - w)), Math.round(Math.random() * Math.max(1, H - h)), w, h];
+}
+
+(async function boot() {
+  SCHEMA = await jget("/api/schema");
+  await tick();
+  const first = STATE?.windows?.[0];
+  if (first) SELECTED = first.id;
+  render();
+  setInterval(tick, 400);
+  setInterval(poll, 700);
+})();
+</script>
+</body>
+</html>

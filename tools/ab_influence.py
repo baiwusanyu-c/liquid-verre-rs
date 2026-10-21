@@ -8,10 +8,10 @@
 先造出两个二进制（仓库里不存 exe）：
 
     cargo build --release
-    Copy-Item target/release/liquid-glass.exe tools/exe_fixed.exe
+    Copy-Item target/release/liquid-verre-playground.exe tools/exe_fixed.exe
     git stash push shaders/glass_ps.hlsl src/gfx/compositor.rs   # 回到修复前
     cargo build --release
-    Copy-Item target/release/liquid-glass.exe tools/exe_prefix.exe
+    Copy-Item target/release/liquid-verre-playground.exe tools/exe_prefix.exe
     git stash pop
     cargo build --release                                        # 恢复工作区二进制
 
@@ -27,7 +27,9 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "target", "release", "liquid-glass.exe")
+# 被测可执行文件 = dev playground 产物；可用 VERRE_EXE 覆盖（例如指向旧基线做 A/B）。
+EXE = os.environ.get("VERRE_EXE") or os.path.join(
+    ROOT, "target", "release", "liquid-verre-playground.exe")
 TAGS = ("prefix", "fixed")
 CASES = ("single-drag", "many-drag")
 REP = int(os.environ.get("AB_REP", "3"))

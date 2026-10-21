@@ -33,3 +33,155 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: liquid-verre-rs 库化重构（workspace + 双模式 + 8 方向缩放 + 层级 + 像素级验收）
+<!-- trellis-session: v=2 fp=83c61d60a62757da -->
+
+**Date**: 2026-10-20
+**Task**: liquid-verre-rs 库化重构（workspace + 双模式 + 8 方向缩放 + 层级 + 像素级验收）
+**Branch**: `codex/liquid-verre-rs-refactor`
+
+### Summary
+
+单 bin crate 重构为 workspace 库项目；147 测试全绿、clippy 0 警告；single 跨版本逐位一致；性能阀门待健康窗口复测；文件夹重命名待目录句柄释放。
+
+### Main Changes
+
+## 做了什么
+
+把 `liquid-glass`（单 bin crate）重构成 `liquid-verre-rs`（Cargo workspace 库项目），
+并落地全部功能需求。未 commit（项目约定：未经明确要求不提交）。
+
+### 结构
+- workspace：`crates/liquid-verre`（库，lib 名 `liquid_verre`）+ `playground`（dev 控制面板，
+  原 `src/ui/`，非业务代码）+ `xtask`（build/check/package/gate/clean）。
+- 库内分层：`api/`（唯一公共面）/ `core/`（纯逻辑，零 Win32）/ `runtime/`（主循环）/
+  `platform/`（Win32 集中地）/ `gfx/` / `capture/` / `input/` / `diag/`。
+- `main.rs`（2133 行 god object）拆为 runtime/{mod,app,monitor,commands}.rs + platform/*。
+- 构建脚本从 PowerShell 迁到 **Node**（`scripts/*.mjs`，零 npm 依赖，含自实现 zip）；
+  `cargo xtask package` 委托 `node scripts/zip.mjs`；target triple 改读 `rustc -vV`。
+- 删除死文件：`src/gfx/w_mode_compositor.rs`（孤儿）、`shaders/reduce_env.hlsl`。
+
+### 功能
+- F1 全参数配置化：`LiquidParams` 全字段 + serde；playground 面板按 `schema.rs` 动态生成控件，
+  并有单测保证「库支持的每个参数都出现在面板上」。
+- F2 8 方向缩放（`core/handle.rs` 先角后边）+ 锚定不动边；border 反馈改为**独立叠加 pass**
+  （`border_vs/ps.hlsl` + `BorderCb` + `draw_borders`），直边到切点为止、对角沿弧；
+  `ResizeOptions.edges/corners/enabled` 可分别禁用。
+- F3 双模式：`GlassMode::Liquid/Transparent`；透明模式只 3 个参数、着色器早退不采样纹理、
+  全透明屏整条 Pass A 跳过 + 采集降保活频率。
+- F4 层级：`WindowLevel::{AlwaysOnTop,Normal,ClickToFront,AlwaysOnBottom}`（全程 SWP_NOACTIVATE
+  不抢焦点）+ 块 z 序 `ZOrder`/bring_to_front/send_to_back（归一化防 i32 溢出）。
+- E2 错误/日志：`Error`/`ErrorKind`(10 类)/`Result`；`log` facade + 默认 stderr logger
+  严格保留 `[boot]/[info]/[warn]/[verify]/[metrics]/[adaptive]` 前缀（tools 解析依赖）。
+
+### 取证抓出并修掉的真实缺陷
+1. border 的 premultiplied source-over 衰减因子写错（用 `1-alpha` 而非 `1-fb`）→ border 处变暗 120 级。
+2. `wait_for_captures` 漏调 `set_capture` → 启动白等满 6s budget。
+3. 旧面板 isize 量化篡改默认值（tint_opacity 0.018→0.01、blur_min→2.4），导致旧二进制
+   引导帧与稳态帧本身不一致（873748 px / max 140）；库默认值对齐「用户实际看到的稳态值」，
+   且 `blur_min` 必须写表达式 `20.0 * 0.12`（字面量 2.4 差 1 ULP ≈ 2400 个 ±1 LSB 像素）。
+4. 旧主循环圆角滑杆只写「选中块」→ 20 块里 19 块 radius 永停 28；新库统一由样式派生（有意变更，已量化归因）。
+5. `GLASS_CURSOR_AT` 过去只设初值 → 「光标移动」取证用例空转；现全程钉死 + cmp_visual 物理停放光标。
+6. 像素等价脚本未关 `GLASS_ADAPTIVE`（verify_adaptive 除外，它验证的就是闭环）。
+7. compositor 里手写的影响盒常量与 `cursor_influence_px` 漂移 → 收敛到 `core::geometry` 单一来源。
+
+## 验证
+- `cargo test --release --workspace`：**147 passed**（129 单元 + 11 集成 + 5 playground + 2 doctest；重构前 25）。
+- `cargo clippy --workspace --all-targets --release -- -D warnings`：0 warning；`cargo fmt --check` 通过；
+  `node scripts/check.mjs` 全绿。
+- `cmp_visual.py`（新口径：稳态帧 + 光标物理停放 + 四段 oracle）：**single 跨版本四段全 0 = 逐位一致**；
+  many 同构建两次全 0；many 跨版本差异 100% 归因到圆角有意变更（邻域外 max=2 <= 阈值）；
+  光标深内部移动 deep 段 0。
+- verify_dirty x3 / verify_mouse_isolation / verify_validity / verify_crossscreen / verify_env_ema x3：PASS。
+- playground HTTP 端到端冒烟：模式切换 / 逐窗口部分更新 / 嵌套 resize 配置 / 层级 / 增删 / 事件通道 全通过。
+- `cargo xtask package`：dist/ 产物 + build-info.json + Node zip（13 文件）验证可解包。
+- **环境阻塞**：gate_perf 与 verify_adaptive 当前机器 `rel_max≈200~257ms`（DDA ReleaseFrame 阻塞），
+  远超健康窗口 `rel_max<5ms`；旧二进制同条件同样 FAIL，背靠背 A/B 无差别 → 非回归。
+  待健康窗口复测并回填 BASELINE.md / README 性能表（占位已留）。
+
+## 未完成 / 下一步
+1. **文件夹重命名**：`node scripts/rename-workspace.mjs`（Codex 集成终端持有仓库根句柄导致 EBUSY；
+   在该终端 `cd ..` 或关掉标签后重试，或 `--retry 120`）。重命名后需在新目录重跑 check + cmp_visual。
+2. 健康窗口复跑 `python tools/gate_perf.py` 与 `verify_adaptive.py`，回填性能表。
+3. README 里 13 处 `<!-- TODO(verify) -->` 占位（性能复测数字 + 最低 Windows 版本）。
+4. 用户明确要求后再 commit（分支 `codex/liquid-verre-rs-refactor`）。
+
+
+### Git Commits
+
+(No commits - planning session)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 重命名文件夹 + 健康窗口复跑 gate_perf/verify_adaptive + 回填性能表
+
+
+## Session 3: 自检轮：独立审查 15 缺陷修复 + 过度设计清理 + 取证 oracle 修正
+<!-- trellis-session: v=2 fp=f88845f0c49cb182 -->
+
+**Date**: 2026-10-21
+**Task**: 自检轮：独立审查 15 缺陷修复 + 过度设计清理 + 取证 oracle 修正
+**Branch**: `codex/liquid-verre-rs-refactor`
+
+### Summary
+
+对照需求/过度设计/逻辑bug 三维度自检；修复 15 条（含 z 序不重画、border 原点、interactive 穿透、fps_cap 被 disable 清掉等）；测试 147→151；cmp_visual 与 7 个像素阀门全绿；重命名与性能复跑待环境。
+
+### Main Changes
+
+## 做了什么（自检轮，2026-10-21）
+
+按用户要求做三项严格自检：① 对照原始需求逐条验收；② 过度设计审查；③ 逻辑 bug 审查。
+方式：派独立只读 check agent（trellis-check）对抗性复核 + 主会话逐条复核修复。
+
+### 修复的缺陷（15 条，均有独立审查编号）
+P0-1 API 改 z 序不重画（新增 Compositor::invalidate_present）；P1-1a 采集门控读陈旧 style
+（新增 Block::effective_style 单一来源）；P1-1b SetDefaultStyle 不脏化；P1-2 border 原点与
+玻璃 pass 不同源（块半出屏错位）；P1-3 采集重建丢 backend 偏好；P1-4 interactive=false 仍吃点击；
+P1-5 disable() 误清 fps_cap；P2-1 adaptive_quality 死字段接线；P2-2 AlwaysOnBottom→Normal 不恢复；
+P2-3 全透明屏谎报 background_valid（不变量 2）；P2-4 读-改-写 setter 同帧互覆盖（改细粒度命令
+PatchStyle/SetResizable）；P2-5 退出后队列无限增长 / start 可双开；P2-7 SIM_BACKDROP 量纲错；
+P2-8 透明块以 mouse_radius 参与影响盒；F3.1 补强：全透明/空屏完全停采（消掉 16s 级 ReleaseFrame 停顿）。
+
+### 过度设计清理
+删 capture_generation、draw_blocks 的 dirty 死参数与死分支、ErrorKind::NotSupported、
+.gitignore 的 tauri 遗留、RAW_TARGETS 两个预留靶标；hit_resize 改零分配；render_monitor 去每帧
+String clone；pass_a_now 降私有；BorderTarget 降 pub(crate)；edges_active/corners_active 恢复为唯一判据。
+保留并写明理由：StyleCache / FrameInput / SpawnSpec / ResizeHandle::public / Snapshot 双缓冲（注释频率已纠正）。
+
+### 取证框架修正
+cmp_visual：冻掉环境色 EMA 的墙钟 dt 依赖（GLASS_ENV_EMA=0）；many 的 now-vs-now 判据改 ≤2 LSB 容差
+（部分刷新的既有时序敏感，verify_dirty 在同一次运行内严格证明增量==全量）；single 仍硬 0。
+gate_perf：新增第四场景 transparent-drag（硬门槛同液态单块 + own_us 劣化 WARN）。
+
+### 验证
+check.mjs 全绿（fmt + clippy -D warnings + test）；测试 147 → **151**。
+cmp_visual PASS（single 四段全 0 = 跨版本逐位一致；many 归因圆角有意变更；cursor_deep=0）。
+verify_dirty ×3 / mouse_isolation / validity / crossscreen / env_ema 全 PASS。
+transparent 实测（不健康窗口）：空闲 cpu 0.39%、Private 121.6MB（液态 157MB）、pass_a/frame=0、
+采集段 cap_max 15989ms → 0.001ms。
+性能 A/B（3×3 轮转，昨日）：fps 中位 88.3(新) vs 86.9(旧)、prep 26 vs 24µs → 持平。
+
+### 仍未完成
+1. 文件夹重命名（Codex 集成终端持有根目录句柄，EBUSY）：`node scripts/rename-workspace.mjs --retry 120`。
+2. gate_perf / verify_adaptive 待健康窗口（rel_max<5ms）复跑回填；今日 rel_max 18~37ms，OLD/NEW 同条件同病。
+3. README 13 处 TODO(verify) 占位（性能复测数字 + 最低 Windows 版本）。
+
+
+### Git Commits
+
+(No commits - planning session)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 重命名文件夹 + 健康窗口复跑 gate_perf/verify_adaptive + 回填 README 性能表

@@ -1,0 +1,27 @@
+[package]
+name = "liquid-verre-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windows 桌面玻璃窗口组件库：液态玻璃（WGC/DDA 采集 + D3D11 模糊金字塔 + DirectComposition 合成 + Snell 折射）与透明玻璃两种模式"
+build = "build.rs"
+# cargo package 要求 readme 在 crate 目录内（workspace 根的 README 不会被打进 .crate），
+# 因此 crate 自带一份短 README，完整文档在仓库根。
+readme = "README.md"
+# 发布到 GitHub 后填这里（cargo package 会对缺失 repository 告警）：
+# repository = "https://github.com/<owner>/liquid-verre-rs"
+keywords = ["windows", "glass", "liquid-glass", "d3d11", "directcomposition"]
+categories = ["graphics", "os::windows-apis"]
+
+[lib]
+name = "liquid_verre"
+path = "src/lib.rs"
+
+[dependencies]
+windows = { workspace = true }
+serde = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

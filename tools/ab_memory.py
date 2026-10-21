@@ -20,7 +20,9 @@ from ctypes import wintypes
 k = ctypes.WinDLL("kernel32")
 ps = ctypes.WinDLL("psapi")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "target", "release", "liquid-glass.exe")
+# 被测可执行文件 = dev playground 产物；可用 VERRE_EXE 覆盖（例如指向旧基线做 A/B）。
+EXE = os.environ.get("VERRE_EXE") or os.path.join(
+    ROOT, "target", "release", "liquid-verre-playground.exe")
 REP = int(os.environ.get("AB_REP", "3"))
 HOLD = float(os.environ.get("AB_HOLD", "30"))
 START = float(os.environ.get("AB_START", "10"))
@@ -45,6 +47,9 @@ def priv_mb(h):
 
 def one(tag, half):
     env = dict(os.environ)
+    # 库默认**不**自建玻璃窗口（上层应用负责 create_window）；
+    # 取证脚本需要一块确定性的默认玻璃，因此显式打开。
+    env["GLASS_DEFAULT_BLOCK"] = "1"
     env["GLASS_MANY"] = "1"
     env["GLASS_METRICS"] = "1"
     env["GLASS_ADAPTIVE"] = "0"      # 固定 level 0，排除控制器干扰

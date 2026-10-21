@@ -25,7 +25,7 @@ SECONDS = float(os.environ.get("HZ_SECONDS", "10"))
 CASE = os.environ.get("HZ_CASE", "many-drag")
 HZ_LIST = [x.strip() for x in
            os.environ.get("HZ_LIST", "0,60,90").split(",") if x.strip()]
-EXTRA = {}
+EXTRA = {"GLASS_ADAPTIVE": "0"}  # 降档会改 Pass A 行为，测频率时必须关
 for k in ("HZ_MONITORS", "HZ_SIM", "HZ_MANY"):
     if os.environ.get(k):
         EXTRA[{"HZ_MONITORS": "GLASS_MONITORS", "HZ_SIM": "GLASS_SIM_BACKDROP",

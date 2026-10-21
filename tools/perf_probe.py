@@ -48,7 +48,9 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "target", "release", "liquid-glass.exe")
+# 被测可执行文件 = dev playground 产物；可用 VERRE_EXE 覆盖（例如指向旧基线做 A/B）。
+EXE = os.environ.get("VERRE_EXE") or os.path.join(
+    ROOT, "target", "release", "liquid-verre-playground.exe")
 
 
 class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
@@ -243,14 +245,22 @@ def drag_path(t: float, cx: float, cy: float, span: float):
 
 def run_case(case: str, seconds: float, warmup: float) -> dict:
     many = case.startswith("many")
+    transparent = case.startswith("transparent")
     do_drag = case.endswith("drag")
     env = dict(os.environ)
+    # 库默认**不**自建玻璃窗口（上层应用负责 create_window）；
+    # 取证脚本需要一块确定性的默认玻璃，因此显式打开。
+    env["GLASS_DEFAULT_BLOCK"] = "1"
     env["GLASS_METRICS"] = "1"
     if many:
         env["GLASS_MANY"] = "1"
     env.pop("GLASS_EXTREME_SPEC", None)
 
-    proc = subprocess.Popen([EXE], env=env, cwd=ROOT,
+    # 透明玻璃场景（需求 F3.1 / 验收 A9）：用 playground 的 --transparent 把
+    # 引擎默认样式切成透明模式，--no-demo-pair 保证场景里只有一块玻璃，
+    # 与 single-* 场景的几何完全可比。
+    argv = [EXE] + (["--transparent", "--no-demo-pair"] if transparent else [])
+    proc = subprocess.Popen(argv, env=env, cwd=ROOT,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE)
     reader = LogReader(proc.stderr)
@@ -258,7 +268,7 @@ def run_case(case: str, seconds: float, warmup: float) -> dict:
     handle = open_process(proc.pid)
 
     sw, sh = screen_size()
-    # 块 0 在 GLASS_MANY 布局下固定为 (32,64) 600x400；单块模式居中。
+    # 块 0 在 GLASS_MANY 布局下固定为 (32,64) 600x400；单块 / 透明单块居中。
     if many:
         cx, cy = 32.0 + 300.0, 64.0 + 200.0
     else:
@@ -349,7 +359,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", default="single-idle",
                     choices=["single-idle", "single-drag",
-                             "many-idle", "many-drag", "all"])
+                             "many-idle", "many-drag",
+                             "transparent-idle", "transparent-drag", "all"])
     ap.add_argument("--seconds", type=float, default=12.0)
     ap.add_argument("--warmup", type=float, default=3.0)
     ap.add_argument("--out", default="")

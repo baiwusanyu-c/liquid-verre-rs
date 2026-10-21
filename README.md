@@ -1,223 +1,733 @@
-# liquid-glass —— Windows 桌面液态玻璃
+# liquid-verre-rs
 
-严格按《折射渲染方案》v1.1 实现的 Windows 桌面「液态玻璃块」叠加层。
-原生 **WGC/DDA + D3D11 + DirectComposition** 管线，不依赖任何 WebView / 前端运行时。
-**多显示器**：每块屏独立采集、独立金字塔、独立画布，分辨率与 DPI 各不相同也各自正确。
+Windows 桌面**玻璃窗口组件库**：上层应用创建一个玻璃窗口、配置它的外观，再把自己的 UI
+叠在上面，就能得到「液态玻璃弹窗」这类效果。原生 **WGC / DDA 采集 + D3D11 模糊金字塔 +
+DirectComposition 合成**，不依赖任何 WebView / 前端运行时。**多显示器**：每块屏独立采集、
+独立金字塔、独立画布，分辨率与 DPI 各不相同也各自正确。
 
-## 架构
+- crate 名：`liquid-verre-rs`　lib 名：`liquid_verre`　版本：`0.4.0`　许可：MIT
+- 平台：Windows x64，依赖 DXGI Desktop Duplication、Windows.Graphics.Capture、DirectComposition 与 Per-Monitor V2 DPI 感知 <!-- TODO(verify): 源码/manifest 未声明最低 Windows 版本号，需确认后再写具体版本 --> ；`rust-version = 1.77`，edition 2021
+- 依赖：`windows 0.58`、`serde`、`log`（**不**自带日志后端）
+
+## 两种模式
+
+| | `GlassMode::Liquid`（液态玻璃，默认） | `GlassMode::Transparent`（透明玻璃） |
+|---|---|---|
+| 参数 | `LiquidParams`，**37 个字段**（折射 / 色散 / 模糊 / 染色 / 光照 / 焦散 / 鼠标点光 / 阴影 / 拖拽滞后） | `TransparentParams`，**只有 3 个**：`corner_radius` / `opacity` / `color` |
+| 管线 | 桌面采集 → 模糊金字塔（Pass A）→ Snell 折射 + RGB 色散 + Fresnel 高光 + 焦散 + 鼠标点光 → Pass B → DComp | 着色器走**早退分支**，不采样任何纹理（capture / frost / env / LUT 全不碰） |
+| 成本 | 需要桌面采集与金字塔 | 整屏都是透明块时 **Pass A 整条跳过**（`FrameInput::needs_backdrop == false`），启动也不等采集就绪 |
+| 阴影 | 有（`shadow_margin` 决定窗口区域与绘制矩形的外扩量） | 无（`shadow_margin()` 恒 0） |
+| 适用 | 需要「桌面被折射 / 磨砂」观感的主视觉面板 | 弹窗底板、提示条、加载遮罩、大量并列小卡片 |
+
+两种模式可以在**运行期**互换：`GlassWindow::set_style` / `set_liquid` / `set_transparent`。
+同一个 `Engine` 里两种模式的窗口可以并存（`playground` 默认就会额外建一对 liquid / transparent 对照窗口，`--no-demo-pair` 可关）。
+
+## 安装
+
+```toml
+# 本地 path 依赖
+[dependencies]
+liquid-verre-rs = { path = "../liquid-verre-rs/crates/liquid-verre" }
+
+# 或 git 依赖（建议钉 tag / rev，别钉 branch：branch 会随上游漂移）
+[dependencies]
+liquid-verre-rs = { git = "https://github.com/baiwusanyu-c/tarui-glass.git", tag = "v0.4.1" }
+# 对应 tag 还没推出来时先钉 commit（当前仓库只有 baseline/pre-refactor 一个 tag）：
+# liquid-verre-rs = { git = "https://github.com/baiwusanyu-c/tarui-glass.git", rev = "<commit sha>" }
+```
+
+```rust
+use liquid_verre as lv;   // lib 名是 liquid_verre（连字符的 crate 名不能直接当标识符）
+```
+
+三种消费方式（git 依赖 / crates.io / GitHub Release 产物）与完整发版流程见下文「发布与分发」。
+
+## 最小可运行示例
+
+```rust,no_run
+use liquid_verre::{Engine, EngineConfig, GlassStyle, WindowConfig, WindowLevel};
+
+let mut engine = Engine::new(EngineConfig {
+    window_level: WindowLevel::ClickToFront,
+    ..Default::default()
+})?;
+engine.start()?;                       // 起渲染线程（非阻塞）
+
+let popup = engine.create_window(WindowConfig {
+    rect: [320.0, 200.0, 560.0, 360.0],           // [x, y, w, h]，逻辑像素
+    style: Some(GlassStyle::transparent(28.0, 0.40, [1.0, 1.0, 1.0, 1.0])),
+    ..Default::default()
+})?;
+
+for ev in engine.poll_events() {
+    println!("{ev:?}");
+}
+popup.set_corner_radius(40.0);         // setter 异步，延迟 ≤1 帧
+engine.shutdown();
+# Ok::<(), liquid_verre::Error>(())
+```
+
+「宿主就是一个玻璃演示程序」时可以直接阻塞跑：
+
+```rust,no_run
+let mut engine = Engine::spawn(EngineConfig::default())?;   // = new + start
+let liquid = engine.create_window(liquid_verre::WindowConfig {
+    rect: [900.0, 200.0, 640.0, 420.0],
+    ..Default::default()
+})?;
+liquid.bring_to_front();
+engine.shutdown();
+# Ok::<(), liquid_verre::Error>(())
+```
+
+## API 速查
+
+### `Engine`（一个进程通常只需要一个；`Drop` 自动 `shutdown`）
+
+| 方法 | 签名要点 |
+|---|---|
+| `new(config: EngineConfig) -> Result<Self>` | 只建配置，**不**起线程；顺带装默认 stderr logger（上层已装则不覆盖）并打一行 `[boot]` 构建摘要 |
+| `spawn(config: EngineConfig) -> Result<Self>` | = `new` + `start` |
+| `start(&mut self) -> Result<()>` | 起渲染线程（幂等）。线程内做 `RoInitialize` + `SetProcessDpiAwarenessContext(PerMonitorV2)`；**DPI 感知是进程级**的，宿主已设过别的级别时这里只 `[warn]` 不失败 |
+| `run(&mut self) -> Result<()>` | = `start` + `join`（阻塞到退出） |
+| `join(&mut self) -> Result<()>` | 等线程结束，并把线程内的致命错误返回 |
+| `shutdown(&mut self)` | 请求退出并 join，幂等 |
+| `is_running() -> bool` | |
+| `take_fatal_error() -> Option<Error>` | 非阻塞取走致命错误（取出即清空） |
+| `create_window(WindowConfig) -> Result<GlassWindow>` | id 在调用侧预分配，句柄**立刻**可用；实际创建发生在下一帧。尺寸为 NaN / ≤0 ⇒ `Err(ErrorKind::InvalidConfig)`（**先校验原始输入再 sanitize**） |
+| `window(id: u32) -> GlassWindow` | 廉价 `Arc` 克隆，不做存在性检查 |
+| `windows() -> Vec<GlassWindow>` | 来自快照，最多滞后一帧 |
+| `window_snapshots() -> Vec<WindowSnapshot>` | |
+| `clear_windows()` | 销毁全部窗口 |
+| `set_default_style(GlassStyle)` / `default_style() -> GlassStyle` | 设置会刷进所有 `inherits_style` 的窗口 |
+| `set_window_level(WindowLevel)` / `window_level() -> WindowLevel` | 作用于**画布窗口** |
+| `set_default_resize(ResizeOptions)` | 只影响**新建**窗口 |
+| `monitors() -> Vec<MonitorSnapshot>` | |
+| `snapshot() -> Snapshot` | 引擎整体状态 |
+| `quality_level() -> u8` | 自适应质量档位（0 = 不降档） |
+| `poll_events() -> Vec<EngineEvent>` | 批量取事件（队列上限 `EVENT_QUEUE_CAP = 256`） |
+| `set_event_handler(Option<EventHandler>)` | 在**渲染线程**同步回调；`None` 取消 |
+| `request_render()` | 手动请求一帧。任何 setter 都会自动置位，只有「改了库看不见的东西」时才需要 |
+| `config() -> &EngineConfig` | 返回 sanitize 之后的配置 |
+
+### `GlassWindow`（`Clone + Send + Sync`；窗口销毁后句柄不失效，setter 变 no-op、getter 返回 `None`）
+
+- 读：`id()`、`is_alive()`、`snapshot() -> Option<WindowSnapshot>`、`rect()`、`size()`、
+  `position()`、`style()`、`mode()`、`monitor_index()`、`canvas_handle() -> Option<isize>`、
+  `engine_running()`
+- 写（几何）：`set_rect(Rect)`、`set_size(w, h)`、`set_position(x, y)`
+- 写（外观）：`set_style(Option<GlassStyle>)`（`None` = 恢复继承引擎默认）、
+  `set_liquid(Option<LiquidParams>)`（`None` = 沿用当前参数）、
+  `set_transparent(corner_radius, opacity, color)`、`set_corner_radius(f32)`、
+  `set_opacity(f32)`、`set_color([f32;4])`
+- 写（交互 / 层级 / 可见性）：`set_resize_options(ResizeOptions)`、`set_resizable(bool)`、
+  `set_z_order(ZOrder)`、`bring_to_front()`、`send_to_back()`、`set_visible(bool)`、
+  `set_interactive(bool)`、`set_movable(bool)`、`close()`
+
+`set_opacity` / `set_color` 在透明模式改 `opacity` / `color`，在液态模式改 `base_alpha` / `tint_color`。
+`canvas_handle()` 是给上层「把自己的 UI 窗口按同样矩形贴在玻璃之上」用的；
+**不要**对它调 `DestroyWindow` / `SetWindowPos`，层级请走 `Engine::set_window_level`。
+
+### 配置类型（全部 `Default` + serde `camelCase`，可直接用 JSON/TOML 喂）
+
+| 类型 | 字段 |
+|---|---|
+| `EngineConfig` | `default_style`、`window_level`、`default_resize`、`capture`、`adaptive_quality`(默认 `true`)、`fps_cap: Option<u32>`、`monitor_limit: Option<usize>`、`log_level`、`diagnostics` |
+| `WindowConfig` | `rect: Rect`、`style: Option<GlassStyle>`(`None` = 继承默认)、`resize`、`z_order: Option<ZOrder>`、`interactive`(默认 `true`)、`movable`(默认 `true`)、`visible`(默认 `true`)；默认 rect = `[64, 64, 600, 400]` |
+| `GlassStyle` | 枚举：`Liquid(LiquidParams)` / `Transparent(TransparentParams)`；方法 `mode()` / `needs_backdrop()` / `corner_radius()` / `shadow_margin()` / `sanitize()` / `scaled(dpi)` / `to_params()` / `liquid(p)` / `transparent(r, a, rgba)` |
+| `TransparentParams` | `corner_radius`(默认 32)、`opacity`(默认 0.35)、`color`(默认 `[1,1,1,1]`) |
+| `LiquidParams` | 37 个字段，默认值即本项目的视觉基线（见「默认参数」一节）；方法 `sanitize()` / `scaled(dpi)` / `inert()` |
+| `ResizeOptions` | `enabled`、`edges`、`corners`、`grip_px`(默认 10)、`min_width`(24)、`min_height`(24)、`feedback`；方法 `edges_active()` / `corners_active()`（总开关关掉则两者都失效） |
+| `ResizeFeedbackOptions` | `enabled`、`border_width`(默认 **5**，逻辑像素；`sanitize` 夹到 0.5–32)、`alpha`(默认 **1.0**)、`color`(`[1,1,1]`)。⚠ 0.4.1 起从 `3 / 0.95` 加粗，原因见「边缘 / 对角缩放」一节 |
+| `WindowLevel` | `AlwaysOnTop`(**默认**) / `Normal` / `ClickToFront` / `AlwaysOnBottom`；`is_topmost()` / `raises_on_click()` |
+| `ZOrder` | `Front` / `Back` / `Absolute(i32)` / `Relative(i32)`（绝对序号会被库整体归一化，**不保证数值长期稳定**） |
+| `CaptureConfig` | `backend`、`retry_backoff_ms`(500)、`idle_keepalive_ms`(250)、`startup_wait_ms`(6000) |
+| `CaptureBackend` | `Auto`(**默认**：HDR→WGC，SDR→DDA 优先) / `ForceDda` / `ForceWgc` |
+| `DiagnosticsConfig` | `default_window`(默认 `false`)、`metrics`、`force_full`、`verify_validity`、`no_adaptive` |
+| `LogLevel` | `Error` / `Warn` / `Info`(**默认**) / `Debug` / `Trace`；有 `From<LogLevel> for log::LevelFilter` |
+| `Rect` | `pub type Rect = [f32; 4]` = `[x, y, width, height]` |
+
+### 三个正交的交互开关（别混）
+
+| 开关 | 关掉后的效果 | 仍然生效的部分 |
+|---|---|---|
+| `WindowConfig.interactive` / `set_interactive(false)` | **完全点击穿透**：不参与任何命中测试（`Manager::hit_test` 与 `hit_resize` 都过滤掉它），鼠标消息交给下层窗口 | 照样画出来（窗口区域仍包含它），`set_rect` 等 API 照旧可用 |
+| `WindowConfig.movable` / `set_movable(false)` | 按住块**内部**不开始移动会话：不 `SetCapture`、不发 `MoveStarted`（`platform/window.rs::on_button_down` 直接早退） | **缩放把手仍然有效**（`hit_resize` 只看 `interactive && visible && resize.enabled`，不看 `movable`）；点击抬层仍然生效（同层 `bring_to_front` 与 `WindowLevel::ClickToFront`） |
+| `ResizeOptions.enabled` / `set_resizable(false)` | 缩放把手不参与命中测试（`hit_resize` 跳过该块），也就没有悬停 border 反馈 | 整块拖动照旧（除非同时 `movable = false`） |
+
+「不能挪位置」「不能改大小」「不接鼠标」是三件独立的事，分别由 `movable`、
+`resize.enabled`、`interactive` 控制，两种玻璃模式共用同一套开关。
+`movable = false` 只对**能被命中**的块有意义（`interactive = false` 时它根本按不住）。
+两个边界行为：
+
+- 正在移动中的块被 `set_movable(false)`：移动会话**立刻结束**（`runtime/commands.rs` 显式丢弃
+  `DragSession::Move` 并清 `press`），否则它会继续跟着光标跑。缩放会话不受影响。
+- `movable` 不参与渲染，因此 `apply_one` 对 `SetMovable` 返回 `false`（不脏化任何绘制账本），
+  只置 `snapshot_dirty` —— 玻璃像素一个都不变，但下一帧快照里能读到新值。
+
+### 事件与错误
+
+- `EngineEvent`（`#[non_exhaustive]`，18 个变体）：`Ready{monitor_count}`、
+  `MonitorsChanged{monitor_count}`、`WindowCreated{id}`、`WindowDestroyed{id}`、
+  `MoveStarted{id}`、`MoveEnded{id,rect}`、`ResizeStarted{id,handle}`、`ResizeEnded{id,rect}`、
+  `LevelApplied{level}`、`CaptureBackendSelected{monitor_index,monitor_name,backend}`、
+  `CaptureLost{monitor_index,reason}`、`CaptureRestored{monitor_index}`、
+  `ExclusiveFullscreen{monitor_index,active}`、`QualityLevelChanged{level}`、
+  `Warning{kind,message}`、`Fatal{kind,message}`、`EventsDropped{count}`、`Shutdown`。
+  `ResizeHandle` = 8 个方向（`Left/Right/Top/Bottom/TopLeft/TopRight/BottomLeft/BottomRight`，
+  `Display` 输出 kebab-case）。
+  两种消费方式可并用：`set_event_handler`（渲染线程同步回调，**不得阻塞、不得重入引擎**）
+  与 `poll_events`（有界队列 `EVENT_QUEUE_CAP = 256`，溢出丢最旧并在下次轮询补一条 `EventsDropped`）。
+- `Error` / `ErrorKind`（`#[non_exhaustive]`，10 类）/ `Result<T>`：
+  `GraphicsInit`、`ShaderCompile`、`MonitorEnumeration`、`WindowCreation`、`CaptureUnavailable`、
+  `CaptureLost`、`InvalidConfig`、`NotSupported`、`Shutdown`、`Internal`。
+  `Error::kind()` / `message()` / `with_kind()`；`Display` 输出 `[kind] message[: source]`；
+  底层 HRESULT 保留在 `source()`。
+- `BuildInfo` / `BUILD_INFO`：`version`、`git_sha`、`git_dirty`、`built_at_utc`、`target_triple`、
+  `rustc_version`、`profile`、`shaders`（`(文件名, sha256 前 12 位)`，按文件名升序）；
+  `BuildInfo::summary()` 是单行摘要，适合打进崩溃上报。由 `build.rs` 生成（零第三方依赖）。
+- `install_default_logger()` / `install_default_logger_with_level(level) -> bool`。
+
+### 快照类型
+
+- `Snapshot`：`windows`、`monitors`、`default_style`、`window_level`、`default_resize`、
+  `quality_level`、`fps`、`refresh_hz`、`on_battery`、`epoch`（每次发布递增）。
+- `WindowSnapshot`：`id`、`rect`、`style`、`mode`、`resize`、`z_order`、`inherits_style`、
+  `monitor_index`、`scale`、`visible`、`interactive`、`movable`、`hovered`、`moving`、`resizing`。
+- `MonitorSnapshot`：`name`(`\\.\DISPLAY1`)、`origin`、`size`、`dpi`、`scale`、`primary`、
+  `capture_backend`(`"dda"` / `"wgc"` / `"none"`)、`canvas_visible`、`canvas_handle`。
+
+## 层级语义（两个不同的东西，别混）
+
+- **画布层级 `WindowLevel`**：作用于**画布窗口**（每块显示器一个全屏 `WS_EX_NOREDIRECTIONBITMAP`
+  popup），即「整层玻璃」相对**其它应用窗口**的位置。
+  - `AlwaysOnTop` → `WS_EX_TOPMOST` + `HWND_TOPMOST`（**默认**，与重构前一致）
+  - `Normal` → `HWND_NOTOPMOST`，随其它窗口正常遮挡
+  - `ClickToFront` → `Normal` + 点击命中玻璃块时 `HWND_TOP`（抬到普通窗口层最前，**不抢焦点**）
+  - `AlwaysOnBottom` → `HWND_BOTTOM`，在所有普通窗口之下（仍在桌面之上，否则玻璃不可见）
+  - 一律带 `SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE`：画布带 `WS_EX_NOACTIVATE`，
+    抬升绝不能把焦点从宿主抢走；层级操作也不该触碰几何（否则白白让 DWM 重新裁剪）。
+- **块 z 序 `ZOrder`**：同一画布**内**玻璃块之间的叠放，用 `set_z_order` / `bring_to_front` /
+  `send_to_back`。`Manager` 按需整体归一化序号，因此 `Absolute(n)` 的 `n` 不保证长期稳定。
+
+## 线程模型与一致性契约
+
+- 库内**只有一个渲染线程**：消息泵、桌面采集、Pass A（模糊金字塔）、Pass B（逐块绘制）、
+  `Present` + DComp `Commit` 全在它上面。这是「20+ 块不卡顿」与「静止桌面 CPU≈0」的前提。
+- **写**：`GlassWindow` 的 setter 把命令推进队列并置渲染请求位；渲染线程在**帧首一次性**消费。
+  因此 setter 是**异步**的，延迟 ≤1 帧；一帧内连发 100 条 `set_style` 只有最后一条生效，
+  不会渲染 100 次。
+- **读**：渲染线程在状态真的变化时发布 `Snapshot`（否则 4 Hz 兜底），getter 从快照读，
+  因此是**最终一致**（≤1 帧）。换来的是读路径不与渲染线程抢锁。
+- **不允许**从上层线程直接触碰 GPU 资源或内部 `Manager`；一律走命令队列 + 快照。
+- `GlassWindow` 是 `Clone + Send + Sync`，可以在上层任意线程持有与调用。
+- `Engine` 不是 `Send`（持有 `JoinHandle`）；需要跨线程共享时自己包 `Arc<Engine>`
+  （`playground` 就是这么做的：面板线程持 `Arc<Engine>`，主线程轮询事件）。
+- `EngineEvent` 回调在**渲染线程**执行：不要阻塞、不要重入引擎（会死锁），重活转到自己的线程。
+
+## 日志与错误捕获
+
+- 库内一律用 [`log`](https://crates.io/crates/log) facade，**不自带日志后端**。
+  `Engine::new()` 会顺带装一个可选的默认 stderr logger（行格式与重构前的命令行版本逐字节一致：
+  `[boot] / [info] / [warn] / [error] / [verify] / [metrics] / [adaptive]`）。
+- **想接管全部日志**：在 `Engine::new()` **之前**调用 `log::set_logger(...)`
+  （`env_logger` / `tracing-log` / 自己的日志面板都行）。之后 `install_default_logger()`
+  会返回 `false` 且不产生任何影响。
+- 级别过滤走 `EngineConfig::log_level`（默认 `Info`）；上层已装 logger 时以对方的过滤器为准。
+- 错误：只有**不可恢复的初始化失败**才是 `Err`（`Engine::new/start/run/join/create_window`）。
+  采集失效、独占全屏让路、DPI 感知被宿主占用、句柄指向已销毁窗口这类**可恢复**情况
+  一律走 `EngineEvent::Warning` / 专用事件，不会让方法返回 `Err`。
+  渲染线程内的致命错误 → `[error]` + `EngineEvent::Fatal` + `Engine::take_fatal_error()`。
+- ⚠ `[metrics]` / `[adaptive]` / `[verify]` 前缀与字段名是 `tools/` 质量阀门的**解析接口**，
+  自定义 logger 时请保留它们（见 `.trellis/spec/backend/logging-guidelines.md`）。
+
+## 坐标系与量纲
+
+- `Rect` / 一切长度参数 = **逻辑像素 = 主屏物理像素**，坐标是**虚拟屏绝对坐标**（多屏通用）。
+- 进程声明 Per-Monitor V2；块落到 `scale = dpi / 主屏 dpi` 的屏上时，库按该比例换算
+  「像素量纲」的字段（`corner_radius` / `bevel_width` / `thickness` / `blur_max` / `blur_min` /
+  `mouse_radius` / `mouse_spread` / `rim_width` / `shadow_margin`），**逻辑尺寸不变**、
+  物理观感一致。主屏 `scale` 恒 1.0，逐字段原样返回，视觉零变化。
+- 尺寸夹紧：`MIN_SIZE = 24.0`、`MAX_SIZE = 8000.0`；位置允许「半出屏」（弹窗滑入动画），
+  但挡住 `±1e9` 这类把 f32 精度吃光的值。
+- 一切来自上层的数值都先过 `sanitize()` 才进 GPU；NaN / ±inf 用 `clamp_finite`
+  （NaN→下界、+inf→上界、-inf→下界）—— `f32::clamp` 遇 NaN 会**原样返回 NaN**，
+  而 NaN 一进 GPU，SDF 会整块消失且不报任何错。
+- 有效圆角 = `clamp(corner_radius * scale, 0, 短边 / 2)`（`Block::effective_radius`），
+  **统一由样式派生**，不再有「每块各存一份半径」。
+## 构建 / 检查 / 打包 / 阀门
+
+这是一个 Cargo workspace（`crates/liquid-verre` + `playground` + `xtask`）。
+两条等价路径，改一边就要改另一边：
+
+```powershell
+# 路径 A：cargo xtask（.cargo/config.toml 里 alias 到 run --package xtask --release --）
+cargo xtask build                          # cargo build --workspace --release（--debug 可切档）
+cargo xtask check                          # fmt --check + clippy -D warnings + test --release
+cargo xtask package [--out DIR] [--no-zip] # 收集产物到 dist/ + build-info.json + zip
+cargo xtask gate                           # 先 build，再 python tools/gate_perf.py（透传退出码）
+cargo xtask clean                          # cargo clean + 删 dist/
+
+# 路径 B：Node 脚本（零 npm 依赖，含自实现 zip；跨平台、固定 UTF-8）
+node scripts/build.mjs [--debug] [--only <pkg>]
+node scripts/check.mjs
+node scripts/gate.mjs
+node scripts/package.mjs [--out DIR] [--no-zip] [--debug]
+node scripts/zip.mjs <sourceDir> <outZip>
+node scripts/release.mjs --bump patch --dry-run   # 本地发版助手（不 commit/tag/push，见「发布与分发」）
+```
+
+单独跑：
+
+```powershell
+cargo test --release --workspace                                    # 功能阀门（库 136 + 集成 11 + playground 5 + doctest 2 = 154）
+cargo clippy --workspace --all-targets --release -- -D warnings
+cargo fmt --all -- --check
+python tools/gate_perf.py                                           # 性能硬门槛（FAIL 退出码 1）
+cargo run --release --bin liquid-verre-playground -- --port 8787    # dev 控制面板
+```
+
+`cargo xtask package` / `node scripts/package.mjs` 的产物（`dist/liquid-verre-rs-<ver>-<triple>/`）：
+`lib/libliquid_verre.rlib`（若开启对应 crate-type 还会有 `liquid_verre.dll` / `libliquid_verre.a`）、
+`bin/liquid-verre-playground.exe`、`shaders/*.hlsl`、`README.md`、`LICENSE`、`CHANGELOG.md`、
+`build-info.json`（name / version / target / gitSha / gitDirty / builtAtUtc / profile / artifacts）。
+
+## 发布与分发
+
+### 作为库被别的项目消费（按推荐顺序）
+
+**① Git 依赖 —— 现在就能用，不需要任何发布动作**
+
+```toml
+[dependencies]
+liquid-verre-rs = { git = "https://github.com/baiwusanyu-c/tarui-glass.git", tag = "v0.4.1" }
+```
+
+- package 名是 **`liquid-verre-rs`**，lib 名是 **`liquid_verre`**：`Cargo.toml` 里写连字符的那个，
+  代码里 `use liquid_verre::{Engine, EngineConfig, WindowConfig};`。
+- **钉 tag 或 rev，不要钉 branch**：branch 会随上游漂移，锁不住「我这次构建用的是哪份代码」。
+  对应 tag 还没推出来时先用 `rev = "<commit sha>"`。
+- **仅 Windows 可用**（D3D11 + DXGI Desktop Duplication / WGC + DirectComposition）。
+  跨平台宿主要写 target 限定依赖，否则非 Windows 上直接编译失败：
+
+```toml
+[target.'cfg(windows)'.dependencies]
+liquid-verre-rs = { git = "https://github.com/baiwusanyu-c/tarui-glass.git", tag = "v0.4.1" }
+```
+
+**② crates.io —— 配好 secret 后由 tag 流水线自动发布**
+
+```toml
+[dependencies]
+liquid-verre-rs = "0.4"
+```
+
+在仓库 Settings → Secrets and variables → Actions 里配好 `CARGO_REGISTRY_TOKEN`
+（crates.io 的 API token）后，推 `v*` tag 会在建完 GitHub Release 之后自动
+`cargo publish -p liquid-verre-rs --no-verify`；**没配 token 则这个 job 直接跳过** ——
+只出 GitHub Release、靠 git 依赖分发也是完全可用的方式。跨平台宿主同样写
+`[target.'cfg(windows)'.dependencies]`。
+
+**③ GitHub Release 的 zip —— 给人看的产物 + 溯源，不是给 Cargo 用的**
+
+`dist/liquid-verre-rs-<ver>-<triple>.zip`（由 `scripts/package.mjs` 生成、`release.yml` 上传）内容：
+`lib/libliquid_verre.rlib`、`bin/liquid-verre-playground.exe`、`shaders/*.hlsl`、
+`README.md` / `LICENSE` / `CHANGELOG.md`，以及 `build-info.json`
+（name / version / target / profile / gitSha / gitDirty / builtAtUtc / node / 逐产物字节数）。
+
+⚠ **`lib/libliquid_verre.rlib` 不能被 Cargo 直接引用**：rlib 不是稳定 ABI，
+它绑定编译它的 rustc 版本与 crate 元数据哈希，换个工具链就加载不了。
+zip 的定位是「**给人看的产物 + `build-info.json` 溯源**」；机器消费请走 ① 或 ②。
+若要给**非 Rust 宿主**（C / C# / Node 原生插件）用，才需要额外开
+`crate-type = ["cdylib"]` 并手写 C 头 —— **当前未做，是待决策项**
+（`package.mjs` 已经会在 `liquid_verre.dll` / `libliquid_verre.a` 存在时顺手打进 zip，
+所以打开 crate-type 不需要改打包脚本）。
+
+### 发版流程
+
+**本地三步（`scripts/release.mjs`）**：
+
+```powershell
+node scripts/release.mjs --bump patch --dry-run   # 先看会做什么，不落盘
+node scripts/release.mjs --bump patch             # 改版本号 + 改 CHANGELOG 标题 + 跑 check + package 干跑
+git add -A && git commit -m "release: 0.4.1"      # 这三条由人执行：脚本会打印它们，但刻意不代劳
+git tag v0.4.1
+git push origin HEAD --tags
+```
+
+`release.mjs` 依次做：① **工作区必须干净**（否则发出去的版本对不上 commit）；
+② 算目标版本（`--bump patch|minor|major` 或 `--version x.y.z`，tag 名默认 `v<version>`，
+`--tag` 可覆盖）；③ `node scripts/check.mjs`（= fmt + clippy `-D warnings` + test）；
+④ `cargo package -p liquid-verre-rs --list --allow-dirty` 干跑（验 readme / license /
+路径依赖等可发布性）；⑤ 改根 `Cargo.toml` 的 `[workspace.package] version`，并把 CHANGELOG 的
+`## [x.y.z-unreleased]` 标题替换成 `## [x.y.z] - YYYY-MM-DD`；⑥ 打印后续 git 命令。
+加 `--publish` 才会在本地直接 `cargo publish`（需先 `cargo login`）。
+
+**推 tag 之后（`.github/workflows/release.yml`）**：
+
+1. `windows-latest`：`node scripts/check.mjs` → `node scripts/package.mjs` → 上传 `dist/` artifact；
+2. `ubuntu-latest`：从 `CHANGELOG.md` 里抽出 `## [x.y.z]` 那一段当 release notes，建 GitHub Release
+   并挂 `dist/*.zip` + `dist/*/build-info.json`（版本号含 `-` 时自动标 prerelease）；
+3. 若配了 secret `CARGO_REGISTRY_TOKEN`：`cargo publish -p liquid-verre-rs --no-verify`。
+
+也可以不推 tag：Actions 页面手动触发 `release`（`workflow_dispatch`，可填 tag 名；留空则只构建不发布）。
+
+**每次 push / PR（`.github/workflows/ci.yml`）**：`cargo fmt --all -- --check` +
+`cargo clippy --workspace --all-targets --release -- -D warnings` + `cargo test --release --workspace` +
+`cargo package -p liquid-verre-rs --list` 干跑。**刻意不跑**像素取证（`cmp_visual` / `verify_*` /
+`repro_tremble`）与性能阀门（`gate_perf`）：它们依赖 DDA 桌面复制、真实 vsync 节拍与可交互的桌面会话，
+CI 的无交互会话里测出来的数字没有意义（口径见 `.trellis/spec/backend/measurement-and-gates.md §1`）。
+**CI 绿只代表「编译 / 单测 / 静态检查 / crate 可打包」**，不代表视觉与性能没回归。
+
+### 发布前需要提供什么
+
+| 项 | 用在哪 | 现状 |
+|---|---|---|
+| GitHub 仓库 URL | `crates/liquid-verre/Cargo.toml` 的 `repository`（缺失时 `cargo package` 会告警）+ 本节与「安装」一节的 git 依赖片段 | crate 的 `repository` 目前是**注释占位**；仓库 remote 是 `https://github.com/baiwusanyu-c/tarui-glass.git`。若日后改名为 `liquid-verre-rs`，这两处要一起改 |
+| 是否开 crates.io | 决定要不要配 Actions secret `CARGO_REGISTRY_TOKEN` | 不配 = 只出 GitHub Release，git 依赖照常用 |
+| tag 命名约定 | `release.yml` 的触发条件是 `tags: ["v*"]`，`release.mjs` 默认生成 `v<version>` | **`v` + semver**（例 `v0.4.1`）；`baseline/pre-refactor` 这类非 `v*` tag 不会触发发布 |
+| crate 内 README | `cargo package` 要求 `readme` 指向 **crate 目录内**的文件（workspace 根的 README 不会被打进 `.crate`） | 已有 `crates/liquid-verre/README.md`（短版 + 指回仓库根） |
+
+## dev 控制面板（playground）
+
+`playground/` **不是库的业务代码**：它只用 `liquid_verre` 的公共 API 驱动引擎，
+没有一个 `pub(crate)` 后门，因此同时兼作 API 的活文档。重构前它是 `src/ui/`
+（tiny_http 混在渲染依赖图里）。
+
+```powershell
+cargo run --release --bin liquid-verre-playground -- --port 8787 --transparent --level click
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--port <n>` | 面板端口（默认 8787，监听 `127.0.0.1`，自动打开系统浏览器） |
+| `--no-browser` | 不自动打开浏览器 |
+| `--transparent` | 默认样式用透明玻璃（`GlassStyle::transparent(28.0, 0.38, [1,1,1,1])`） |
+| `--no-demo-pair` | 不额外创建 liquid / transparent 对照窗口 |
+| `--no-default-window` | 不创建居中默认玻璃 |
+| `--level <top\|normal\|click\|bottom>` | 画布层级（默认 `top`） |
+
+HTTP 接口：`GET /`、`GET /api/schema`、`GET /api/state`、`GET /api/events`、
+`POST /api/style`、`POST /api/mode`、`POST /api/resize`、`POST /api/window`、`POST /api/level`。
+`POST /api/window` 的 `action`：`create` / `close` / `clear` / `front` / `back` / `rect` /
+**`movable`**（`{"action":"movable","id":<id>,"value":<bool>}` → `GlassWindow::set_movable`）。
+窗口区有一个「可拖拽移动」按钮切换它，文案随状态在「可拖拽移动 / 禁止拖拽移动」之间变；
+`GET /api/state` 的每个窗口都回显 `movable` 字段。
+
+`playground/src/schema.rs` 是面板控件的**单一来源**（`liquid_fields()` 37 项、
+`transparent_fields()` 3 项、`resize_fields()` 10 项），前端按它动态生成控件。
+两个方向的单测都钉死了：`LiquidParams` 里有字段没进面板 ⇒ `every_param_is_exposed_in_the_panel` FAIL；
+面板里有 key 但 `LiquidParams` 没有 ⇒ `every_liquid_field_exists_in_params` FAIL。
+**给库加参数时必须同步加一行 schema。**
+
+取证 / 计量模式（`GLASS_MANY` / `GLASS_FAR_GRID` / `GLASS_SPREAD` / `GLASS_DEFAULT_BLOCK` /
+`GLASS_INTERNAL_SHOT` / `GLASS_SHOT_EVERY_MS` / `GLASS_METRICS` / `GLASS_SIM_BACKDROP` /
+`GLASS_VERIFY_PASS_A` / `GLASS_VERIFY_VALIDITY`）下 playground **不会**加演示窗口 ——
+多出来的窗口会让逐位比对图整体错位（实测抓到过 single 场景 interior 差 49885 像素）。
+
+## 目录结构
 
 ```
-每块显示器（EnumDisplayMonitors + GetDpiForMonitor）
-  ├─ 1 个采集会话，按方案 10.5 的 pick_backend() 选后端：
-  │     DDA（优先，提供脏矩形、延迟更低）-> 失败回退 WGC（支持并发采集）
-  │     └─ DDA: 脏矩形 -> 只 CopySubresourceRegion 变化的区域，不整屏搬 26 MB
-  │     └─ 失效（锁屏/独占全屏/被占用）时 500 ms 退避重建，恢复后自动继续
-  ├─ 1 份该屏分辨率的共享 D3D11 纹理
-  ├─ 1 套该屏的模糊金字塔，只刷新「DDA 脏矩形 ∩ 块足迹 ⊕ 采样余量」
-  └─ 1 个全屏画布窗口（WS_EX_NOREDIRECTIONBITMAP + WDA_EXCLUDEFROMCAPTURE）
-        └─ 每块玻璃一次 scissor 绘制，只画与脏区相交的块
-        └─ 一次 Present + 一次 DComp Commit
+liquid-verre-rs/                     # Cargo workspace（根 Cargo.toml 只有 [workspace]）
+├─ Cargo.toml                        # members / workspace.package(0.4.0, edition 2021, rust 1.77, MIT)
+│                                    #   / workspace.dependencies(windows 0.58, serde, serde_json, tiny_http, log)
+│                                    #   / [profile.release] opt-level=3, lto=fat, codegen-units=1,
+│                                    #     panic=abort, strip=symbols（与重构前逐字一致，别改）
+├─ .cargo/config.toml                # [alias] xtask
+├─ .github/workflows/                # ci.yml（push/PR：fmt + clippy -D warnings + test --release + package 干跑）
+│                                    # release.yml（v* tag / 手动：check + package → GitHub Release → 可选 crates.io）
+├─ crates/liquid-verre/              # ★ 库本体（package liquid-verre-rs，lib liquid_verre）
+│  ├─ Cargo.toml                     # readme = "README.md"（cargo package 要求 readme 在 crate 目录内）；
+│  │                                 #   repository 仍是注释占位，等仓库 URL 定下来再填
+│  ├─ README.md                      # crate 自带短 README（会进 .crate 包），指回仓库根的完整文档
+│  ├─ build.rs                       # 生成 OUT_DIR/build_info.rs（自实现 SHA-256 + UTC 时间戳，零依赖，绝不 panic）
+│  ├─ shaders/                       # glass_vs / glass_ps / blur_vs / blur_down / blur_up / env_ema /
+│  │                                 #   border_vs / border_ps（缩放反馈 border 的独立叠加 pass；include_str! 内嵌）
+│  └─ src/
+│     ├─ lib.rs                      # crate 门面：#![warn(missing_docs)] + 全部对外 pub use
+│     ├─ error.rs  logging.rs  build_info.rs
+│     ├─ api/                        # ★★ 唯一公共面
+│     │  ├─ config.rs                # EngineConfig / WindowConfig / GlassStyle / GlassMode / TransparentParams /
+│     │  │                           #   ResizeOptions / ResizeFeedbackOptions / WindowLevel / ZOrder /
+│     │  │                           #   CaptureConfig / CaptureBackend / DiagnosticsConfig / LogLevel / Rect
+│     │  ├─ engine.rs                # Engine
+│     │  ├─ handle.rs                # GlassWindow + Command 队列 + Shared + Snapshot/WindowSnapshot/MonitorSnapshot
+│     │  └─ event.rs                 # EngineEvent / EventHandler / ResizeHandle / EVENT_QUEUE_CAP
+│     ├─ core/                       # ★ 纯逻辑：零 windows:: 引用、零 unsafe，因此全部可单测
+│     │  ├─ params.rs                # LiquidParams(37 字段) + Profile + Shape + sanitize/scaled/inert
+│     │  ├─ block.rs                 # Block + MIN_SIZE/MAX_SIZE + clamp + effective_radius
+│     │  ├─ manager.rs               # 块集合 / z 序 / hit_test / hit_resize / 跨屏归属
+│     │  ├─ handle.rs                # ResizeEdges(8 方向) + hit_handle(先角后边) + to_shader_edges/corners
+│     │  ├─ draw.rs                  # DrawBlock(投影块，Copy) + ResizeFeedback + draw_rect
+│     │  ├─ style.rs                 # StyleCache（避免每帧重跑 sanitize）
+│     │  ├─ geometry.rs              # ★ 矩形 / 影响盒运算的单一来源
+│     │  ├─ quality.rs               # QualityCtrl（自适应质量 0–4 档）
+│     │  └─ sdf.rs                   # 折射 LUT(256 项) + clamp_for_block + is_lod3
+│     ├─ runtime/                    # 主循环（只在渲染线程存在，无锁）
+│     │  ├─ mod.rs                   # run()：初始化 + 逐帧顺序 + 诊断布局 seed_diagnostic_blocks
+│     │  ├─ app.rs                   # App 状态机 + FrameCtx + render_monitor + publish_snapshot + read_cursor
+│     │  ├─ commands.rs              # Command 的帧首消费点
+│     │  └─ monitor.rs               # MonitorRt（一屏一套）+ region_margin() + influence_px()
+│     ├─ platform/                   # ★ Win32 集中地
+│     │  ├─ window.rs                # 窗口类 LiquidVerreCanvas / 窗口过程 / WM_NCHITTEST / SetWindowRgn / 点击穿透
+│     │  ├─ level.rs                 # WindowLevel → WS_EX_TOPMOST + SetWindowPos
+│     │  └─ display.rs               # 显示器枚举（物理像素 + 每屏 DPI）/ refresh_hz / on_battery / 独占全屏检测
+│     ├─ gfx/                        # D3D11 / DXGI / DComp
+│     │  ├─ device.rs  shaders.rs  swapchain.rs  dcomp.rs
+│     │  ├─ compositor.rs            # 每屏画布：脏区账本、金字塔有效性、Clear→PassA→PassB→Present→Commit、取证落盘
+│     │  ├─ pyramid.rs               # Pass A：下采样×4 + env EMA + frost tent×4（scissor 幂等）
+│     │  ├─ glass_renderer.rs        # Pass B：per-block cbuffer(c0..c18) + 逐块 LUT 缓存 + z 序绘制
+│  │                            #   + border 叠加 pass（draw_borders，独立 BorderCb）
+│     │  └─ gpu_timer.rs             # D3D11 timestamp（只用于离线归因，禁止进闭环判据）
+│     ├─ capture/                    # mod.rs(后端选择 + 合成源) / dda.rs(脏矩形 + 局部拷贝) / wgc.rs(帧池)
+│     ├─ input/                      # cursor.rs(GetCursorPos 轮询，零 hook) / drag.rs(拖拽 + 8 方向缩放状态机)
+│     └─ diag/                       # env.rs(GLASS_* 唯一解析点) / metrics.rs([metrics] 行)
+├─ playground/                       # dev 控制面板（bin liquid-verre-playground，publish = false）
+│  └─ src/ main.rs  panel.rs  schema.rs  web/index.html
+├─ xtask/src/main.rs                 # build / check / package / gate / clean（零第三方依赖）
+├─ scripts/                          # _lib.mjs build.mjs check.mjs gate.mjs package.mjs zip.mjs
+│                                    #   release.mjs（本地发版助手：改版本号 + CHANGELOG 标题；不 commit/tag/push）
+├─ tools/                            # 性能探针与逐像素取证（Python）
+├─ .trellis/spec/                    # 项目约定（backend/ + guides/）
+├─ README.md  CHANGELOG.md  BASELINE.md  performance_report.md  LICENSE  AGENTS.md  CLAUDE.md
 ```
 
-### 为什么 20+ 块不卡顿
+分层边界（完整版见 `.trellis/spec/backend/directory-structure.md`）：
+`api/` 是唯一公共面；`core/` 不得依赖 `windows::`；`unsafe` 只在 `platform/` `gfx/` `capture/`
+与 `runtime/` 的平台边界点位（`api/` 与 `core/` 必须保持 0 个）；上层不得直接触碰 GPU 资源。
+
+## 渲染管线（一屏一帧）
+
+```
+PeekMessage 泵
+→ 每屏采集 try_capture(wait)         # DDA 的阻塞等待 = 主循环唯一休眠点
+→ 帧首一次性消费上层命令              # 一帧内连发 N 条同类 setter 只有最后一条生效
+→ prep（参数/质量档/块投影/hover+把手/拖拽/窗口区域/点击穿透/影响盒/快照发布）
+→ 渲染门控：触发源全空则整帧跳过（不 Clear、不 Pass A/B、不 Present、不 Commit）
+→ 每屏：整屏 Clear → Pass A（按脏区 scissor；全透明屏整条跳过）→ Pass B（z 序画全部块）
+→ Present(1) → DComp Commit（每屏一次）
+→ QualityCtrl.tick(own_us)           # own_us = prep + PassA + PassB + Commit，不含采集等待与 Present 阻塞
+```
 
 | 关键点 | 实现 |
 |---|---|
-| 整屏只采集一次 | `src/capture/dda.rs`，成本 O(屏幕)，与块数无关 |
-| **只搬变化的像素** | `GetFrameDirtyRects` / `GetFrameMoveRects` -> 逐矩形 `CopySubresourceRegion` |
-| **模糊只算块看得见的地方** | `src/gfx/pyramid.rs`，Pass A 的 scissor = 桌面脏区 ∩ 块足迹 |
-| **Pass B 每帧画全部块** | flip 模型 back buffer 在 Present 后内容不保，「只画脏块」会让没画的块整块消失（= 其他玻璃闪动）；改为每帧自包含（整屏清 + 画全部块），**Pass A 仍按脏区 scissor** |
-| 每块只画自己的矩形 | `src/gfx/glass_renderer.rs`，per-block viewport + scissor |
-| 位移交给 DWM | 拖动只改块矩形，不重建位图、不 `ResizeBuffers` |
-| 单设备、每屏一次 Present | 一次 Present / 一次 DComp Commit，与块数无关 |
+| 整屏只采集一次 | `capture/dda.rs`，成本 O(屏幕)，与块数无关 |
+| **只搬变化的像素** | `GetFrameDirtyRects` / `GetFrameMoveRects` → 逐矩形 `CopySubresourceRegion`（>24 个退回整屏） |
+| **模糊只算块看得见的地方** | `gfx/pyramid.rs`，Pass A 的 scissor = 桌面脏区 ⊕ 模糊核 ∩ 块足迹 ⊕ 采样余量 |
+| **Pass B 每帧画全部块** | flip 模型 back buffer 在 Present 后内容不保，「只画脏块」会让没画的块整块消失 |
+| 每块只画自己的矩形 | `gfx/glass_renderer.rs`，per-block viewport + scissor |
 | **没有玻璃的屏整帧短路** | 不清屏、不 Pass B、不 Present、不 Commit |
+| **全透明屏跳过 Pass A** | `FrameInput::needs_backdrop == false`（需求 F3.1 的性能来源） |
 | **事件驱动** | 无触发源就整帧跳过；静止桌面不 Present、不 Commit |
 | 自反馈根治 | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`（DDA/WGC 均已验收：不是黑块） |
-| **HDR 桌面** | HDR/宽色域输出（色彩空间 ≠ SDR G22）下 DDA 复制面是 HDR 参考值（整张桌面过曝）；自动改走 **WGC**，由 DWM 完成 HDR→SDR（实测与 SDR 桌面统计一致）。SDR 输出仍 DDA 优先；`GLASS_BACKEND` 可强制 |
-| 拖拽期零 `SetWindowRgn` | 按下时一次性扩到整窗，抬起后收紧 |
-| 不抢焦点 | 画布带 `WS_EX_NOACTIVATE`（方案 需求 2） |
-| 独占全屏自动让路 | 无边框 popup 铺满显示器时隐藏该屏画布，退出后恢复（方案 R-16） |
-| 环境色不闪烁 | 1/16 层 GPU ping-pong EMA，τ=150 ms，零回读（方案 12.6 / R-20） |
-| **块与块之间零串扰** | 鼠标驱动的 border 渐变乘 `fall × 有限支撑窗(3R)`，脏区「光标影响盒」半径与之严格对齐：**不再被重画的块，其鼠标项精确为 0**（`tools/verify_mouse_isolation.py` 逐位取证） |
-| 撑不住时自动降档 | 自适应质量控制器（方案 12.4.3，**默认开启**）：持续丢 vblank 才逐级降，恢复后逐级升回；level 0 与未启用时**逐位一致** |
+| **HDR 桌面** | HDR/宽色域输出下 DDA 复制面是 HDR 参考值（整张过曝）；自动改走 **WGC**，由 DWM 做 HDR→SDR。SDR 输出仍 DDA 优先；`GLASS_BACKEND` 可强制 |
+| 拖拽期零 `SetWindowRgn` | 按下时一次性扩到整窗，抬起后收紧（旧实现每帧重建 HRGN，是 100~280 ms 长尾的主因） |
+| 不抢焦点 | 画布带 `WS_EX_NOACTIVATE`，层级操作一律 `SWP_NOACTIVATE` |
+| 独占全屏自动让路 | 4 Hz 轮询，命中就隐藏该屏画布，退出后恢复 |
+| 环境色不闪烁 | 1/16 层 GPU ping-pong EMA，τ=150 ms，零回读；**只在捕获内容真变化时推进** |
+| **块与块之间零串扰** | 鼠标 border 渐变乘 `fall × gate(2.5R..3R)`；缩放反馈只作用于被 hover 的那一块；脏区影响盒 = `max(3R+32, 2*grip+16) + ceil(shadow_margin)`，与之严格对齐 ⇒ 盒外精确为 0 |
+| 撑不住时自动降档 | 自适应质量控制器（**默认开启**）：持续丢 vblank 才逐级降，恢复后逐级升回；level 0 与未启用时**逐位一致** |
 
-### 渲染管线（逐帧）
+### 边缘 / 对角缩放（8 个把手）
 
-- **门控**：新桌面帧 / 参数变化 / 几何变化 / hover 变化 / 光标进入点光影响半径 /
-  拖拽 / 速度未收敛 / 窗口消息 —— 全为空则整帧跳过。
-- **Pass A**（每屏，仅在需要时）
-  - 下采样：采集纹理 -> 1/2 -> 1/4 -> 1/8 -> 1/16（4-tap 角点，`shaders/blur_down.hlsl`）
-  - 块分辨率模糊层：整屏 -> 1/2 -> 1/2 ×4 次 tent -> 整屏（强模糊 `frost`）
-    > `soft` 与 `frost` 内容逐像素相同，共享同一份 RT/SRV。
-    > 1/16 层直接兼作环境色探针，不再额外拷贝。
-  - 全程 scissor 到「桌面脏区 ∩ 块足迹」，与整屏无关。
-- **Pass B**（每块一次，`shaders/glass_ps.hlsl`）
-  - SDF：圆角矩形（精确欧氏）或 squircle（超椭圆）
-  - 斜面 LUT：`[slope, tanTheta2]` 256 项 `StructuredBuffer`，CPU 侧由 `src/glass/sdf.rs` 生成
-  - Snell 折射、RGB 色散、Beer-Lambert 吸收、Fresnel-Schlick、焦散亮带、鼠标点光、自适应染色
-  - 毛玻璃 ↔ 全透：`clarity` 连续控制，边缘始终保留折射（`edgeAlways`）
-  - LOD-3：<32×32 的块关闭折射/焦散/鼠标光
+- 判定唯一入口 `core/handle.rs::hit_handle(rect, cursor, grip)`：**先角后边**
+  （同时落在左边带与上边带内 ⇒ 判为对角 `TOP_LEFT`，不是单边）。命中带伸出块外 `grip/2`，
+  窗口区域同步外扩 `max_grip + 2`，否则那部分鼠标消息根本到不了我们窗口。
+- `ResizeOptions { enabled, edges, corners, grip_px, min_width, min_height, feedback }`
+  可分别开关边缘 / 对角；`edges_active()` / `corners_active()` 都受总开关约束。
+- 悬停反馈是**加粗白色 border**（`ResizeFeedbackOptions`，默认宽 **5** 逻辑像素、alpha **1.0**、纯白；
+  投影时 `DrawBlock::feedback.width = border_width * scale`，200% DPI 下就是 10 物理像素。
+  0.4.1 之前是 `3 / 0.95` —— 在 100% DPI 屏上实测「看得见但不醒目」，用户验收时反馈触发不够明显；
+  border 画在玻璃形状**内侧**（SDF 内距离 band），因此加粗**不影响**影响盒公式）：
+  - **直边只画到圆角切点为止**（`winX/winY` 用 `hs - r` 做切点窗，`smoothstep` 软化，不拐弯）；
+  - **对角沿圆弧拐弯**（用 SDF 内侧距离做 band，在圆角象限自然沿弧走）；
+  - 两种掩码在**源头互斥**：`to_shader_edges()` 在对角时返回全 0，`to_shader_corners()`
+    在单边时返回全 0（否则切点附近会叠出一个亮斑）；
+  - 返回值再乘 `coverage`，保证 border 不漏到玻璃形状之外。
+  实现在独立的 `shaders/border_ps.hlsl`（`GlassRenderer::draw_borders` 在 Pass B 之后叠加绘制），
+  与液态着色完全解耦；直边到圆角切点为止、对角沿弧拐弯，两种掩码在 Rust 侧源头互斥。
+- 缩放时**锚定不动边**：夹到最小尺寸时固定边纹丝不动（否则会出现「左边滑走」）。
+- 事件：`ResizeStarted{id, handle}` / `ResizeEnded{id, rect}`；系统光标由 `ResizeEdges::cursor_id()`
+  经 `WM_SETCURSOR` 设置。
 
-### 多显示器与 DPI
+### 自适应质量档位（默认开启，`EngineConfig.adaptive_quality` / `GLASS_ADAPTIVE=0` 关）
 
-- 块几何以**主屏物理像素**为逻辑单位；落到 scale = `dpi / 主屏 dpi` 的屏上按该比例换算，
-  物理观感保持一致（方案 12.2.5）。主屏 scale 恒为 1.0，因此主屏视觉与单屏版本逐位一致。
-- 默认**钳制在单屏内**（方案 12.10 策略 ①）：块中心越过边界即换屏并按比例换算尺寸，
-  不做跨屏大玻璃，因此不存在两屏采样不连续的接缝问题。
-- `WM_DISPLAYCHANGE` / `WM_DPICHANGED` -> 重建全部画布与采集，块自动重新归位。
-- 采集失效（锁屏安全桌面 / 独占全屏 / 被其他录屏软件抢占）时按 500 ms 退避重建，
-  恢复后自动继续，主循环有速率下限，任何异常下都不会空转。
+| level | 动作 | 实测收益 |
+|---|---|---|
+| 0 | 全部效果开启，与未启用控制器时**逐位一致** | 默认 |
+| 1 | `frost` 保持 1/2 分辨率（省掉 Pass A 的整屏 tent 上采样） | +14% fps、−27.4 MB(单屏)/−35.5 MB(双屏)；模糊层差异 ≤3/255 |
+| 2 | + 帧率上限 60（把抖动变成恒定 60 fps） | 消除 judder |
+| 3 | + 关闭焦散与 Beer-Lambert 吸收 | 少量 ALU |
+| 4 | + 关闭 RGB 色散（3 tap → 1 tap） | 省 2 次采样/像素 |
 
-## 中文控制面板
+判据：1 秒窗口内「**我们自己的工作**（prep + Pass A + Pass B + Commit）> 1.25 × 目标帧间隔」
+的渲染帧占比 > 25%（电池 15%）连续 2 次才降档；升档需连续 4 个干净窗口**且距上次降档 ≥20 s**，
+升上去 10 s 内被打回视为失败探针，探针间隔翻倍（上限 300 s）。
+**必须排除采集等待（实测 8~32 ms）与 Present 阻塞（实测 6.6~25 ms）**：
+我们自己的工作只有 30~80 µs/帧。档位变化发 `EngineEvent::QualityLevelChanged`，并打 `[adaptive]` 日志。
 
-启动后自动开启一个本地 HTTP 服务并用系统浏览器打开「液态玻璃 · 控制面板」。
+## 默认参数（= 本项目的视觉基线，改动必须重做取证）
 
-- **玻璃块**：宽度 / 高度（逻辑单位，跨屏自动换算）；`＋ 添加一块`、`＋ 添加 20 块`、`删除最后一块`、`清空全部`
-- **折射与光学参数**：圆角半径、透镜覆盖、折射率 IOR、玻璃厚度、折射强度、色散、
-  清晰度、模糊半径、高光强度/锐度、Fresnel、焦散增益、染色浓度、自适应染色、
-  鼠标高光/半径、阴影强度
+`LiquidParams::default()` 的两个「看起来像手误」的数字是**重构前那个二进制稳态运行时真正渲染出来的值**：
 
-交互：
+- `tint_opacity: 0.01`（不是设计值 0.018）
+- `blur_min: 20.0 * 0.12`（不是设计值 3.0，而且**必须写成表达式**）
 
-- 拖动玻璃块任意位置移动；右下角拖拽缩放；可直接拖到另一块显示器
-- 点击某块即选中，面板的宽度/高度/圆角作用于该块
-- 快捷键：`+` 增一块、`-` 删一块、`Esc` 退出
+来历与逐位取证结论见 `CHANGELOG.md` 的 Fixed 一节与 `core/params.rs` 的注释。
+其余默认值：`corner_radius 32`、`lens_coverage 0.15`、`bevel_width 26`、`ior 1.50`、`thickness 26`、
+`refr_strength 1.0`、`dispersion 0.25`、`absorption 0.18`、`clarity 0.10`、`blur_max 20`、
+`progressive_curve 1.6`、`edge_always 0.55`、`adaptive_tint 0.35`、`base_alpha 1.0`、
+`tint_color [0.92,0.95,1.0,1.0]`、`env_tint_mix 0.25`、`light_dir [-0.45,-0.72,0.53]`、
+`light_intensity 1.0`、`spec_intensity 0.85`、`spec_power 42`、`spec_spread 0.20`、
+`fresnel_f0 0.14`、`rim_width 1.5`、`caustic_gain 0.55`、`mouse_radius 220`、
+`mouse_intensity 1.35`、`mouse_spread 160`、`proximity_glow 0.35`、`shadow_opacity 0.10`、
+`shadow_margin 24`、`lag_seconds 0.012`、`shape RoundedRect`、`super_n 4.0`、`profile Circular`。
 
-## 运行
+## 性能指标
 
-前置：Rust stable（1.77+）、Windows 10 2004+ / Windows 11。
+下表是**重构前**（单 bin crate `liquid-glass`）在本机实测的数字，作为回归基线保留。
+本机：3120×2080@120 Hz/200% + 1920×1080@100%（Intel Ultra 9 285H / Arc 140T），
+桌面持续重绘 47~110 次/秒。
 
-```powershell
-cargo run --release
-```
+| 指标 | 改造前（单屏，最初实现） | 重构前基线（单屏折算） | 重构后（`liquid-verre-rs`） |
+|---|---|---|---|
+| Pass A / 帧 | 6.49 Mpx，每帧必跑 | **0.79 Mpx**，最低 **0 次/帧** | <!-- TODO(verify): 重构后复测待填（python tools/perf_probe.py 的 pass_a_mpx_avg / pass_a）--> |
+| Pass B 脏区 / 帧 | 6.49 Mpx（整屏） | **0.50 Mpx**（单块）/ 1.5~2.0 Mpx（20 块） | <!-- TODO(verify): 重构后复测待填（dirty_mpx_avg）--> |
+| DDA 拷贝 / 帧 | 6.49 Mpx（整屏） | 1.7~4.0 Mpx（脏矩形） | <!-- TODO(verify): 重构后复测待填（copy_mpx_avg）--> |
+| CPU render 均值 | 0.294 ms | **0.094~0.118 ms** | <!-- TODO(verify): 重构后复测待填（avg_render_ms）--> |
+| CPU render 峰值 | 17~31 ms | **0.66~0.94 ms** | <!-- TODO(verify): 重构后复测待填（max_render_ms）--> |
+| 常驻 Private | 182.7 MB | **128.4 MB** | <!-- TODO(verify): 重构后复测待填（tools/ab_memory.py）--> |
+| 20 块静止 CPU | 8.83% 单核 | **5.32%** | <!-- TODO(verify): 重构后复测待填 --> |
+| 20 块拖拽 CPU | 12.34% 单核 | **3.57~10.02%** | <!-- TODO(verify): 重构后复测待填 --> |
+| 锁屏 / 采集失效 | **83.25%**（96 kHz 空转） | **0.469%** | <!-- TODO(verify): 重构后复测待填 --> |
+| 单块拖拽 fps / p50 | — | 113~116 / 8.32~8.36 ms（120 Hz 锁相） | <!-- TODO(verify): 重构后复测待填（gate_perf single-drag）--> |
+| 20 块拖拽 fps / p50（默认 lat=1） | — | 70~74 / 13.0~13.2 ms | <!-- TODO(verify): 重构后复测待填（gate_perf many-drag）--> |
+| 20 块拖拽 fps / p50（吞吐档 `GLASS_FRAME_LATENCY=2`） | — | **105.0 / 8.34 ms** | <!-- TODO(verify): 重构后复测待填 --> |
 
-### 环境变量（全部只影响诊断/布局，不影响视觉）
+> 重构后的数字**尚未复测**（库化改动本身不改渲染路径，但需要一次干净窗口的 A/B 才能下结论）。
+> 复测方法见 `.trellis/spec/backend/measurement-and-gates.md`：轮转 A/B + ≥3 重复 + 中位数，
+> 且必须满足机器健康判据 `rel_max < 5 ms`、`acq_max < 25 ms`，否则数据作废。
+
+历史视觉零变化取证（重构前）：Pass A 重构前后 overlay **0 / 6,489,600 像素差异**；
+脏矩形路径 vs 全量路径 **6/6 场景 0 差异**；局部拷贝 vs 整屏参考拷贝 **7 轮 840 帧 0 差异**；
+多屏改造前后主屏 overlay **alpha 通道 0 差异**。详见 `performance_report.md`。
+## `GLASS_*` 环境变量
+
+**上层应用应当优先用 `EngineConfig` / `DiagnosticsConfig`**（结构化、可 serde）；
+环境变量是给 `tools/` 脚本与命令行用的后门。名字保持 `GLASS_*` 不变 ——
+`tools/` 下的回归脚本与 `gate_perf.py` 全部按这些名字取证，**改名等于打断质量阀门**。
+
+解析点分两批，都**只在启动 / 构造期读一次**，不进热路径
+（每帧 `env::var` = 一次进程环境锁 + 一次 `String` 分配）。
+
+### A. 主循环批（`diag/env.rs::EnvOverrides::load()` 是唯一解析点）
 
 | 变量 | 作用 |
 |---|---|
-| `GLASS_METRICS=1` | 每 5 秒墙钟窗口输出 CPU / 脏区 / Pass A / DDA / 帧率统计 |
-| `GLASS_GPU_TIMINGS=1` | 额外打开 D3D11 timestamp 计时。**会打断驱动批处理、显著拖慢管线**，只在专门做 GPU 归因时开 |
-| `GLASS_MANY=1` | 启动即 20 块自动布局 |
-| `GLASS_SPREAD=1` | 每块显示器正中各放一块玻璃（多屏验收） |
-| `GLASS_FAR_GRID=1` | 4 块互不重叠的分离布局（跨块串扰取证用） |
-| `GLASS_CURSOR_AT=x,y` | 固定首帧光标位置，使「光标在 A 处」与「光标在 B 处」两张取证图可逐像素对比 |
-| `GLASS_FRAME_LATENCY=<1..8>` | DXGI 渲染队列深度，**默认 1**（方案 7.4-7，跟手优先）；`=2` 为吞吐档：20 块拖拽 74→105 fps，代价 +8ms 光标到光子 |
-| `GLASS_FORCE_FULL=1` | 关闭 Pass B 脏矩形，每帧整屏重画（A/B 对照） |
-| `GLASS_INTERNAL_SHOT=<path>` | 输出内部取证图（合成结果 / overlay / capture / frost） |
-| `GLASS_INTERNAL_SHOT_AT_MS=<ms>` | 延迟取证，配合下面两项才能测到脏矩形路径 |
-| `GLASS_VERIFY_PASS_A=1` | 同进程再渲一帧「全量 Pass A + 整屏 Pass B」，输出 `.full.bmp` 对照图 |
-| `GLASS_VERIFY_COPY=1` | 并行维护整屏拷贝的参考纹理，周期性逐像素比对局部拷贝结果 |
-| `GLASS_EXTREME_SPEC=1` | 极端高光回归（`spec_intensity=4.0`、`spec_power=1.0`） |
-| `GLASS_BACKEND=dda\|wgc` | 强制指定采集后端（默认 DDA 优先、失败回退 WGC） |
-| `GLASS_WGC_BUFFERS=<2..8>` | WGC 帧池缓冲数（方案 12.7：>90 Hz 用 3） |
-| `GLASS_MONITORS=<n>` | 只启用前 n 块显示器 |
-| `GLASS_ENV_EMA=0` | 关闭环境色时域平滑，回到逐帧直采 1/16 层 |
-| `GLASS_SHOT_EVERY_MS=<n>` | 连拍 composed 取证图（不强制全量重画），供 `repro_tremble.py` 逐帧分析 |
-| `GLASS_VERIFY_VALIDITY=1` | 漏更新自检：金字塔有效性虚报 / 该重画却漏掉的块，只打印计数不改渲染 |
-| `GLASS_FORCE_HDR_CONV=1` | SDR 源也强制走 HDR->SDR 转换路径（数值校验用） |
-| `GLASS_SIM_BUSY=<ms>` | 拖拽期每帧注入 N ms 忙等，确定性地驱动控制器降档/回升（验证用） |
-| `GLASS_ADAPTIVE=0` | 关闭自适应质量控制器（**默认开启**）。level 0 = 与关闭时逐位一致，只有持续丢帧才降档 |
-| `GLASS_FROST_HALF=1` | 手动强制 frost 保持 1/2 分辨率（自适应控制器的 level 1）。差异 ≤3/255，非逐位一致 |
-| `GLASS_SYNTH_CAP=1` | 用确定性合成图案覆盖采集结果，使跨进程/跨时间的逐像素取证可复现 |
-| `GLASS_SKIP_PASS_A/PASS_B/PRESENT=1` | 归因开关：分别跳过某一段 GPU 工作（画面会不正确，仅实验用） |
+| `GLASS_METRICS=1` | 每 **5 秒墙钟窗口**输出一行 `[metrics]`（CPU / 脏区 / Pass A / DDA / 帧率 / 分位数）。= `DiagnosticsConfig.metrics` |
+| `GLASS_DEFAULT_BLOCK=1` | 启动即建一块**居中默认玻璃**（`w=clamp(主屏宽*0.62,720,1200)`、`h=clamp(主屏高*0.68,480,760)`）。**库默认不建任何窗口**（那是上层应用的职责），取证脚本必须显式打开。= `DiagnosticsConfig.default_window` |
+| `GLASS_MANY=1` | 启动即铺 20 块密集级联布局（步长 `0.62w + 22` / `0.60h + 22`，与重构前一致，否则 `gate_perf` 的 many-drag 与历史数字不可比） |
+| `GLASS_SPREAD=1` | 每块显示器正中各放一块（多屏 + DPI 验收） |
+| `GLASS_FAR_GRID=1` | 4 块互不重叠、分开足够远的确定性布局（`verify_mouse_isolation` 的硬证明）。不能用 `GLASS_MANY` 代替：密集重叠会让邻近余晖沿半透明阴影逐块传递，判定集合的传递闭包吞掉全部 20 块 |
+| `GLASS_EXTREME_SPEC=1` | 极端高光回归：`spec_intensity = 4.0`、`spec_power = 1.0`（验证 bevel/plane 与圆角转角不断裂） |
+| `GLASS_SIM_BUSY=<ms>` | **拖拽帧**注入确定性忙等，用来确定性地驱动自适应控制器降档/回升 |
+| `GLASS_SIM_BACKDROP=<W>x<H>@<HZ>` | 确定性模拟桌面脏区（固定放主屏正中）。**不能**用于「增量==全量」像素 oracle |
+| `GLASS_MONITORS=<n>` | 只用前 n 块屏。= `EngineConfig.monitor_limit` |
+| `GLASS_VERIFY_PASS_A=1` | 拍一张脏矩形受限帧后，同进程再渲一帧「全量 Pass A + 整屏 Pass B」，输出 `.full.bmp` 对照图 |
+| `GLASS_INTERNAL_SHOT=<path>` | 取证截图输出路径（按屏加 `.m<i>.bmp`）。未同时设 `GLASS_SHOT_EVERY_MS` 时会**强制全量重画** |
+| `GLASS_CURSOR_AT=x,y` | **全程钉死**光标（`App::pinned_cursor` → `App::read_cursor()`），不再只设初值。窗口过程与主循环都走 `read_cursor()`，因此命中测试与渲染用的是同一个光标 |
+| `GLASS_ADAPTIVE=0` | 关闭自适应质量控制器（**默认开启**）。level 0 与关闭时逐位一致。= `DiagnosticsConfig.no_adaptive` |
 
-### 自检脚本
+### B. 子系统批（只在自己模块的构造期读一次）
+
+| 变量 | 读取点 | 作用 |
+|---|---|---|
+| `GLASS_BACKEND=dda\|wgc` | `capture/mod.rs` | 强制采集后端（默认 Auto：HDR 输出→WGC，SDR→DDA 优先、失败回退 WGC）。强制 dda 且拿到 FP16 复制面时打一次 `[warn]`（背景会过曝） |
+| `GLASS_SYNTH_CAP=1` | `capture/mod.rs` | 用**确定性合成图案**覆盖采集结果，使跨进程 / 跨时间的逐像素取证可复现 |
+| `GLASS_COPY_MODE=multi\|union\|full` | `capture/dda.rs` | 局部拷贝策略。`multi`(默认)=逐脏矩形 `CopySubresourceRegion`，超过 `MAX_DIRTY_RECTS = 24` 退回整屏；`union`=只拷脏矩形并集 bbox 一次；`full`=永远整屏 `CopyResource` |
+| `GLASS_SIM_DIRTY=<w>x<h>@<n>` | `capture/dda.rs` | 用 n 个固定尺寸、确定性散布的脏矩形取代真实脏矩形，使三种拷贝策略在完全相同的搬运量下对比 |
+| `GLASS_SKIP_COPY=1` / `GLASS_SKIP_DIRTY=1` | `capture/dda.rs` | 归因开关：跳过像素搬运 / 跳过脏矩形查询（画面会不正确，仅实验用） |
+| `GLASS_VERIFY_COPY=1` | `capture/dda.rs` | 并行维护一张「永远整屏 `CopyResource`」的参考纹理，周期性回读并逐像素比对局部拷贝结果，自证脏矩形没漏区域 |
+| `GLASS_WGC_BUFFERS=<2..8>` | `capture/wgc.rs` | WGC 帧池缓冲数（方案 12.7：>90 Hz 用 3，否则 2；下限夹到 2） |
+| `GLASS_FRAME_LATENCY=<1..8>` | `gfx/device.rs` | DXGI 渲染队列深度，**默认 1**（跟手优先）。`=2` 为吞吐档：20 块拖拽 73.9→105.0 fps、p50 13.0→8.34 ms，代价 +1 帧呈现队列 ≈ +8 ms 光标到光子（快速拖拽时有「玻璃跟在光标后面」的拖尾感） |
+| `GLASS_ENV_EMA=0` | `gfx/pyramid.rs` | 关闭环境色时域平滑（**默认开**，τ=150 ms），回到逐帧直采 1/16 层 |
+| `GLASS_FROST_HALF=1` | `gfx/pyramid.rs` | 手动强制 `frost` 保持 1/2 分辨率（= 自适应控制器的 level 1）。省掉整屏 8-tap tent 上采样（约 1.0 个整屏当量 + 26 MB 常驻）。**开启后输出不再与默认档逐位一致**（差异 ≤3/255） |
+| `GLASS_PASS_A_HZ=<hz>` | `gfx/compositor.rs` | Pass A 限频（自适应控制器的一档）。未设 / `0` = 不限频，此时与未引入本机制**逐位一致**。限频只影响 `frost` 与 1/16 环境色探针的新鲜度；清晰层、块几何、折射、色散、高光、鼠标点光、Pass B 仍每帧更新 |
+| `GLASS_FORCE_FULL=1` | `gfx/compositor.rs` | 关闭脏矩形优化，每帧整屏重画（A/B 对照用）。= `DiagnosticsConfig.force_full` |
+| `GLASS_VERIFY_VALIDITY=1` | `gfx/compositor.rs` | 漏更新自检：金字塔有效性虚报 / 该重画却漏掉的块。只打 `[verify]` 计数（≥1 秒节流），不改渲染。= `DiagnosticsConfig.verify_validity` |
+| `GLASS_INTERNAL_SHOT_AT_MS=<ms>` | `gfx/compositor.rs` | 延迟到该时刻之后的第一帧再截图。**必须 > 0 才测得到脏矩形路径**（首帧本来就是整屏重画）。取**稳态帧**用 2500（> 环境色 EMA 的 τ=150 ms 收敛时间） |
+| `GLASS_SHOT_EVERY_MS=<n>` | `gfx/compositor.rs` | 连拍模式，每 n ms 拍一张（序号进文件名）。连拍时**不**强制全量重画（保留增量路径），且默认只写 composed 一个文件 |
+| `GLASS_BURST_OVERLAY=1` | `gfx/compositor.rs` | 连拍时额外写 `.overlay.bmp` / `.capture.bmp` / `.soft.bmp` / `.frost.bmp` |
+| `GLASS_SKIP_PASS_A=1` / `GLASS_SKIP_PASS_B=1` / `GLASS_SKIP_PRESENT=1` / `GLASS_SKIP_CLEAR=1` | `gfx/compositor.rs` | 归因开关：分别跳过某一段 GPU 工作（画面会不正确，**仅实验用**，默认全关） |
+| `GLASS_GPU_TIMINGS=1` | `gfx/compositor.rs` | 额外创建 D3D11 timestamp query。**会打断驱动的命令批处理、显著拖慢管线**（实测把帧率打到 15 fps），因此独立于 `GLASS_METRICS`，只在专门做 GPU 归因时开；**禁止进闭环判据** |
+
+## 质量阀门
 
 ```powershell
-cargo test --release                 # 25 个单元测试（矩形运算/sanitize/丢帧判据/夹紧/LUT/EMA/clamp）
-python tools/gate_perf.py            # 性能阀门：硬门槛不过退出码 1（阈值见 BASELINE.md）
-python tools/verify_all.py           # 7 项逐像素取证，期望 ALL PASS（含跨版本对比）
-python tools/verify_adaptive.py      # 自适应控制器行为：降档/回升/显存回收
-python tools/attribute.py            # 拖拽帧时间归因：逐项关掉 Pass A / Pass B / Present
+cargo test --release --workspace        # 功能阀门：库 136 个单测 + 集成 11 + playground 5 个 schema 单测 + doctest 2 = 154
+python tools/gate_perf.py               # 性能阀门：硬门槛不过退出码 1
+```
+
+`gate_perf.py` 硬门槛：单块拖拽 `fps ≥ 90` 且 `p50 ≤ 9.0 ms`；20 块默认档 `fps ≥ 60`；
+20 块吞吐档（`lat=2` + `SIM_BACKDROP=900x700@120`）`fps ≥ 90`；三场景 `idle Private < 200 MB`。
+软门槛（只 WARN）：20 块默认档 `fps ≥ 90`、拖拽 CPU `< 5%` 单核。
+
+8 个回归脚本（重构前后都必须全绿）：
+
+```powershell
+python tools/verify_dirty.py             # 脏矩形渲染 vs 全量渲染，逐像素（含真实拖拽）；改 blur kernel/scissor 时连跑 ≥3 次
+python tools/verify_mouse_isolation.py   # 拖一块，其余块必须 0 像素变化（含反向对照）
+python tools/verify_validity.py          # 漏更新自检：虚报 / 漏画计数必须为 0
+python tools/repro_tremble.py far        # 分离布局：拖一块，其他块逐帧不变（连拍取证）
+python tools/repro_tremble.py many       # 密集 20 块同上
+python tools/verify_adaptive.py          # 自适应控制器：降档 / 回升 / 显存回收闭环
+python tools/ab_latency.py               # GLASS_FRAME_LATENCY 1 vs 2 轮转 A/B（吞吐档依据）
+python tools/ab_memory.py                # 常驻内存受控 A/B（level 0 vs level 1）
+```
+
+视觉改动额外：
+
+```powershell
+python tools/cmp_visual.py               # 跨版本稳态帧四段取证（deep/interior/ring/outside）
+python tools/verify_crossscreen.py       # 跨屏拖拽 + DPI 换算验收
+python tools/verify_env_ema.py           # 环境色 EMA 开/关 首帧等价
+python tools/smoke_panel.py              # 面板 HTTP 冒烟：movable 开关 / feedback 默认值 / applyToAll 链路
+python tools/shot_zoom.py <bmp> <png> <cx> <cy> [half]   # 取证图 4x 近邻裁剪放大（border 等细视觉验收用）
+python tools/verify_all.py               # 上述 5 项一次跑完（含跨版本对比，需要先建 82a49e8 的 worktree）
+python tools/attribute.py                # 拖拽帧时间归因：逐项关掉 Pass A / Pass B / Present
 python tools/perf_probe.py --case all --seconds 12 --warmup 4 --out tools/final.json
-python tools/verify_dirty.py         # 脏矩形渲染 vs 全量渲染，逐像素（含真实拖拽）
-python tools/verify_crossscreen.py   # 跨屏拖拽 + DPI 换算验收
-python tools/verify_mouse_isolation.py # 拖一块，其余块必须 0 像素变化（含反向对照）
-python tools/measure_frost_half.py   # frost 半分辨率档的视觉代价 + 性能收益量化
-python tools/ab_memory.py            # 常驻内存受控 A/B（轮转交错 + 稳态窗口中位数）
-python tools/ab_influence.py         # 光标影响盒修复前/后两个二进制的同环境 A/B
-python tools/verify_validity.py        # 漏更新自检（金字塔虚报 / 漏画计数必须为 0）
-python tools/repro_tremble.py far      # 拖一块，其他块必须逐帧不变（连拍取证）
+python tools/measure_frost_half.py       # frost 半分辨率档的视觉代价 + 性能收益量化
+python tools/ab_influence.py             # 光标影响盒修复前/后两个二进制的同环境 A/B
 ```
 
-自适应质量档位（方案 12.4.3，按**实测收益**排序）：
+测量规则（本机结论的唯一合法来源）：轮转交错 A/B + ≥3 重复 + 中位数/p95；
+机器健康判据 `rel_max < 5 ms`、`acq_max < 25 ms`，劣化窗口的数据一律作废；
+视觉取证只能看 `GLASS_INTERNAL_SHOT` 的 composed 图（`WDA_EXCLUDEFROMCAPTURE` 使 OS 截屏看不到玻璃）。
+详见 `.trellis/spec/backend/measurement-and-gates.md`。
 
-| level | 动作 | 触发条件 |
-|---|---|---|
-| 0 | 全部效果开启，与未启用控制器时逐位一致 | 默认 |
-| 1 | frost 保持 1/2 分辨率（+14% fps；单屏 −27.4 MB / 双屏 −35.5 MB，受控 A/B 实测；模糊层差异 ≤3/255） | 见下 |
-| 2 | + 帧率上限 60（把抖动变成恒定 60 fps） | 同上 |
-| 3 | + 关闭焦散与 Beer-Lambert 吸收 | 同上 |
-| 4 | + 关闭 RGB 色散 | 同上 |
+## 不可破坏的 9 条不变量
 
-降档判据：1 秒窗口内「**我们自己的工作**（渲染前准备 + Pass A + Pass B + Commit）
-> 1.25 × 目标帧间隔」的渲染帧占比 >25%（电池 15%）连续 2 次。
-**必须排除采集等待与 Present 阻塞**：那两段实测 8.7~25 ms，而我们自己的工作只有
-30~80 µs/帧（8.33 ms 预算的 1/100）；旧判据用整循环时长，把等待算成丢帧，
-结果单块拖拽也会被降到 level 2 —— 白白改视觉、fps 一点没变好。
+完整版见 `BASELINE.md` 与 `.trellis/spec/backend/rendering-pipeline.md §5`：
+① 每帧自包含（整屏清 + Pass B 画全部块，Pass A 按脏区 scissor）；
+② 金字塔有效性不虚报（`!covered` 先于 `backdrop_changed`）；
+③ 模糊链幂等（`DOWN_GROW=[14,12,8,0]`、tent `32/24/16/8`、`BLUR_REACH=96`、`HYSTERESIS=192`、
+`pad = 128 + min(vel*max_lag,128)`）；
+④ 环境色 EMA 只在捕获内容真变化时推进；
+⑤ 一切光标驱动的视觉都是有限支撑窗，影响盒 `max(3R+32, 2*grip+16) + ceil(shadow_margin)`
+必须严格覆盖（**含缩放反馈**；直边/对角掩码在源头互斥）；
+⑥ 脏区三来源始终并集，不得短路；
+⑦ HDR 输出自动切 WGC；
+⑧ 自适应判据只看「我们自己的工作」；
+⑨ 元数据与上层输入先 sanitize（`clamp_finite`，NaN 不进 GPU）。
 
-升档需要连续 4 个干净窗口**且距上次降档 ≥20 s**；升上去 10 秒内被打回视为失败探针，
-探针间隔翻倍（上限 300 s），避免在两个档位之间周期振荡。
+## 基线与回滚点
 
-`tools/verify_all.py` 的 7 项：跨版本 overlay / composed / capture 三项逐位对比
-（需要先把 `82a49e8` 拉成 worktree 并打同一份合成采集源补丁，见 `performance_report.md` 第七节）、
-脏矩形 vs 全量、跨屏拖拽、环境色 EMA 开关等价、DDA 局部拷贝 vs 整屏参考拷贝。
-
-## 重构基线与质量阀门
-
-- 基线：tag `baseline/pre-refactor`、分支 `backup/pre-refactor-baseline`（= `82fc311`）；
-  重构起点建议 `4dca041`（基线 + 阀门，无行为变化）。快照说明见 `BASELINE.md`。
-- 阀门三件套：`cargo test --release`、`tools/gate_perf.py`、以及下面 8 个回归脚本；
-  阈值与 oracle 选择见 `.trellis/spec/backend/measurement-and-gates.md`。
+- 重构前基线：tag `baseline/pre-refactor`、分支 `backup/pre-refactor-baseline`（= `82fc311`）；
+  重构起点 `4dca041`（基线 + 阀门，无行为变化）。快照说明见 `BASELINE.md`。
 - 过程证据与决策记录（含被否决方案）：`performance_report.md` 第一~十四轮。
+- 变更清单：`CHANGELOG.md`（`0.4.0` = 库化重构，`0.4.1` = 自检轮修复 + `movable` + 发布流水线）。
+- 项目约定（给 AI 协作者）：`AGENTS.md` / `CLAUDE.md`；工程规范：`.trellis/spec/`。
 
-## 项目结构
+## 许可
 
-```
-liquid-glass/
-├─ Cargo.toml / build.rs
-├─ shaders/
-│  ├─ glass_vs.hlsl         # 逐块矩形 -> 裁剪空间；SV_Position 为画布像素坐标
-│  ├─ glass_ps.hlsl         # SDF + Snell 折射 + 色散 + Fresnel + 焦散 + 鼠标光
-│  ├─ blur_down.hlsl        # 4-tap 角点下采样
-│  ├─ blur_up.hlsl          # 8-tap tent 上采样
-│  ├─ env_ema.hlsl          # 1/16 环境色探针时域平滑（方案 12.6 / R-20）
-│  └─ reduce_env.hlsl       # 备用：独立 pass 版环境色探针（未接入管线）
-├─ src/
-│  ├─ main.rs               # 多屏画布管理、消息循环、事件驱动调度、脏区门控、
-│  │                        #   独占全屏检测、自适应质量控制器
-│  ├─ capture/mod.rs        # Capture 统一封装 + pick_backend()（方案 10.5）+ 合成采集源
-│  ├─ capture/dda.rs        # 每屏一个 duplication + 脏矩形 + 局部拷贝 + 失效退避重建
-│  ├─ capture/wgc.rs        # WGC 后端：CreateFreeThreaded + 帧生命周期 + 事件通知
-│  ├─ gfx/
-│  │  ├─ monitors.rs        # 显示器枚举（物理几何 + 每屏 DPI）
-│  │  ├─ device.rs          # D3D11 设备 / DXGI 工厂 / 帧队列深度
-│  │  ├─ shaders.rs         # HLSL 编译与状态对象
-│  │  ├─ pyramid.rs         # Pass A：可裁剪的共享模糊金字塔 + 环境色 EMA
-│  │  ├─ glass_renderer.rs  # Pass B：逐块 scissor 绘制
-│  │  ├─ compositor.rs      # 画布、脏区推导、分级重绘、取证
-│  │  ├─ gpu_timer.rs       # D3D11 timestamp（方案 7.6）
-│  │  ├─ dcomp.rs / swapchain.rs
-│  ├─ glass/                # 参数（含 DPI 缩放）、SDF/LUT、块模型、管理器
-│  ├─ input/                # 光标轮询、拖拽状态机（逻辑单位，跨屏安全）
-│  └─ ui/                   # 中文控制面板（内嵌 HTTP）
-└─ tools/                   # 性能探针与逐像素自证脚本
-```
-
-## 实测（本机 3120×2080@120 Hz/200% + 1920×1080@100%，桌面持续重绘 47~110 次/秒）
-
-| 指标 | 改造前（单屏） | 改造后（单屏折算） |
-|---|---|---|
-| Pass A / 帧 | 6.49 Mpx，每帧必跑 | **0.79 Mpx**，最低 **0 次/帧** |
-| Pass B 脏区 / 帧 | 6.49 Mpx（整屏） | **0.50 Mpx**（单块）/ 1.5~2.0 Mpx（20 块） |
-| DDA 拷贝 / 帧 | 6.49 Mpx（整屏） | 1.7~4.0 Mpx（脏矩形） |
-| CPU render 均值 | 0.294 ms | **0.094~0.118 ms** |
-| CPU render 峰值 | 17~31 ms | **0.66~0.94 ms** |
-| 常驻 Private | 182.7 MB | **128.4 MB** |
-| 20 块静止 CPU | 8.83% 单核 | **5.32%** |
-| 20 块拖拽 CPU | 12.34% 单核 | **3.57~10.02%** |
-| 锁屏 / 采集失效 | **83.25%**（96 kHz 空转） | **0.469%** |
-
-视觉零变化取证：Pass A 重构前后 overlay **0 / 6,489,600 像素差异**；
-脏矩形路径 vs 全量路径 **6/6 场景 0 差异**；局部拷贝 vs 整屏参考拷贝 **7 轮 840 帧 0 差异**；
-多屏改造前后主屏 overlay **alpha 通道 0 差异**。详见 `performance_report.md`。
+MIT。见 `LICENSE`。

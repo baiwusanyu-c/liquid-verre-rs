@@ -13,7 +13,9 @@ except Exception:
     ctypes.windll.user32.SetProcessDPIAware()
 u = ctypes.windll.user32
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "target", "release", "liquid-glass.exe")
+# 被测可执行文件 = dev playground 产物；可用 VERRE_EXE 覆盖（例如指向旧基线做 A/B）。
+EXE = os.environ.get("VERRE_EXE") or os.path.join(
+    ROOT, "target", "release", "liquid-verre-playground.exe")
 BASE = os.path.join(ROOT, "tools", "cross")
 
 def load(p):
@@ -38,6 +40,11 @@ def bbox(p):
 for f in glob.glob(BASE + "*"):
     os.remove(f)
 env = dict(os.environ)
+# 库默认**不**自建玻璃窗口（上层应用负责 create_window）；
+# 取证脚本需要一块确定性的默认玻璃，因此显式打开。
+env["GLASS_DEFAULT_BLOCK"] = "1"
+# 跨屏拖拽的逐位比对同样不允许自适应降档中途改视觉
+env["GLASS_ADAPTIVE"] = "0"
 env["GLASS_INTERNAL_SHOT"] = BASE
 env["GLASS_INTERNAL_SHOT_AT_MS"] = "14000"
 LOG = os.path.join(ROOT, "tools", "cross.log")

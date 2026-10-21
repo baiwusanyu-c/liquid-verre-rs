@@ -1,0 +1,41 @@
+# 每次 push / PR 的质量闸门。
+#
+# 只跑「不需要真实桌面」的部分：fmt / clippy / test / package 干跑。
+# 像素取证（cmp_visual / verify_*）与性能阀门（gate_perf）依赖 DDA 桌面复制与
+# 真实 vsync 节拍，CI 的无交互会话里测出来的数字没有意义 —— 它们只在物理
+# Windows 桌面上跑，口径见 .trellis/spec/backend/measurement-and-gates.md。
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt + clippy + test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
+      - name: test
+        run: cargo test --release --workspace
+      - name: package dry-run (crate 可发布性)
+        run: cargo package --package liquid-verre-rs --list

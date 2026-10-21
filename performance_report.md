@@ -1667,3 +1667,18 @@ lat=2 后 `verify_dirty` 8 次中 2 次 FAIL（lat=1 对照 4/4 PASS）：scisso
 - `GLASS_FRAME_LATENCY` 默认 1，`=2` 为吞吐档 ✓
 - 其余（每帧自包含、闪动修复、HDR 自动切 WGC、控制器判据等）不变 ✓
 
+## 2026-10-21 优化轮 2 后的性能阀门（gate_perf.py，健康窗口）
+
+机器：DISPLAY1 3120x2080@120Hz dpi=192（scale 1.00）+ DISPLAY2 1920x1080（scale 0.50），交流电，GLASS_ADAPTIVE 默认开。
+结论：**PASS**（含新增的 transparent-drag 用例）。
+
+| 用例 | fps | p50 ms | p95 ms | CPU% | Private MB | DDA 次/秒 | own us |
+|---|---|---|---|---|---|---|---|
+| single-drag (lat=1) | 110.2 | 8.34 | 14.58 | 11.87 | 148.9 | 76 | 28 |
+| many-drag (lat=1) | 60.9 | 16.66 | 25.01 | 16.25 | 158.5 | 107 | 76 |
+| many-drag (lat=2, 合成 120Hz 负载) | 97.8 | 8.98 | 18.99 | 10.93 | 159.3 | 60 | 66 |
+| transparent-drag（透明玻璃） | 93.8 | 8.34 | 8.59 | 9.69 | 121.8 | **0** | 20 |
+
+两条 WARN 为建议项、非门槛：20 块 lat=1 的 60.9 fps 受 DDA 采集 107 次/秒（dirty 2.87 Mpx）
+与 DWM 合成挤压；拖拽 CPU ≥5% 门槛只在合成负载窗口才会超。
+transparent-drag 的 DDA 0 次/秒 = 全透明屏整条采集停摆（需求 F3.1 的性能来源）仍然成立。

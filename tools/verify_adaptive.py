@@ -30,7 +30,9 @@ k = ctypes.WinDLL("kernel32")
 ps = ctypes.WinDLL("psapi")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXE = os.path.join(ROOT, "target", "release", "liquid-glass.exe")
+# 被测可执行文件 = dev playground 产物；可用 VERRE_EXE 覆盖（例如指向旧基线做 A/B）。
+EXE = os.environ.get("VERRE_EXE") or os.path.join(
+    ROOT, "target", "release", "liquid-verre-playground.exe")
 LOG = os.path.join(ROOT, "tools", "adaptive.log")
 
 
@@ -55,6 +57,13 @@ def main():
     if os.path.exists(LOG):
         os.remove(LOG)
     env = dict(os.environ)
+    # 库默认**不**自建玻璃窗口（上层应用负责 create_window）；
+    # 取证脚本需要一块确定性的默认玻璃，因此显式打开。
+    env["GLASS_DEFAULT_BLOCK"] = "1"
+    # ⚠ 本脚本**不能**关自适应：它验证的就是降档/回升闭环本身。
+    # （批量给像素等价脚本加 GLASS_ADAPTIVE=0 时误伤过这里一次，导致
+    #   [adaptive] 日志全空、"未观察到降档"。像素等价与闭环验证的开关需求相反。）
+    env.pop("GLASS_ADAPTIVE", None)
     env["GLASS_MANY"] = "1"
     env["GLASS_METRICS"] = "1"
     # 确定性负载：拖拽期每帧渲染段 +13 ms（超 1.25 × 8.33 ms 阈值）。
