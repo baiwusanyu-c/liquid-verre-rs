@@ -13,6 +13,20 @@
 //! （见 `.trellis/spec/backend/quality-guidelines.md` 的「禁止模式」）。
 //! 现在统一在引擎启动时解析一次，热路径只读结构体字段。
 //!
+//! 其中 `GLASS_ADAPTIVE=0` 与 `GLASS_OCCLUSION=0` 是**同一类**：把某个产品正向开关
+//! （`EngineConfig::adaptive_quality` / `EngineConfig::occlusion_culling`）临时关掉的取证后门，
+//! 供 `tools/` 做 A/B 归因。两者都只在构造期读一次，与配置字段合成一个 bool 存进运行期状态
+//! （`QualityCtrl::disable()` / `App::occlusion_enabled`），热路径绝不 `env::var`。
+//!
+//! `GLASS_FS_HIDE=0` 也属于这一类，但它关掉的是「独占全屏应用检测」（方案 R-16）。
+//! 该检测的形状判据是「前台窗口 = `WS_POPUP` 且无 caption/thickframe 且铺满整块屏」，
+//! 而**无边框最大化的普通应用**（Electron / Tauri 那一类）完全符合这个形状 ——
+//! 玻璃确实被它盖住了，隐藏 + 停产在**产品语义**上是对的；但对 `tools/` 的取证脚本是灾难：
+//! 画布一停产，连拍拿到 0 帧、拖拽类脚本整批 FAIL（实测：前台恰好是这类应用时
+//! `repro_tremble far/many` 与 `verify_adaptive` 直接废掉，且与 `GLASS_OCCLUSION` 无关）。
+//! 所以像素 / 性能取证一律显式设 `GLASS_FS_HIDE=0`，让闸门对「用户前台开着哪个应用」
+//! 保持 hermetic —— 与 `GLASS_ADAPTIVE=0`（不许降档中途改视觉）同一个理由。
+//!
 //! 环境变量名保持 `GLASS_*` 不变：`tools/` 下 8 个回归脚本与 `gate_perf.py`
 //! 全部按这些名字取证，改名等于打断质量阀门。上层应用应当优先用
 //! [`crate::api::DiagnosticsConfig`]，环境变量只是给脚本 / 命令行用的后门。
@@ -51,6 +65,24 @@ pub(crate) struct EnvOverrides {
     pub cursor_at: Option<[f32; 2]>,
     /// `GLASS_ADAPTIVE=0`：关闭自适应质量控制器。
     pub no_adaptive: bool,
+    /// `GLASS_OCCLUSION=0`：关闭逐块遮挡剔除（B1 的取证后门，与 `no_adaptive` 完全同构）。
+    ///
+    /// 只在 `runtime::run()` 里读一次并与 `EngineConfig::occlusion_culling` 合成
+    /// `App::occlusion_enabled`；8 Hz 轮询与两个消费点只读那个 bool。
+    /// 关掉之后 `Block::occluded` 恒为 `false`，两处消费点短路 ⇒ 行为与改动前逐位一致（AC7）。
+    pub no_occlusion: bool,
+    /// `GLASS_FS_HIDE=0`：关闭「独占全屏应用检测」（方案 R-16）的隐藏 + 停产。
+    ///
+    /// 这是产品开关 [`crate::api::EngineConfig::fullscreen_hide`] 的**取证后门**，
+    /// 与 `no_adaptive` / `no_occlusion` 完全同构：`runtime::run()` 构造期读一次并合成
+    /// `fs_hide_enabled = cfg.fullscreen_hide && !env.no_fs_hide`，4 Hz 检测块只读那个 bool。
+    ///
+    /// 取证脚本必须设它，否则闸门不 hermetic：该检测的形状判据（**前台**窗口 = `WS_POPUP`
+    /// 且无 caption/thickframe 且铺满整块屏）与「无边框最大化的普通应用」重合，
+    /// 一旦误触发就是**整屏停产** ⇒ `tools/` 的脚本拿到 0 帧连拍并整批假 FAIL
+    /// （实测 `repro_tremble far/many` 只有 0~1 帧、`verify_adaptive` 报「未观察到降档」）。
+    /// 唯一不设它的是 `tools/verify_occlusion.py` —— 它就是测这条停产门的。
+    pub no_fs_hide: bool,
 }
 
 fn flag(name: &str) -> bool {
@@ -93,6 +125,8 @@ impl EnvOverrides {
             internal_shot: std::env::var("GLASS_INTERNAL_SHOT").ok(),
             cursor_at,
             no_adaptive: std::env::var("GLASS_ADAPTIVE").ok().as_deref() == Some("0"),
+            no_occlusion: std::env::var("GLASS_OCCLUSION").ok().as_deref() == Some("0"),
+            no_fs_hide: std::env::var("GLASS_FS_HIDE").ok().as_deref() == Some("0"),
         }
     }
 
@@ -113,6 +147,8 @@ mod tests {
         assert!(!e.metrics && !e.many && !e.spread && !e.far_grid);
         assert!(!e.default_block);
         assert!(!e.extreme_spec && !e.verify_pass_a && !e.no_adaptive);
+        assert!(!e.no_occlusion, "遮挡剔除的取证后门默认必须是「不关」");
+        assert!(!e.no_fs_hide, "全屏隐藏检测的取证后门默认必须是「不关」");
         assert_eq!(e.sim_busy_us(), 0);
         assert!(e.sim_backdrop.is_none());
         assert!(e.monitor_limit.is_none());

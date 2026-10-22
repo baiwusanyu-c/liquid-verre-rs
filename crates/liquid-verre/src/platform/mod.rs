@@ -5,4 +5,5 @@
 
 pub(crate) mod display;
 pub(crate) mod level;
+pub(crate) mod occlusion;
 pub(crate) mod window;

@@ -72,6 +72,17 @@ pub(crate) struct DrawBlock {
     pub interactive: bool,
     /// 是否可拖拽移动（投影自 `Block::movable`，窗口过程据此拒绝开始移动会话）。
     pub movable: bool,
+    /// 是否被「z 序在我们之上的不透明窗口」完整覆盖（投影自
+    /// [`crate::core::block::Block::occluded`]，8 Hz 更新，滞后 ≤1 圈）。
+    ///
+    /// **唯一消费者是主循环的 `mouse_relevant` 判定**：被遮挡块的光标移动不该触发重画，
+    /// 更不该把 `capture_wait_ms` 打到 0 —— 后者会让采集从「在驱动里阻塞」退化成
+    /// 满频轮询，正是 CPU 11.87% / 16.25% 那一档的成因之一（`performance_report.md`
+    /// 2026-10-21 健康窗口实测）。
+    ///
+    /// **不影响绘制**：块照常进 `mon.blocks` 与 `cur_rects`，`draw_rect` / `margin` /
+    /// `needs_backdrop` 都不读它，因此单帧像素输出逐位不变（AC6）。
+    pub occluded: bool,
     /// 缩放反馈（仅 hover 块非零）。
     pub feedback: ResizeFeedback,
 }
@@ -125,8 +136,23 @@ mod tests {
             mode,
             interactive: true,
             movable: true,
+            occluded: false,
             feedback: ResizeFeedback::NONE,
         }
+    }
+
+    #[test]
+    fn occluded_does_not_change_draw_geometry() {
+        // B1 只摘「触发源」，**不改绘制集合**：occluded 翻转不许影响
+        // draw_rect / margin / needs_backdrop，否则「单帧像素输出逐位不变」（AC6）
+        // 就不成立了 —— 这条单测是那个承诺的回归网。
+        let b = mk(GlassMode::Liquid, 300.0, 200.0);
+        let mut a = b;
+        a.occluded = true;
+        assert!(!b.occluded);
+        assert_eq!(a.draw_rect(), b.draw_rect());
+        assert_eq!(a.margin(), b.margin());
+        assert_eq!(a.needs_backdrop(), b.needs_backdrop());
     }
 
     #[test]

@@ -48,6 +48,27 @@ pub(crate) struct Block {
     pub movable: bool,
     /// 是否可见。
     pub visible: bool,
+    /// 是否被「z 序在我们之上的不透明窗口」**完整覆盖**（判据用绘制矩形，含阴影外扩）。
+    ///
+    /// **写点唯一**：`runtime::occlusion::update`（8 Hz 轮询，迟滞见 [`occlusion_step`]）。
+    /// **读点三处**：
+    /// 1. 主循环顶部的采集需求扫描（`active` / `wants_bd` 跳过被遮挡块）—— 于是
+    ///    「本屏液态块全被遮挡」会落到现成的 `needs_backdrop_now == false` →
+    ///    `idle_capturing` 停采路径（与全透明屏同一条，DDA 次/秒归零）；
+    /// 2. `runtime::app::collect_monitor_blocks` 投影到 [`crate::core::draw::DrawBlock::occluded`]；
+    /// 3. `mouse_relevant` 判定（被遮挡块的光标移动既不触发重画，也不把
+    ///    `capture_wait_ms` 打到 0）。
+    ///
+    /// **不参与绘制集合**：`mon.blocks` / `cur_rects` 原样，因此单帧像素输出逐位不变
+    /// （AC6 用 `GLASS_OCCLUSION=0/1` 同稳态帧对比来钉死这一点）。
+    pub occluded: bool,
+    /// 遮挡判定的连续命中计数（[`occlusion_step`] 的持久状态）。
+    ///
+    /// 与 `occluded` 同写同读（只有 `runtime::occlusion::update` 碰它）。单独存一个字段
+    /// 是为了让「置位需连续 2 次、解除只需 1 次」这件事保持成**纯函数**：可单测、
+    /// 无隐藏状态、也不会和 `occluded` 各自漂移（spec 的「单一来源」硬规矩）。
+    /// `i8` 足够：它数到 `OCCLUSION_CONFIRM_POLLS` 就饱和，永远不会涨大。
+    pub occl_streak: i8,
 }
 
 impl Block {
@@ -68,6 +89,8 @@ impl Block {
             interactive: true,
             movable: true,
             visible: true,
+            occluded: false,
+            occl_streak: 0,
         }
     }
 
@@ -118,10 +141,101 @@ fn clamp_finite_pos(v: f32, lo: f32) -> f32 {
     }
 }
 
+/// 遮挡确认所需的连续命中次数（8 Hz 轮询 ⇒ ≤250 ms）。
+///
+/// 为什么要迟滞：`EnumWindows` 拿到的窗口快照与我们的块几何不是同一时刻取的，
+/// 遮挡窗口正在移动 / 正在创建销毁时单次判定会抖。置位慢一轮（+125 ms）只是让
+/// 「省下来的采集」晚一点开始；解除快（1 次）保证遮挡一移开立刻恢复渲染 ——
+/// 错判方向必须是「多渲染」而不是「少渲染」。
+pub(crate) const OCCLUSION_CONFIRM_POLLS: i8 = 2;
+
+/// 遮挡迟滞状态机：由上一轮的 `streak` 与本轮判定 `hit` 推出新的 `(occluded, streak)`。
+///
+/// - 置位需**连续** [`OCCLUSION_CONFIRM_POLLS`] 次命中；
+/// - **解除只需 1 次未命中**（立即恢复），且 `streak` 归零；
+/// - `streak` 数到阈值就饱和，不再自增：连续命中 1000 轮与 2 轮语义完全相同，
+///   继续数只会让解除变慢。先 `clamp` 再 `saturating_add` 是为了杜绝 i8 溢出 ——
+///   debug 构建下裸 `streak + 1` 在第 128 轮就 panic（spec 明令禁止裸的整数加减），
+///   而 `streak` 是跨轮持久字段，脏值 / 阈值日后调大都可能把它推到边界。
+#[must_use]
+pub(crate) fn occlusion_step(streak: i8, hit: bool) -> (bool, i8) {
+    if !hit {
+        // 一次未命中就解除：宁可多渲染一帧，也不许让玻璃在遮挡移开后还是黑的。
+        return (false, 0);
+    }
+    let next = streak
+        .clamp(0, OCCLUSION_CONFIRM_POLLS)
+        .saturating_add(1)
+        .min(OCCLUSION_CONFIRM_POLLS);
+    (next >= OCCLUSION_CONFIRM_POLLS, next)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Block, MAX_SIZE, MIN_SIZE};
+    use super::{occlusion_step, Block, MAX_SIZE, MIN_SIZE, OCCLUSION_CONFIRM_POLLS};
     use crate::api::config::GlassStyle;
+
+    #[test]
+    fn new_blocks_start_unoccluded() {
+        let b = Block::new(1, 0.0, 0.0, 100.0, 100.0);
+        assert!(!b.occluded && b.occl_streak == 0);
+    }
+
+    #[test]
+    fn occlusion_latches_only_after_two_consecutive_hits() {
+        // 首次命中不置位（迟滞：EnumWindows 快照与块几何不同时刻取的，会抖）
+        let (occ, streak) = occlusion_step(0, true);
+        assert!(!occ);
+        assert_eq!(streak, 1);
+        // 连续第 2 次命中才置位
+        let (occ, streak) = occlusion_step(streak, true);
+        assert!(occ);
+        assert_eq!(streak, OCCLUSION_CONFIRM_POLLS);
+    }
+
+    #[test]
+    fn occlusion_releases_on_a_single_miss_and_resets_streak() {
+        // 解除只需 1 次：错判方向必须是「多渲染」而不是「少渲染」
+        let (occ, streak) = occlusion_step(OCCLUSION_CONFIRM_POLLS, false);
+        assert!(!occ);
+        assert_eq!(streak, 0);
+        // 解除后必须重新数满 OCCLUSION_CONFIRM_POLLS 次才再置位（不许留残余计数）
+        let (occ, streak) = occlusion_step(streak, true);
+        assert!(!occ);
+        assert_eq!(streak, 1);
+    }
+
+    #[test]
+    fn occlusion_streak_saturates_and_never_overflows_i8() {
+        // 先走正常路径置位（连续 2 次命中）
+        let (occ, s1) = occlusion_step(0, true);
+        assert!(!occ);
+        assert_eq!(s1, 1);
+        let (occ, mut streak) = occlusion_step(s1, true);
+        assert!(occ, "连续 2 次命中后必须已置位");
+        // 已置位之后再连续命中 1000 轮：debug 构建下裸 `streak + 1`
+        // 会在第 128 轮溢出 panic（i8::MAX = 127）
+        for round in 0..1000 {
+            let (occ, next) = occlusion_step(streak, true);
+            assert!(occ, "第 {} 轮：已置位后继续命中必须保持遮挡", round);
+            assert_eq!(next, OCCLUSION_CONFIRM_POLLS, "streak 必须饱和而不是继续涨");
+            streak = next;
+        }
+        // 饱和之后一次未命中仍然立刻解除
+        assert_eq!(occlusion_step(streak, false), (false, 0));
+    }
+
+    #[test]
+    fn occlusion_step_tolerates_dirty_streak() {
+        // streak 是跨轮持久字段：脏值 / 阈值日后调大都不许让状态机跑飞或 panic
+        let (occ, streak) = occlusion_step(i8::MAX, true);
+        assert!(occ);
+        assert_eq!(streak, OCCLUSION_CONFIRM_POLLS);
+        let (occ, streak) = occlusion_step(-7, true);
+        assert!(!occ, "负值按 0 起算，等价于第一次命中");
+        assert_eq!(streak, 1);
+        assert_eq!(occlusion_step(i8::MIN, false), (false, 0));
+    }
 
     #[test]
     fn clamp_enforces_size_bounds() {

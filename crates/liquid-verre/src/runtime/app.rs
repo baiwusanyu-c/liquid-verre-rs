@@ -74,6 +74,28 @@ pub(crate) struct App {
     /// 窗口过程置位的「需要重画」标记（z 序变化 / 会话结束）。
     pub geometry_changed: bool,
     pub fs_check_at: Instant,
+    /// 逐块遮挡轮询（B1）的上一次时刻。8 Hz 节流，见 `crate::runtime::occlusion`。
+    ///
+    /// 与 `fs_check_at` 同构但**独立**：全屏检测 4 Hz、遮挡轮询 8 Hz，两者的成本模型与
+    /// 延迟承诺都不同，共用一个时间戳会让其中一个的频率被另一个绑架。
+    pub occl_check_at: Instant,
+    /// `platform::occlusion::opaque_rects_above` 的输出缓冲（跨帧复用）。
+    ///
+    /// 热路径零堆分配的硬要求：多屏共用这一个 `Vec`，每屏调用前 `clear()`
+    /// （被调方**只追加、不清空**，那是它的显式契约）。
+    pub occluders: Vec<[i32; 4]>,
+    /// 遮挡剔除是否生效。**构造期算一次**：`cfg.occlusion_culling && !env.no_occlusion`。
+    ///
+    /// 存成 bool 而不是每次查两处，是为了让热路径（8 Hz 轮询与两个消费点）
+    /// 绝不 `env::var`（spec：每帧一次进程环境锁 + 一个 `String` 分配）。
+    pub occlusion_enabled: bool,
+    /// 每屏「全部块被遮挡 ⇒ 采集停产」的状态位（bit i = 第 i 块屏）。
+    ///
+    /// **只服务日志翻转沿**（R-C3：不许每轮打印），不参与任何判定 —— 真值是
+    /// `Block::occluded`。放这里而不是 `MonitorRt`：一个纯日志用途的位不值得让
+    /// `runtime/monitor.rs` 新增字段，位掩码也不必跟着 `rebuild_monitors` resize
+    /// （那里直接清 0）。超过 32 块屏时高位屏的**日志**静默放弃，判定仍逐块正确。
+    pub occl_paused_mask: u32,
     pub t0: Instant,
     pub frames: u64,
 
@@ -316,6 +338,7 @@ pub(crate) fn collect_monitor_blocks(app: &mut App, mi: usize) {
             mode: style.mode(),
             interactive,
             movable,
+            occluded: b.occluded,
             feedback,
         });
     }
@@ -451,6 +474,9 @@ pub(crate) fn rebuild_monitors(app: &mut App) {
     for m in app.monitors.iter_mut() {
         m.region_dirty = true;
     }
+    // 拔插显示器后屏的下标可能整体错位，旧的「因遮挡停产」状态位不再对应同一块屏。
+    // 清 0 的代价只是：下一轮 8 Hz 扫描若仍全部被遮挡，会多打一条「停产」日志。
+    app.occl_paused_mask = 0;
     app.snapshot_dirty = true;
     let count = app.monitors.len();
     app.shared
@@ -517,7 +543,10 @@ pub(crate) fn publish_snapshot(app: &mut App, fps: f32, hz: f32, battery: bool) 
             (b.width / s).round() as i32,
             (b.height / s).round() as i32,
             b.z_order,
-            i32::from(b.visible) * 2 + i32::from(b.interactive),
+            // 位掩码必须**覆盖所有会变的布尔位**：少一位就意味着「只有那一位变了」
+            // 不会触发快照发布，上层永远读不到翻转（加 `occluded` 时正是这个坑）。
+            // 3 位仍远小于 i32 的宽度，将来再加布尔位往后接即可。
+            i32::from(b.visible) * 4 + i32::from(b.interactive) * 2 + i32::from(b.occluded),
         ];
         app.snapshot_key_next.push((b.id, q));
         let dragged = app.drag.as_ref().map(|d| d.id()) == Some(b.id);
@@ -538,6 +567,7 @@ pub(crate) fn publish_snapshot(app: &mut App, fps: f32, hz: f32, battery: bool) 
             hovered: app.hover == Some(b.id),
             moving: dragged && !resizing_now,
             resizing: dragged && resizing_now,
+            occluded: b.occluded,
         });
     }
     let monitors_changed = app.snapshot.monitors.len() != app.monitors.len();

@@ -47,6 +47,10 @@ def priv_mb(h):
 
 def one(tag, half):
     env = dict(os.environ)
+    # # 前台若恰好是「无边框最大化的普通应用」（Electron / Tauri 那一类），库的独占全屏
+    # # 检测（方案 R-16）会命中 -> 画布隐藏 + 整屏停产 -> 本脚本拿到 0 帧连拍并假 FAIL。
+    # # 取证必须对「用户前台开着哪个应用」保持 hermetic，与 GLASS_ADAPTIVE=0 同理。
+    env["GLASS_FS_HIDE"] = "0"
     # 库默认**不**自建玻璃窗口（上层应用负责 create_window）；
     # 取证脚本需要一块确定性的默认玻璃，因此显式打开。
     env["GLASS_DEFAULT_BLOCK"] = "1"

@@ -8,6 +8,156 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
+## [0.4.2-unreleased]
+
+### Added
+- **逐块遮挡剔除（B1）**：被「z 序在画布之上、且不透明」的窗口**完整覆盖**的玻璃块，
+  不再驱动桌面采集，也不再计入光标影响盒。判据用含阴影外扩的**绘制矩形**
+  （`DrawBlock::draw_rect()`）—— Pass B 是 per-block viewport + scissor，绘制矩形就是该块
+  可见像素的硬边界：完整覆盖 ⇒ 该块贡献 0 个可见像素 ⇒ 它触发的一切工作都可证明是浪费。
+  - **8 Hz 轮询**（`runtime/occlusion.rs`，125 ms 一轮，绝不进每帧热路径）：
+    `platform/occlusion.rs` 用 `EnumWindows` 自顶向下枚举，撞到本屏自家画布即终止（z 序下界）。
+    回调里的关卡顺序是**性能契约**，不要为了「看起来整齐」重排：便宜的在前
+    （`GetWindowRect` + 相交测试 + `IsWindowVisible`/`IsIconic`/样式位 + `GetWindowRgn`），
+    唯一跨进程的 `DwmGetWindowAttribute(DWMWA_CLOAKED)` 在最后。
+  - **保守判定，错判方向永远是「多渲染」**：不可见 / 最小化 / cloaked / `WS_EX_LAYERED` /
+    `WS_EX_TRANSPARENT` / 异形窗口（`GetWindowRgn != RGN_ERROR`）一律**不算**遮挡者；
+    查询失败一律当「可能半透明」。置位需连续 2 轮命中（≤250 ms），解除只需 1 轮（≤125 ms）；
+    被拖拽的那一块强制判「未遮挡」（否则拖到恰好被覆盖的位置会停采 → 看起来像卡顿）。
+  - 纯逻辑全在 `core/`（零 `windows::`、零 `unsafe`）：`geometry::rect_fully_covered`
+    （分割法差集 + 单 cover 快路径 + 碎片上限 256 保守退出）、`block::occlusion_step`（迟滞状态机）。
+    覆盖判定另有一条 **4000 组随机输入对撞逐像素 oracle** 的单测 —— 分割法差集是全仓最容易藏
+    off-by-one 的地方，手写用例覆盖不到。
+  - **不改绘制集合**：`mon.blocks` / `cur_rects` / `prev_rects` / 脏区判据 / `set_click_through` /
+    命中测试全部原样，因此**单帧像素输出逐位不变**（`GLASS_OCCLUSION=0` 与 `=1` 同稳态帧、
+    `cmp_visual.py` 口径 single 四段全 0）。
+  - 开关：`EngineConfig.occlusion_culling`（默认 `true`）/ `GLASS_OCCLUSION=0`。
+    关掉时 `Block::occluded` 恒为 `false`、两个消费点短路 ⇒ 行为与未引入本机制逐位一致。
+  - ⚠ **默认层级 `AlwaysOnTop` 下收益接近 0**：`EnumWindows` 几乎立刻撞上自家画布就终止，
+    遮挡者集合恒为空 —— 置顶玻璃本来就不该被普通窗口遮住。真正吃到收益的是
+    `Normal` / `ClickToFront` / `AlwaysOnBottom`（尤其 `AlwaysOnBottom`：玻璃当桌面组件用时
+    遮挡是常态而不是偶发）。
+- **`WindowSnapshot.occluded: bool`**：上层据此解释「玻璃为什么不动了」。
+  语义是**不驱动采集与光标触发源**，不是「被隐藏」—— 遮挡一移开像素就回来（≤125 ms）。
+  `publish_snapshot` 的去重位掩码同步从 2 位扩成 3 位（`visible*4 + interactive*2 + occluded`），
+  否则「只有 occluded 变了」不会触发发布。
+  ⚠ 按 spec 值类型**不加** `#[non_exhaustive]`，因此上层若曾用结构体字面量构造
+  `WindowSnapshot` 会编译失败 —— 它是**输出**结构体（正常用法只读不构造），补一个
+  `occluded: false` 即可。`EngineConfig` 同理，但它有 `Default`，用 `..Default::default()`
+  的调用方不受影响。
+- **`GLASS_FS_HIDE=0`（取证后门）**：关闭「独占全屏应用检测」（方案 R-16）的隐藏 + 停产。
+  为什么必须有：该检测的形状判据（**前台**窗口 = `WS_POPUP` 且无 caption/thickframe 且铺满屏）
+  **不看** cloaked、**不看** z 序、也不看那到底是不是游戏，实测确实误触发过 —— 取证时
+  （没有创建任何探针窗口、只移动光标并点击）引擎两次打出「检测到独占全屏应用，暂时隐藏玻璃」，
+  `repro_tremble far/many` 因此只拿到 0~1 帧连拍、`verify_adaptive` 报「未观察到降档」。
+  ⚠ 当时**没有记录是哪个窗口**触发的（日志不打窗口身份），所以不做具体应用的断言；
+  按形状判据，候选包括 UWP/XAML 壳窗口（`Windows.UI.Core.CoreWindow`，本机实测有 rect 铺满
+  整屏的实例）、无边框最大化的 Electron / Tauri 应用、app-mode 浏览器。
+  注意默认 `AlwaysOnTop` 下我们的画布在这些应用**之上**、玻璃本来可见，所以隐藏的唯一正当理由
+  是 R-16 的原始目的（别压在游戏上破坏独占全屏与 MPO）—— 这是既有行为，非本次引入。
+  A 把命中后果从「画布隐藏」升级成「整屏停产」之后，误触发对取证的杀伤力被放大。
+  根治方向（打窗口身份日志 / 加 cloaked 检查 / 用桌面更新速率区分游戏）见
+  `performance_report.md` 第十五轮「六」，**本次只做后门，不改判据**。
+  已给 13 个像素/性能脚本统一注入，让闸门对「用户前台开着哪个应用」保持 hermetic；
+  **`verify_occlusion.py` 刻意不设**（它就是测这条门的）。与 `GLASS_ADAPTIVE=0` /
+  `GLASS_OCCLUSION=0` 同构，只在构造期读一次。
+- **playground `/api/state` 转发 `occluded`**：不转发就没法在 dev 侧区分「玻璃为什么不动了」
+  是遮挡剔除、采集失效还是渲染门控 —— 取证时实测踩过这个盲区。
+- **`tools/verify_occlusion.py`**：八阶段取证（基线 / 不透明全覆盖 → `dda_acq` 归零 /
+  **半透明覆盖 → `dda_acq` 不许下降**（反向对照，证明保守判定真的在起作用）/ 移开恢复 /
+  无边框全屏 → 停产且不忙等 / 退出恢复），判据全部取自 `[metrics]` 行；
+  `--off` 模式验 `GLASS_OCCLUSION=0` 的开关等价性。
+
+### Fixed
+- **桌面本身被误判成「独占全屏应用」⇒ 玻璃凭空消失并整屏停产**（既有缺陷，被停产门 A 放大）。
+  靠 R-E1 新加的身份日志当场抓到，原文：
+  `检测到独占全屏应用，暂时隐藏玻璃：class=Progman title="Program Manager" rect=[0, 0, 5040, 2080]`。
+  `Progman` 的样式是 `WS_POPUP` 且无 caption/thickframe、rect 铺满整个虚拟屏
+  （3120x2080 + 1920x1080 两块屏合起来），**三条形状判据全中**；而「没有别的窗口持有焦点」时
+  它就是前台窗口 —— 于是用户**点一下壁纸、或者把所有窗口最小化**，玻璃就会消失。
+  取证期间被它命中三次（`repro_tremble far/many` 只拿到 0~1 帧连拍、`verify_adaptive`
+  报「未观察到降档」，一度被误当成 A/B1 的回归）。修法：`fullscreen_app_on` 的身份排除里
+  加一条 `fg == GetShellWindow()`；抽成纯函数 `is_non_candidate_foreground(fg, mon_hwnd, shell)`
+  以便单测，且 `GetShellWindow()` 失败时该条自动失效、退化成修复前行为
+  （**不许**把「所有窗口」都当成桌面，那会让 R-16 整个失效）。
+- **`fullscreen_app_on` 现在否决 cloaked 窗口**：`DWMWA_CLOAKED != 0` 的窗口一个像素都不画
+  （UWP 挂起 / 被 DWM 隐藏），不可能是「独占全屏应用」。
+  ⚠ 保守方向与遮挡扫描**相反**：查询失败时一律当**未** cloaked、维持既有判定 ——
+  隐藏玻璃才是破坏性动作，只有确知 cloaked 才否决，这样对真游戏零影响。
+  两侧共用同一个 `display::dwm_cloaked(hwnd) -> Option<bool>`（全仓唯一 DWM 调用点），
+  返回 `Option` 正是因为两个调用方对「失败」的处置方向相反。
+
+### Added（R-E 追加）
+- **`EngineConfig.fullscreen_hide: bool`**（默认 `true`）：把「独占全屏应用检测」从
+  只有取证后门变成上层可控的产品开关，与 `adaptive_quality` / `occlusion_culling` 同构。
+  关掉后玻璃会一直画在这些应用之上（画布默认 `HWND_TOPMOST`）。
+  ⚠ 判据只看形状，**分不出「游戏」与「无边框最大化的普通应用」**（Electron / Tauri /
+  app-mode 浏览器）；cloaked 否决只排掉「存在但不画」的那一类，**可见的**无边框全屏应用
+  仍会命中 —— 上层若不想要这个行为就关掉它。与 `GLASS_FS_HIDE=0` 取「与」。
+- **命中日志现在带触发窗口身份**：`class` / `title` / `rect`。此前那条日志不打身份，
+  导致误报发生时**根本不知道是谁触发的**（Progman 那个缺陷因此潜伏至今）。
+  `fullscreen_app_on` 因此改为返回 `Option<HWND>`（命中的那个前台窗口），
+  身份字符串只在**翻转沿**由 `window_desc()` 构造 ⇒ 4 Hz 轮询路径仍然零分配；
+  记录的是**真正触发判定的那个窗口**，而不是「打日志那一刻恰好在前台的窗口」。
+  ⚠ 原句「检测到独占全屏应用，暂时隐藏玻璃」原文保留（`tools/verify_occlusion.py`
+  的 `MARKS["fs_on"]` 按子串匹配），身份追加在后面。
+
+### 变更（工具链：性能阀门改成两档判定）
+- **`tools/gate_perf.py` 改成「相对 A/B 优先、绝对门槛回退」两档**。
+  动因：`many-drag >= 60` 这条绝对硬门槛在本机**没有余量**（0.4.1 基线 60.9，机器一漂移就 59.2），
+  而实测**关掉被测特性后逐位相同 59.2** ⇒ 那不是回归，是尺子贴到了机器能力线。
+  **直接把绝对值调低等于静默削弱闸门**（下次真回归就不响了），所以正解是"和同一台机器上的上一个版本比"：
+  - 设了 `VERRE_OLD_EXE` ⇒ 每场景 `REPS` 轮 x 2 臂、**奇偶轮反序**跑抵消漂移、逐字段取中位数；
+    新臂 fps 劣化 > `GATE_REL_MAX`（默认 3%）判 FAIL；绝对值仍打印但只作 `ABS-DRIFT` 提示"该重新标定"。
+  - 没设 ⇒ **退回今天的绝对硬门槛**（CI、别的机器、忘记建参考时仍有卡点，闸门不变弱）。
+  - `Private >= 200 MB` 在**两档下都是硬判据**（内存不随机器漂移）。
+- **新增噪声可辨识度 `spread_pct`**：逐轮 fps 的 `(max-min)/中位数`。若臂内散布 >= 劣化量 x 0.8，
+  判 **「结果不可信」并 FAIL**，明确要求换健康窗口重跑或加轮次 ——
+  **既不宣布回归，也不签字放行**。没有它，3% 门槛在噪声 17% 的窗口里就是抛硬币
+  （实测被"新臂莫名快 17.6%"骗过一次）。
+- **`REPS` 默认 3**（对齐 `measurement-and-gates §2` 的 ">=3 重复 + 中位数 + 轮转"）。
+  2 轮不是省时间，是判据失效。
+- **新增 `tools/test_gate_logic.py`**：桩化 `run()` 喂已知样本，钉住 19 条判定路径
+  （两档各自的通过/抓出、"判回归"与"判不可信"互斥、新臂更快不判失败、
+  `Private` 两档都硬判、`spread_pct` 的除零与单样本边界）。纯逻辑、秒级、不启动 EXE。
+  这类判定的失败方式很隐蔽（它不崩，只在噪声上乱签结论），跑真实性能测不出来。
+- **`tools/` 13 个像素/性能脚本注入 `GLASS_FS_HIDE=0`**，让闸门对"用户前台开着哪个应用"
+  保持 hermetic（详见上面 Fixed 的 `Progman` 条目）；`verify_occlusion.py` 刻意不设。
+
+### Changed
+- **`platform::window::is_own_window` 现在零堆分配**：原来用 `String::from_utf16_lossy` 比类名，
+  而 B1 的 `EnumWindows` 回调会对桌面上**每个**窗口调它一次（8 Hz × 每屏），4 Hz 的
+  `fullscreen_app_on` 也走它 —— 与本任务「回调里不分配 `String`/`Vec`」的硬约束直接冲突。
+  抽出纯函数 `class_name_is_canvas(buf, n)` 直接比宽字符常量 `CANVAS_CLASS_NAME_W`
+  （语义与原来完全等价：等长 + 逐元素），并把 Win32 返回的长度 clamp 到缓冲区范围内，
+  使「切片不越界」成为结构性质。这条判据的后果被 A **放大**了：把自家画布误认成独占全屏应用
+  ⇒ 整屏停采停产 ⇒ 玻璃永久消失且不报错，因此单独加了单测钉住。
+- **`core::geometry::rect_is_empty_i64`**：「矩形退化」判据的**唯一**出处，i32 版委托给它。
+  起因是 `platform/occlusion.rs` 为了「全程 i64 不窄化」手写了第二份 `x1 <= x0 || y1 <= y0`，
+  违反 R-D2（矩形运算单一来源 = `core/geometry.rs`，禁止在 `platform/` 或 `runtime/` 再手写）。
+  而「widen 是为了防溢出」这个理由对**纯比较**不成立（比较不会溢出，widen 在这里只是纪律一致性），
+  所以选择统一而不是给重复开豁免。顺带修正了三处把「比较可能溢出」写进注释的事实性错误。
+- **`MonitorRt::hidden_fs` 从「可见性位」升级为「停产门」（A）**：画布被无边框 / 独占全屏应用
+  压住时，该屏**既不采集也不渲染**。此前只是 `SW_HIDE`：DDA 一切正常，于是我们满频跟着
+  一块看不见的画布跑 采集 + Pass A + Pass B + Present + Commit（`[metrics]` 那一档实测
+  DDA 107 次/秒、CPU 16.25% 单核）。Win10/11 上绝大多数游戏与视频播放器是**无边框窗口全屏**
+  （`fullscreen_app_on` 判的正是这一类：`WS_POPUP` 且无 caption / thickframe 且铺满屏）；
+  真独占全屏反而会因为 DDA `ACCESS_LOST` → `hidden_capture` + `ready=false` 自然停产 ——
+  白干的一直是前者。
+  - 恢复（全屏应用退出）时**不呈现任何陈旧帧**：`compositor.invalidate()` + `ready = false`
+    （**仅当 `needs_backdrop`**；全透明屏没有「新采集帧」可等，置 `ready=false` 会让它永远不回来），
+    画布保持隐藏，直到拿到**新的**采集帧才 `ready=true` + 显示 —— 复用「采集失效恢复」
+    同一条已验证路径，**零新状态机**。代价是玻璃晚约一帧 + 一次 32 ms 阻塞采集才出现
+    （宁可晚 40 ms，不可闪一帧停产前的旧桌面）。
+- **屏从停采恢复的那一帧现在会 `compositor.invalidate()`**（`just_activated` 边沿）。
+  原来金字塔账本靠 commands 层兜底，那是因为透明↔液态切换**必然经过 `Command`**；
+  而「遮挡移开」与「全屏应用退出」都**不经过 commands，没有兜底** —— 停产期间桌面变了而我们
+  一帧都没采集，`pyramid_valid` 却仍声称那块区域有效 ⇒ 恢复后露出陈旧背景
+  （正是 `verify_validity` 抓的「金字塔虚报有效」那一类前科）。`invalidate()` 与「采集源重建」
+  是同一处理，语义单一来源。成本：每次「屏从停采恢复」多一次整屏 Pass A；这类翻转本身稀有
+  （跨屏拖拽、建窗口、遮挡移开、退出全屏），而恢复帧已经在付 32 ms 阻塞采集。
+  幂等，因此对既有的「透明屏 → 液态块落入」路径只是多一次无害调用。
+
 ## [0.4.1] - 2026-10-21
 
 ### Added

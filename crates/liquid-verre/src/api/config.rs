@@ -468,6 +468,43 @@ pub struct EngineConfig {
     pub capture: CaptureConfig,
     /// 自适应质量控制器（方案 12.4.3）。默认开启；level 0 与未启用时逐位一致。
     pub adaptive_quality: bool,
+    /// 遮挡剔除：被「z 序在画布之上、且不透明」的窗口**完整覆盖**（判据用含阴影外扩的
+    /// 绘制矩形）的玻璃块，不再驱动桌面采集，也不再计入光标影响盒。默认开启。
+    ///
+    /// 8 Hz 轮询（125 ms），置位需**连续 2 次**命中、解除只需 **1 次** —— 错判方向永远是
+    /// 「多渲染」而不是「少渲染」。**不改绘制集合**：块照常进投影与脏区集合，因此
+    /// 单帧像素输出逐位不变；唯一可观察的代价是「遮挡移开后 ≤125 ms 内玻璃里是旧桌面」
+    /// （恢复帧会取新桌面并整屏重画，不影响正确性）。
+    ///
+    /// ⚠ 默认层级 [`WindowLevel::AlwaysOnTop`] 下收益**接近 0**：`EnumWindows` 几乎立刻
+    /// 撞上自家画布就终止枚举，遮挡者集合恒为空 —— 置顶玻璃本来就不该被普通窗口遮住。
+    /// 真正吃到收益的是 `Normal` / `ClickToFront` / `AlwaysOnBottom`。
+    /// 「无边框全屏应用压住整屏」由另一条停产门负责（[`fullscreen_hide`]）：那条关的是
+    /// **整屏**（隐藏画布上的采集与渲染每一个像素都进不了用户眼睛，属于缺陷修复而不是
+    /// 可选优化），与本项的**逐块**粒度不同，两个开关互不替代。
+    ///
+    /// 取证后门：`GLASS_OCCLUSION=0`（见 `diag/env.rs`），两者任一关闭都禁用。
+    pub occlusion_culling: bool,
+    /// 前台出现「无边框铺满整块屏」的窗口时，隐藏该屏画布**并整屏停产**
+    /// （方案 R-16 + 0.4.2 的停产门 A）。默认开启。
+    ///
+    /// 目的：别让置顶画布压在游戏上、破坏独占全屏与 MPO（多平面叠加）。命中时该屏的采集与
+    /// 渲染全部跳过（画布已 `SW_HIDE`，那些像素进不了用户眼睛），恢复走「采集失效恢复」
+    /// 同一条路径（`invalidate()` + `ready = false`）⇒ 零陈旧帧。
+    ///
+    /// ⚠ **判据只看形状**（`WS_POPUP` + 无 caption/thickframe + 铺满屏 + 是**前台**窗口），
+    /// 分不出「游戏」与「无边框最大化的普通应用」（Electron / Tauri / app-mode 浏览器 /
+    /// UWP 壳窗口）。0.4.2 起加了 cloaked 否决（`DWMWA_CLOAKED`），排掉「存在但一个像素
+    /// 都不画」的那一类（挂起的 UWP 窗口 / 被 DWM 隐藏的窗口），但**可见的**无边框全屏应用
+    /// 仍会命中 —— 上层若不想要这个行为，把它关掉。关掉后玻璃会一直画在这些应用之上
+    /// （画布默认是 `HWND_TOPMOST`，见 [`WindowLevel`]）。
+    ///
+    /// 命中 / 退出都会打一行 `[info]`，命中那行**追加**触发窗口的
+    /// `class` / `title` / `rect`（身份只在翻转沿构造，4 Hz 轮询路径零分配），
+    /// 同时上抛 [`crate::EngineEvent::ExclusiveFullscreen`]。
+    ///
+    /// 取证后门：`GLASS_FS_HIDE=0`（见 `diag/env.rs`），与本字段取「与」。
+    pub fullscreen_hide: bool,
     /// 帧率上限。`None` = 跟随显示器刷新率。
     pub fps_cap: Option<u32>,
     /// 是否把画布限制在前 N 块显示器（`None` = 全部）。
@@ -487,6 +524,8 @@ impl Default for EngineConfig {
             default_resize: ResizeOptions::default(),
             capture: CaptureConfig::default(),
             adaptive_quality: true,
+            occlusion_culling: true,
+            fullscreen_hide: true,
             fps_cap: None,
             monitor_limit: None,
             log_level: LogLevel::Info,
@@ -592,6 +631,48 @@ mod tests {
         assert!(bad.capture.retry_backoff_ms >= 50);
         assert!(bad.capture.idle_keepalive_ms >= 16);
         assert!(bad.default_resize.grip_px.is_finite());
+    }
+
+    #[test]
+    fn occlusion_culling_defaults_on_and_survives_partial_json() {
+        // 默认必须是「开启」：它不改绘制集合（单帧像素逐位不变），是纯收益项；
+        // 关掉它只用于 A/B 取证（AC6 用 GLASS_OCCLUSION=0/1 同稳态帧对比）。
+        assert!(EngineConfig::default().occlusion_culling);
+        // 容器级 `#[serde(default)]` ⇒ 老配置文件缺这个字段时走 Default，
+        // 上层升级库之后不会被静默关掉（与 `movable` 同一类兼容性承诺）。
+        let c: EngineConfig = serde_json::from_str("{}").expect("空对象也能反序列化");
+        assert!(c.occlusion_culling);
+        // sanitize 不许动它：它是布尔开关，没有「非法值」可夹。
+        let mut c2 = EngineConfig {
+            occlusion_culling: false,
+            ..Default::default()
+        };
+        c2.sanitize();
+        assert!(!c2.occlusion_culling, "关掉就是关掉，sanitize 不许翻回来");
+    }
+
+    #[test]
+    fn fullscreen_hide_defaults_on_and_survives_partial_json() {
+        // 默认必须是「开启」：它是重构前就有的产品行为（方案 R-16 —— 别让置顶画布压在
+        // 独占全屏游戏上），静默关掉等于让玻璃永远画在游戏之上。
+        assert!(EngineConfig::default().fullscreen_hide);
+        // 容器级 `#[serde(default)]` ⇒ 老配置文件缺这个字段时走 Default，
+        // 上层升级库之后不会被静默关掉（与 `occlusion_culling` / `movable` 同一类兼容性承诺）。
+        let c: EngineConfig = serde_json::from_str("{}").expect("空对象也能反序列化");
+        assert!(c.fullscreen_hide);
+        // camelCase 是跨语言契约（上层可能是 JS / C# / Python）。
+        let json = serde_json::to_string(&c).expect("序列化");
+        assert!(
+            json.contains("\"fullscreenHide\""),
+            "字段名必须是 camelCase: {json}"
+        );
+        // sanitize 不许动它：布尔开关没有「非法值」可夹。
+        let mut c2 = EngineConfig {
+            fullscreen_hide: false,
+            ..Default::default()
+        };
+        c2.sanitize();
+        assert!(!c2.fullscreen_hide, "关掉就是关掉，sanitize 不许翻回来");
     }
 
     #[test]

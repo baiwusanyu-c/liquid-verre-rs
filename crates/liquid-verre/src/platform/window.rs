@@ -450,19 +450,72 @@ pub(crate) fn set_click_through(hwnd: HWND, inside: bool) {
 ///
 /// 用来避免把自家 overlay 误判成独占全屏应用 —— 画布本身就是 `WS_POPUP` + 铺满显示器，
 /// 完全符合「全屏」的形状判据。
+///
+/// ⚠ 误判的后果被 A（`hidden_fs` 停产门）放大了：把**自家画布**认成「独占全屏应用」
+/// 就会整屏停采 + 停产，玻璃直接消失，而且不会报成我们的错误。所以纯比较逻辑
+/// 抽成 [`class_name_is_canvas`] 单独测 —— 真实 HWND 在 CI 里造不出来。
 #[must_use]
 pub(crate) fn is_own_window(hwnd: HWND) -> bool {
     if hwnd.0.is_null() {
         return false;
     }
     let mut buf = [0u16; 64];
-    let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
-    String::from_utf16_lossy(&buf[..n]) == CANVAS_CLASS_NAME
+    // `GetClassNameW` 返回**写入的字符数**（不含结尾 0），失败返回 0，两者都 <= buf.len()。
+    // 仍然 clamp 一次：本函数现在也被 `platform::occlusion` 的 `EnumWindows` 回调以 8 Hz
+    // 对桌面上**每个**窗口调用，而回调里 panic 穿 FFI + release profile 的 `panic = "abort"`
+    // 会直接带走整个渲染进程 ⇒「切片不越界」必须是结构性质，不是对 Win32 返回值的信任。
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    class_name_is_canvas(&buf, n)
+}
+
+/// 类名比较的纯逻辑：`GetClassNameW` 写进 `buf` 的前 `n` 个宽字符，是否恰好是我们的画布类名。
+///
+/// **零分配**：直接比宽字符常量，不再 `String::from_utf16_lossy`（那是一次堆分配，
+/// 而任务硬约束要求「`EnumWindows` 回调里不分配 `String` / `Vec`」；本函数被那条回调
+/// 对桌面上每个窗口调用一次，4 Hz 的 `fullscreen_app_on` 也走它）。
+/// 判据来源仍然是同一个 [`CANVAS_CLASS_NAME`]（编译期展开成 `CANVAS_CLASS_NAME_W`，
+/// 单一来源，见其注释）。
+///
+/// `n` 是 `GetClassNameW` 的原始 `i32` 返回值：负数（不该出现）按 0 处理，超过 `buf`
+/// 长度按 `buf.len()` 截断 —— 两条都用 saturating/clamp 表达，不留越界切片的余地。
+#[must_use]
+fn class_name_is_canvas(buf: &[u16], n: i32) -> bool {
+    let n = (n.max(0) as usize).min(buf.len());
+    // 两者的长度约定差一个结尾 0：`CANVAS_CLASS_NAME_W` **含**它，
+    // 而 `GetClassNameW` 的计数**不含**，所以只比 len-1 那一段。
+    let expect = &CANVAS_CLASS_NAME_W[..CANVAS_CLASS_NAME_W.len().saturating_sub(1)];
+    &buf[..n] == expect
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CANVAS_CLASS_NAME, CANVAS_CLASS_NAME_W};
+    use super::{class_name_is_canvas, CANVAS_CLASS_NAME, CANVAS_CLASS_NAME_W};
+
+    #[test]
+    fn class_name_is_canvas_accepts_only_the_exact_name() {
+        // 这条判据错一次的后果：`fullscreen_app_on` 把自家画布当成独占全屏应用
+        // ⇒ `hidden_fs` ⇒ 整屏停采停产 ⇒ 玻璃永久消失（A 放大了误判的代价）。
+        let name = &CANVAS_CLASS_NAME_W[..CANVAS_CLASS_NAME_W.len() - 1];
+        let mut buf = [0u16; 64];
+        buf[..name.len()].copy_from_slice(name);
+        assert!(
+            class_name_is_canvas(&buf, name.len() as i32),
+            "精确类名必须认成自家画布"
+        );
+        // 少一个字符 / 多一个结尾 0 / 空串 / 别的窗口类，一律不是自家画布
+        assert!(!class_name_is_canvas(&buf, name.len() as i32 - 1));
+        assert!(!class_name_is_canvas(&buf, name.len() as i32 + 1));
+        assert!(!class_name_is_canvas(&buf, 0));
+        let mut other = [0u16; 64];
+        let o: Vec<u16> = "Progman".encode_utf16().collect();
+        other[..o.len()].copy_from_slice(&o);
+        assert!(!class_name_is_canvas(&other, o.len() as i32));
+        // Win32 不该给出这两种返回值，但「不可能 panic」必须是结构性质：
+        // 负数按 0 处理，超长按 buf.len() 截断，两者都只影响结论不影响安全性。
+        assert!(!class_name_is_canvas(&buf, -1));
+        assert!(!class_name_is_canvas(&buf, i32::MIN));
+        assert!(!class_name_is_canvas(&buf, i32::MAX));
+    }
 
     #[test]
     fn wide_class_name_matches_narrow_and_is_null_terminated() {

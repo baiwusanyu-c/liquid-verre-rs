@@ -240,6 +240,13 @@ fn apply_one(app: &mut App, cmd: Command) -> bool {
                 return false;
             }
             b.visible = visible;
+            // 遮挡状态必须跟着复位：不可见块**不进** `mon.blocks`（投影阶段就跳过了），
+            // 因此 8 Hz 扫描根本不会更新它。不复位的话 `set_visible(true)` 之后会有
+            // ≤125 ms 沿用陈旧的 `occluded = true` —— 那段时间该块不驱动采集，
+            // 玻璃里是旧桌面。这正是本项目最忌讳的「间歇、难复现」类缺陷
+            // （只在「隐藏期间遮挡者恰好移走」时出现），必须在源头掐掉。
+            b.occluded = false;
+            b.occl_streak = 0;
             // 隐藏 / 显示都会改变「本屏是否需要采集」，金字塔账本作废。
             invalidate_all(app);
             for m in app.monitors.iter_mut() {

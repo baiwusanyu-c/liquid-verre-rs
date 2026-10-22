@@ -93,6 +93,14 @@ pub struct WindowSnapshot {
     pub moving: bool,
     /// 是否正在被缩放。
     pub resizing: bool,
+    /// 是否被「z 序在画布之上、且不透明」的窗口**完整覆盖**（8 Hz 轮询，
+    /// 置位需连续 2 次命中、解除只需 1 次）。
+    ///
+    /// 上层据此解释「玻璃为什么不动了」：被遮挡的块既不驱动桌面采集，也不响应光标移动
+    /// —— 它的可见像素全被别的窗口挡着，那些工作都是白烧。
+    /// **不代表块被隐藏**：绘制集合没有变，遮挡一移开像素就回来（≤125 ms）。
+    /// `EngineConfig::occlusion_culling = false`（或 `GLASS_OCCLUSION=0`）时恒为 `false`。
+    pub occluded: bool,
 }
 
 /// 单个显示器的只读状态。
@@ -760,6 +768,7 @@ mod tests {
                 hovered: false,
                 moving: false,
                 resizing: false,
+                occluded: false,
             });
         });
         assert!(w.is_alive());

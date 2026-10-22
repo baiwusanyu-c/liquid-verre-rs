@@ -17,6 +17,7 @@
 pub(crate) mod app;
 pub(crate) mod commands;
 pub(crate) mod monitor;
+pub(crate) mod occlusion;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -190,6 +191,22 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         }
     );
 
+    // 遮挡剔除（B1）的生效判据在**构造期**算一次：热路径绝不读环境变量（spec 硬规矩）。
+    // 产品正向开关 `EngineConfig::occlusion_culling` 与取证后门 `GLASS_OCCLUSION=0`
+    // 任一关闭都禁用，与上面 `adaptive_quality` / `GLASS_ADAPTIVE=0` 的组合完全同构。
+    let occlusion_enabled = cfg.occlusion_culling && !env.no_occlusion;
+
+    // 「独占全屏应用检测」（方案 R-16 + 0.4.2 的停产门 A）的生效判据同样在**构造期**算一次：
+    // 产品开关 `EngineConfig::fullscreen_hide` 与取证后门 `GLASS_FS_HIDE=0` 取「与」，
+    // 与上面 `occlusion_culling` / `GLASS_OCCLUSION=0` 的组合完全同构（R-E3）。
+    // 为什么必须有取证后门：它的形状判据（WS_POPUP + 无 caption/thickframe + 铺满屏）
+    // 与「无边框最大化的普通应用」（Electron / Tauri）完全重合，而停产门 A 把命中后果
+    // 从「画布隐藏」升级成了「整屏停产」—— 于是 tools/ 的取证脚本会在「前台恰好是
+    // 这类应用」时拿到 0 帧连拍并整批 FAIL（实测 repro_tremble far/many 与 verify_adaptive，
+    // 且与 GLASS_OCCLUSION 无关）。闸门必须对「用户前台开着什么」保持 hermetic，
+    // 与 GLASS_ADAPTIVE=0 同理。产品代码不要关它：玻璃真被盖住时停产正是收益来源。
+    let fs_hide_enabled = cfg.fullscreen_hide && !env.no_fs_hide;
+
     let mut app = App {
         gfx,
         glass,
@@ -214,6 +231,12 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         fs_check_at: Instant::now()
             .checked_sub(std::time::Duration::from_secs(3600))
             .unwrap_or_else(Instant::now),
+        // 遮挡轮询从「启动后第一个 125 ms」开始：开机这一刻桌面上有什么窗口还没稳定
+        // （画布刚建、上层可能还没 create_window），立刻扫一次纯属浪费。
+        occl_check_at: Instant::now(),
+        occluders: Vec::new(),
+        occlusion_enabled,
+        occl_paused_mask: 0,
         t0: Instant::now(),
         frames: 0,
         quality,
@@ -345,7 +368,13 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         let mut wants_bd = [false; 16];
         let mut overflow = false;
         for b in app.manager.blocks() {
-            if !b.visible {
+            // 读点 1（B1）：被「z 序在画布之上、且不透明」的窗口**完整覆盖**的块，
+            // 它的每一个可见像素都被别人挡着 ⇒ 它触发的一切工作都可证明是浪费。
+            // 后果链：本屏液态块全被遮挡 ⇒ `wants_bd=false` ⇒ `needs_backdrop_now=false`
+            // ⇒ 走全透明屏那条**既有**的停采路径（`idle_capturing`），DDA 次/秒归零。
+            // 注意这里只摘「触发源」，不改绘制集合（`mon.blocks` / `cur_rects` 原样），
+            // 因此单帧像素输出逐位不变（AC6 用 `GLASS_OCCLUSION=0/1` 同帧对比钉死）。
+            if !b.visible || b.occluded {
                 continue;
             }
             match active.get_mut(b.monitor) {
@@ -366,13 +395,29 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                 mon.new_backdrop = false;
                 mon.backdrop_dirty = None;
                 mon.copied_px = 0;
+                // 停产门 A：画布已被独占 / 无边框全屏应用压住（`hidden_fs` ⇒ `SW_HIDE`），
+                // 采集与渲染出来的每一个像素都进不了用户眼睛 ⇒ 整屏不采集（R-A1）。
+                // 在此之前 `hidden_fs` 只是「可见性位」：DDA 一切正常，于是我们满频跟着
+                // 一块看不见的画布渲染 —— 那是纯粹的浪费，不是设计。
+                // ⚠ 必须同时置 `idle_capturing`：它不只是「省掉采集」的标记，还是恢复那一帧
+                //   `just_activated` 的**判据**。不置位 ⇒ `just_activated` 恒为假 ⇒ 拿不到
+                //   「刚恢复所以要阻塞取一帧新桌面」这个结论，玻璃里会是停产前的旧桌面。
+                // ⚠ 忙等前科（R-A2）：采集段是主循环**唯一**的休眠点（DDA 在驱动里内核阻塞）。
+                //   停产后本屏不再产生 `new_backdrop`；若所有屏都停产则 `need_render=false`，
+                //   靠下面 `!need_render` 分支的 `IDLE_WAIT_MS`(8 ms) 速率下限兜住。
+                //   少了那道兜底就是 DDA ACCESS_LOST 那次的实测结果：96 kHz / 83% CPU。
+                if mon.hidden_fs {
+                    mon.idle_capturing = true;
+                    continue;
+                }
                 let has_blocks = overflow || active.get(mi).copied().unwrap_or(true);
                 // 全透明屏（或空屏）对桌面内容**零依赖**：连保活采集都不做。
                 // 保活的 4Hz `try_capture` 在 DDA 不健康的机器上会让 ReleaseFrame
                 // 阻塞到秒级（实测 transparent-drag 场景 cap_max=15989ms、fps 掉到 14），
                 // 而那些像素对透明模式毫无用处 —— 停采才是需求 F3.1 的完整形态。
                 // 一旦有液态块落回本屏，下面的 `just_activated` 会强制阻塞取一帧新桌面，
-                // 不会闪旧背景；金字塔账本则由 commands 层的 invalidate 兜底。
+                // 不会闪旧背景；金字塔账本由 `just_activated` 那一次 `invalidate()` 兜底 ——
+                // 不能只靠 commands 层，因为「遮挡移开」与「全屏应用退出」都不经过 `Command`。
                 let needs_backdrop_now = overflow || wants_bd.get(mi).copied().unwrap_or(true);
                 if !needs_backdrop_now && mon.capture.is_some() {
                     mon.idle_capturing = true;
@@ -390,6 +435,21 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                 // 那样会让有块的屏也一直走 32 ms 阻塞，白降帧率。
                 let just_activated = has_blocks && mon.idle_capturing;
                 mon.idle_capturing = !has_blocks;
+                if just_activated {
+                    // 停产期间桌面可能已经变了，而我们一帧都没采集；金字塔与 present 账本
+                    // 却仍声称「这块区域有效」⇒ 恢复后露出陈旧背景。这正是
+                    // `verify_validity` 抓的那一类「虚报有效」前科。
+                    // 为什么现在才加：透明↔液态切换**必然经过 `Command`**，commands 层的
+                    // `invalidate_all` 顺手就兜住了；而 B1 的「遮挡移开」与 A 的
+                    // 「全屏应用退出」都**不经过 commands，没有兜底**。
+                    // `invalidate()` = `pyramid_valid=None` + `background_valid=false` +
+                    // `prev_rects.clear()` + `has_presented=false`，与「采集源重建」
+                    // 是同一处理（语义单一来源）。幂等，因此对既有的透明屏→液态屏路径
+                    // 只是多一次无害调用；成本是每次「屏从停采恢复」多一次整屏 Pass A，
+                    // 而这类翻转本身稀有（跨屏拖拽、建窗口、遮挡移开），恢复帧已经在付
+                    // 32 ms 阻塞采集。
+                    mon.compositor.invalidate();
+                }
                 let wait = if just_activated || !needs_backdrop_now {
                     32
                 } else {
@@ -690,9 +750,17 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
             let x1 = a[0].max(b[0]) + influence;
             let y1 = a[1].max(b[1]) + influence;
             let mon = &app.monitors[mi];
+            // 读点 3（B1）：被完整遮挡的块不参与光标影响盒判定。
+            // 这是 B1 里**单位收益最高**的一处 —— `mouse_relevant` 不只触发整帧重画，
+            // 还会把下面的 `capture_wait_ms` 打到 **0**，让采集从「在驱动里内核阻塞」
+            // 退化成满频轮询（CPU 11.87% / 16.25% 那一档的成因之一）。
             if cursor_moved
                 && mon.blocks.iter().any(|blk| {
-                    blk.x < x1 && blk.x + blk.width > x0 && blk.y < y1 && blk.y + blk.height > y0
+                    !blk.occluded
+                        && blk.x < x1
+                        && blk.x + blk.width > x0
+                        && blk.y < y1
+                        && blk.y + blk.height > y0
                 })
             {
                 mouse_relevant = true;
@@ -712,21 +780,67 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
             window::set_click_through(mon.hwnd, inside);
         }
 
-        // 独占全屏应用检测（方案 R-16）：4 Hz 轮询，命中就隐藏该屏画布，
+        // ---- 逐块遮挡检测（B1）：8 Hz 轮询，节流在函数内部 ----
+        // 放在 `collect_monitor_blocks` 的循环**之后**：它要读本屏刚投影出来的
+        // `mon.blocks`（绘制矩形 = 该块可见像素的硬边界）；放在渲染门控**之前**：
+        // 本轮结论要能被下一圈的采集需求扫描与 `mouse_relevant` 读到。
+        // 因此读点拿到的是上一轮结果，滞后 ≤1 圈（≤8 ms）—— 对 8 Hz 的决策毫无意义。
+        occlusion::update(&mut app);
+
+        // 独占全屏应用检测（方案 R-16）：4 Hz 轮询，命中就隐藏该屏画布 + 整屏停产，
         // 避免全屏置顶画布破坏游戏的独占全屏与 MPO。
-        if app.fs_check_at.elapsed() >= std::time::Duration::from_millis(250) {
+        // `fs_hide_enabled` 为假时整块跳过（`EngineConfig::fullscreen_hide` 与取证后门
+        // GLASS_FS_HIDE=0 取「与」，见上方构造期注释）。
+        if fs_hide_enabled && app.fs_check_at.elapsed() >= std::time::Duration::from_millis(250) {
             app.fs_check_at = Instant::now();
             for (mi, mon) in app.monitors.iter_mut().enumerate() {
                 // 拖拽中隐藏画布会释放 SetCapture，把拖拽状态机打断，
                 // 因此拖拽期间推迟到抬起后再处理。
-                let hit = !dragging && display::fullscreen_app_on(mon.hwnd);
+                // ⚠ 轮询路径**零分配**：`fullscreen_app_on` 只返回命中的 HWND，
+                //   身份字符串（`window_desc`）只在下面的翻转沿才构造（R-E1）。
+                let matched = if dragging {
+                    None
+                } else {
+                    display::fullscreen_app_on(mon.hwnd)
+                };
+                let hit = matched.is_some();
                 if hit != mon.hidden_fs {
                     mon.hidden_fs = hit;
+                    if !hit {
+                        // 停产期间桌面变了而我们一帧都没采集：金字塔与 present 账本都不可信。
+                        mon.compositor.invalidate();
+                        // 需要桌面背景的屏走「采集失效恢复」那条**已验证**的路径：
+                        // `ready=false` ⇒ 下面这次 `apply_visibility` 继续 `SW_HIDE`，
+                        // 画布保持隐藏；等下一次采集到 `Ok(Some(..))` 时命中既有的
+                        // `if !mon.ready && mon.compositor.capture_ready()` 分支自动
+                        // `ready=true` + 显示。**零新状态机**。
+                        // 代价（诚实记录）：玻璃晚约一帧 + 一次 32 ms 阻塞采集才出现；
+                        // 换来「绝不呈现停产前的陈旧桌面」（R-A3 优先于 40 ms 延迟）。
+                        // ⚠ `needs_backdrop` 这个条件**不可省**：全透明屏不采样桌面，
+                        //   没有「新采集帧」可等 ⇒ 把 `ready` 打成 false 会让它**永远不回来**
+                        //   （透明模式本来也没有陈旧问题）。
+                        if mon.needs_backdrop {
+                            mon.ready = false;
+                        }
+                    }
                     window::apply_visibility(mon);
-                    if hit {
-                        log::info!("{} 检测到独占全屏应用，暂时隐藏玻璃", mon.info.name);
-                    } else {
-                        log::info!("{} 独占全屏应用已退出，恢复玻璃", mon.info.name);
+                    // 翻转沿日志。`matched` 是**真正触发判定的那个前台窗口**（不是「打日志这
+                    // 一刻恰好在前台的窗口」—— 4 Hz 轮询与翻转沿之间前台可以变，记错了比不记更误导）。
+                    // `hit == matched.is_some()` 且此刻正处于翻转沿，所以两个分支恰好各对应一次跃迁。
+                    // ⚠ 命中侧那句「检测到独占全屏应用，暂时隐藏玻璃」是
+                    //   tools/verify_occlusion.py 的 MARKS["fs_on"] **子串匹配**目标，
+                    //   原文不可改，窗口身份只能**追加在后面**（改措辞 = 打断取证脚本）。
+                    match matched {
+                        Some(fg) => {
+                            let (class, title, rect) = display::window_desc(fg);
+                            log::info!(
+                                "{} 检测到独占全屏应用，暂时隐藏玻璃：class={class} title={title:?} rect={rect:?}",
+                                mon.info.name
+                            );
+                        }
+                        None => {
+                            log::info!("{} 独占全屏应用已退出，恢复玻璃", mon.info.name);
+                        }
                     }
                     pending_events.push(EngineEvent::ExclusiveFullscreen {
                         monitor_index: mi,
@@ -816,6 +930,15 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         // last_stage_us = [Pass A, Pass B, Present, Commit]，这里故意跳过 Present。
         let mut own_us: u128 = prep_us + sim_us;
         for mi in 0..app.monitors.len() {
+            // 停产门 A：被全屏应用压住的屏这一帧**根本不参与**（不 Clear、不 Pass A/B、
+            // 不 Present、不 Commit）。必须放在 `ready` 判定**之前** —— `hidden_fs` 的屏
+            // `ready` 往往仍是 true，只有这一道门挡得住它。GPU 的大头正在这里
+            // （实测 baseline 77 fps、skip-PassA→110、skip-PassB→114）。
+            // 不调 `render_monitor` ⇒ `presented` 不置位 ⇒ `quality.tick(own_us, false)`
+            // 看到的是一个「零负载」窗口，自适应控制器不会因此误降档。
+            if app.monitors[mi].hidden_fs {
+                continue;
+            }
             // 全透明屏不依赖采集，ready 恒为 true；液态屏必须等首帧就绪。
             if !app.monitors[mi].ready && app.monitors[mi].needs_backdrop {
                 continue;

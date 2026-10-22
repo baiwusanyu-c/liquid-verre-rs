@@ -132,7 +132,7 @@ engine.shutdown();
 
 | 类型 | 字段 |
 |---|---|
-| `EngineConfig` | `default_style`、`window_level`、`default_resize`、`capture`、`adaptive_quality`(默认 `true`)、`fps_cap: Option<u32>`、`monitor_limit: Option<usize>`、`log_level`、`diagnostics` |
+| `EngineConfig` | `default_style`、`window_level`、`default_resize`、`capture`、`adaptive_quality`(默认 `true`)、`occlusion_culling`(默认 `true`)、`fullscreen_hide`(默认 `true`)、`fps_cap: Option<u32>`、`monitor_limit: Option<usize>`、`log_level`、`diagnostics` |
 | `WindowConfig` | `rect: Rect`、`style: Option<GlassStyle>`(`None` = 继承默认)、`resize`、`z_order: Option<ZOrder>`、`interactive`(默认 `true`)、`movable`(默认 `true`)、`visible`(默认 `true`)；默认 rect = `[64, 64, 600, 400]` |
 | `GlassStyle` | 枚举：`Liquid(LiquidParams)` / `Transparent(TransparentParams)`；方法 `mode()` / `needs_backdrop()` / `corner_radius()` / `shadow_margin()` / `sanitize()` / `scaled(dpi)` / `to_params()` / `liquid(p)` / `transparent(r, a, rgba)` |
 | `TransparentParams` | `corner_radius`(默认 32)、`opacity`(默认 0.35)、`color`(默认 `[1,1,1,1]`) |
@@ -207,6 +207,12 @@ engine.shutdown();
   - `AlwaysOnBottom` → `HWND_BOTTOM`，在所有普通窗口之下（仍在桌面之上，否则玻璃不可见）
   - 一律带 `SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE`：画布带 `WS_EX_NOACTIVATE`，
     抬升绝不能把焦点从宿主抢走；层级操作也不该触碰几何（否则白白让 DWM 重新裁剪）。
+  - ⚠ **遮挡剔除只在非置顶层级有意义**：`AlwaysOnTop`（默认）时画布在所有普通窗口之上，
+    普通窗口**盖不住**玻璃，`EnumWindows` 扫到自家画布就终止 ⇒ 遮挡者集合恒空。
+    `Normal` / `ClickToFront` / `AlwaysOnBottom` 下才会有块被完整覆盖，此时被覆盖的块
+    不再驱动桌面采集、也不再计入光标影响盒（`EngineConfig.occlusion_culling`，默认开；
+    `GLASS_OCCLUSION=0` 关）。剔除的是**触发源**而不是绘制：像素照常画，
+    遮挡移开后 ≤125 ms 内恢复（那一小段玻璃里是旧桌面，恢复帧会取新桌面并整屏重画）。
 - **块 z 序 `ZOrder`**：同一画布**内**玻璃块之间的叠放，用 `set_z_order` / `bring_to_front` /
   `send_to_back`。`Manager` 按需整体归一化序号，因此 `Absolute(n)` 的 `n` 不保证长期稳定。
 
@@ -493,11 +499,14 @@ liquid-verre-rs/                     # Cargo workspace（根 Cargo.toml 只有 [
 │     │  ├─ mod.rs                   # run()：初始化 + 逐帧顺序 + 诊断布局 seed_diagnostic_blocks
 │     │  ├─ app.rs                   # App 状态机 + FrameCtx + render_monitor + publish_snapshot + read_cursor
 │     │  ├─ commands.rs              # Command 的帧首消费点
+│     │  ├─ occlusion.rs             # 逐块遮挡剔除的**编排**（8 Hz）：扫哪块屏、结论写回谁、翻转沿日志
 │     │  └─ monitor.rs               # MonitorRt（一屏一套）+ region_margin() + influence_px()
 │     ├─ platform/                   # ★ Win32 集中地
 │     │  ├─ window.rs                # 窗口类 LiquidVerreCanvas / 窗口过程 / WM_NCHITTEST / SetWindowRgn / 点击穿透
 │     │  ├─ level.rs                 # WindowLevel → WS_EX_TOPMOST + SetWindowPos
-│     │  └─ display.rs               # 显示器枚举（物理像素 + 每屏 DPI）/ refresh_hz / on_battery / 独占全屏检测
+│     │  ├─ display.rs               # 显示器枚举（物理像素 + 每屏 DPI）/ refresh_hz / on_battery / 独占全屏检测
+│     │                              #   + dwm_cloaked（全仓唯一 DWM 调用点）/ window_desc（翻转沿打身份日志）
+│     │  └─ occlusion.rs             # EnumWindows z 序扫描：本屏画布**之上**的不透明窗口矩形（关卡顺序 = 性能契约）
 │     ├─ gfx/                        # D3D11 / DXGI / DComp
 │     │  ├─ device.rs  shaders.rs  swapchain.rs  dcomp.rs
 │     │  ├─ compositor.rs            # 每屏画布：脏区账本、金字塔有效性、Clear→PassA→PassB→Present→Commit、取证落盘
@@ -528,7 +537,7 @@ liquid-verre-rs/                     # Cargo workspace（根 Cargo.toml 只有 [
 PeekMessage 泵
 → 每屏采集 try_capture(wait)         # DDA 的阻塞等待 = 主循环唯一休眠点
 → 帧首一次性消费上层命令              # 一帧内连发 N 条同类 setter 只有最后一条生效
-→ prep（参数/质量档/块投影/hover+把手/拖拽/窗口区域/点击穿透/影响盒/快照发布）
+→ prep（参数/质量档/块投影/hover+把手/拖拽/窗口区域/点击穿透/影响盒/遮挡剔除 8 Hz/快照发布）
 → 渲染门控：触发源全空则整帧跳过（不 Clear、不 Pass A/B、不 Present、不 Commit）
 → 每屏：整屏 Clear → Pass A（按脏区 scissor；全透明屏整条跳过）→ Pass B（z 序画全部块）
 → Present(1) → DComp Commit（每屏一次）
@@ -543,13 +552,15 @@ PeekMessage 泵
 | **Pass B 每帧画全部块** | flip 模型 back buffer 在 Present 后内容不保，「只画脏块」会让没画的块整块消失 |
 | 每块只画自己的矩形 | `gfx/glass_renderer.rs`，per-block viewport + scissor |
 | **没有玻璃的屏整帧短路** | 不清屏、不 Pass B、不 Present、不 Commit |
+| **被全屏应用压住的屏整屏停产** | `MonitorRt::hidden_fs` 同时是**停产门**：采集段与渲染段都跳过该屏（画布已 `SW_HIDE`，那些像素进不了用户眼睛）。恢复走「采集失效恢复」同一条路径（`invalidate()` + `ready=false`），**零陈旧帧** |
+| **被完整遮挡的块不驱动采集** | `runtime/occlusion.rs` 8 Hz 扫 z 序；被不透明窗口完整盖住（判据用含阴影外扩的**绘制矩形**）的块不进 `wants_bd`、不进 `mouse_relevant`。**不改绘制集合** ⇒ 单帧像素逐位不变。⚠ 默认 `AlwaysOnTop` 下收益接近 0（置顶玻璃本来就不该被普通窗口遮住） |
 | **全透明屏跳过 Pass A** | `FrameInput::needs_backdrop == false`（需求 F3.1 的性能来源） |
 | **事件驱动** | 无触发源就整帧跳过；静止桌面不 Present、不 Commit |
 | 自反馈根治 | `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`（DDA/WGC 均已验收：不是黑块） |
 | **HDR 桌面** | HDR/宽色域输出下 DDA 复制面是 HDR 参考值（整张过曝）；自动改走 **WGC**，由 DWM 做 HDR→SDR。SDR 输出仍 DDA 优先；`GLASS_BACKEND` 可强制 |
 | 拖拽期零 `SetWindowRgn` | 按下时一次性扩到整窗，抬起后收紧（旧实现每帧重建 HRGN，是 100~280 ms 长尾的主因） |
 | 不抢焦点 | 画布带 `WS_EX_NOACTIVATE`，层级操作一律 `SWP_NOACTIVATE` |
-| 独占全屏自动让路 | 4 Hz 轮询，命中就隐藏该屏画布，退出后恢复 |
+| 独占全屏自动让路 | 4 Hz 轮询，命中就隐藏该屏画布 **并整屏停产**（采集 + 渲染全跳），退出后恢复。判据 = 前台窗口 `WS_POPUP` 且无 caption/thickframe 且铺满整块屏，外加三条身份排除（自家画布 / 无前台 / **`Progman` 桌面本身**）与 cloaked 否决；命中日志会打出触发窗口的 `class`/`title`/`rect`。`EngineConfig.fullscreen_hide`（默认 `true`）/ `GLASS_FS_HIDE=0` 可关 |
 | 环境色不闪烁 | 1/16 层 GPU ping-pong EMA，τ=150 ms，零回读；**只在捕获内容真变化时推进** |
 | **块与块之间零串扰** | 鼠标 border 渐变乘 `fall × gate(2.5R..3R)`；缩放反馈只作用于被 hover 的那一块；脏区影响盒 = `max(3R+32, 2*grip+16) + ceil(shadow_margin)`，与之严格对齐 ⇒ 盒外精确为 0 |
 | 撑不住时自动降档 | 自适应质量控制器（**默认开启**）：持续丢 vblank 才逐级降，恢复后逐级升回；level 0 与未启用时**逐位一致** |
@@ -663,6 +674,8 @@ PeekMessage 泵
 | `GLASS_INTERNAL_SHOT=<path>` | 取证截图输出路径（按屏加 `.m<i>.bmp`）。未同时设 `GLASS_SHOT_EVERY_MS` 时会**强制全量重画** |
 | `GLASS_CURSOR_AT=x,y` | **全程钉死**光标（`App::pinned_cursor` → `App::read_cursor()`），不再只设初值。窗口过程与主循环都走 `read_cursor()`，因此命中测试与渲染用的是同一个光标 |
 | `GLASS_ADAPTIVE=0` | 关闭自适应质量控制器（**默认开启**）。level 0 与关闭时逐位一致。= `DiagnosticsConfig.no_adaptive` |
+| `GLASS_OCCLUSION=0` | 关闭逐块遮挡剔除（**默认开启**）。关掉后 `Block::occluded` 恒为 `false`、两个消费点短路 ⇒ 与未引入本机制**逐位一致**。= `EngineConfig.occlusion_culling` |
+| `GLASS_FS_HIDE=0` | 关闭「独占全屏应用检测」（方案 R-16）的隐藏 + 整屏停产。= `EngineConfig.fullscreen_hide`（默认 `true`），两者取「与」。取证脚本必须设它，否则闸门不 hermetic：该检测的形状判据与「无边框最大化的普通应用」（Electron / Tauri 那一类）重合，命中即整屏停产 ⇒ 脚本拿到 0 帧连拍并整批假 FAIL。`tools/` 下所有像素/性能脚本都已注入，**唯一例外是 `verify_occlusion.py`**（它就是测这条门的） |
 
 ### B. 子系统批（只在自己模块的构造期读一次）
 

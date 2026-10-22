@@ -58,6 +58,8 @@ liquid-verre-rs/
 │     ├─ core/                    # ★ 纯逻辑领域模型：**零 `windows::` 引用、零 `unsafe`**，因此全部可单测
 │     │  ├─ params.rs             # LiquidParams（37 字段）+ Profile + Shape + sanitize + scaled(DPI) + inert()
 │     │  ├─ block.rs              # Block（逻辑单位）+ MIN_SIZE=24 / MAX_SIZE=8000 + clamp + effective_radius
+│     │  │                        #   occluded / occl_streak + occlusion_step（遮挡迟滞状态机：置位需连续
+│     │  │                        #     OCCLUSION_CONFIRM_POLLS=2 轮命中、**解除只需 1 轮**；streak 到阈值即饱和，不许溢出 i8）
 │     │  ├─ manager.rs            # 块集合 / z 序（Front/Back/Absolute/Relative）/ hit_test / hit_resize / 跨屏归属
 │     │  ├─ handle.rs             # ResizeEdges（8 方向常量）+ hit_handle（先角后边）+ to_shader_edges/corners
 │     │  │                        #   （直边与对角掩码在**源头**互斥）+ cursor_id（WM_SETCURSOR）
@@ -65,6 +67,11 @@ liquid-verre-rs/
 │     │  ├─ style.rs              # StyleCache：以 (id, style_epoch, scale 位模式) 为键缓存展开后的参数
 │     │  ├─ geometry.rs           # ★ 矩形 / 影响盒运算的**单一来源**：cursor_influence_px / resize_influence_px /
 │     │  │                        #   frame_influence_px / rect_{contains,union,hit,inflate,clamp,area} / rects_bbox
+│     │  │                        #   / rect_is_empty_i64（「矩形退化」判据的**唯一**出处，i32 版委托给它；platform 侧
+│     │  │                        #     全程 i64 也调它 —— 不许再手写 `x1 <= x0 || y1 <= y0`，即使理由是「防溢出」：
+│     │  │                        #     纯比较本来就不会溢出，widen 只是纪律一致性）
+│     │  │                        #   / rect_fully_covered（矩形并集**完整覆盖**判定：分割法差集 + 单 cover 快路径
+│     │  │                        #     + 碎片上限 OPEN_RECT_CAP=256，超限即保守退出成「未遮挡」= 多渲染）
 │     │  ├─ quality.rs            # QualityCtrl：自适应质量控制器（level 0–4，判据只看 own_us）
 │     │  └─ sdf.rs                # build_refraction_lut（256 项）+ clamp_for_block + is_lod3 + LUT_SIZE
 │     │
@@ -75,16 +82,34 @@ liquid-verre-rs/
 │     │  │                        #   render_monitor / publish_snapshot / rebuild_monitors / wait_for_captures /
 │     │  │                        #   sync_block_monitor；read_cursor()（钉死光标优先）
 │     │  ├─ commands.rs           # Command 在渲染线程的消费点：**帧首一次性** drain + apply（输入合并）
+│     │  ├─ occlusion.rs          # 逐块遮挡剔除的**编排层**（8 Hz）：`Block::occluded` 的唯一写点。
+│     │                           #   只决定「何时扫 / 扫哪块屏 / 结论写回谁 / 何时打日志」，
+│     │                           #   几何判定走 core::geometry、z 序枚举走 platform::occlusion，
+│     │                           #   本模块**一行 Win32 与一行矩形运算都不自己写**
 │     │  └─ monitor.rs            # MonitorRt：一块屏 = 画布窗口 + 交换链 + 采集会话 + 金字塔；
 │     │                           #   region_margin() / influence_px()（影响盒单一出口）
 │     │
 │     ├─ platform/                # ★ Win32 集中地（`unsafe` 密度最高）
 │     │  ├─ window.rs             # 窗口类 LiquidVerreCanvas / create_canvas / 窗口过程 / WM_NCHITTEST 命中测试 /
 │     │  │                        #   SetWindowRgn 区域 / 点击穿透 / apply_visibility / set_cursor
+│     │  │                        #   is_own_window（**零堆分配**，委托纯函数 class_name_is_canvas 直接比宽字符常量；
+│     │  │                        #     它被 platform/occlusion.rs 的 EnumWindows 回调对桌面上**每个**窗口调一次，分配即违规。
+│     │  │                        #     误判后果被停产门 A 放大：把自家画布认成独占全屏应用 ⇒ 整屏停采 ⇒ 玻璃永久消失且不报错）
 │     │  ├─ level.rs              # WindowLevel → WS_EX_TOPMOST + SetWindowPos（HWND_TOPMOST/NOTOPMOST/TOP/BOTTOM），
 │     │  │                        #   一律 SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE；raise_on_click
-│     │  └─ display.rs            # 显示器枚举（物理像素 + 每屏 DPI + scale）/ refresh_hz / on_battery /
-│     │                           #   fullscreen_app_on（独占全屏检测，方案 R-16）
+│     │  ├─ display.rs            # 显示器枚举（物理像素 + 每屏 DPI + scale）/ refresh_hz / on_battery /
+│     │                           #   fullscreen_app_on（独占全屏检测，方案 R-16；返回 Option<HWND>）
+│     │                           #   + is_fullscreen_shape / is_non_candidate_foreground（两条**纯**判据，
+│     │                           #     可单测：形状 + cloaked；身份排除含 Progman 桌面本身）
+│     │                           #   + dwm_cloaked（**全仓唯一** DWM 调用点，返回 Option<bool>：
+│     │                           #     两个调用方对「查询失败」的保守方向相反，不许在 helper 里写死）
+│     │                           #   + window_desc（class/title/rect，**只在翻转沿调用**，会分配 String）
+│     │  └─ occlusion.rs          # EnumWindows z 序扫描：本屏画布**之上**的不透明窗口矩形。
+│     │                           #   回调里的关卡顺序是**性能契约**（便宜的在前，唯一跨进程的
+│     │                           #   DwmGetWindowAttribute(DWMWA_CLOAKED) 在最后），不要重排；
+│     │                           #   一切「不确定」判**不遮挡**；探针 HRGN 必须 DeleteObject；
+│     │                           #   回调必须**结构上不可能 panic**（release 是 panic=abort，
+│     │                           #   catch_unwind 无意义）：零索引、零 unwrap、整数一律 widen 到 i64
 │     │
 │     ├─ gfx/                     # D3D11 / DXGI / DirectComposition
 │     │  ├─ device.rs             # 设备 / DXGI 工厂 / SetMaximumFrameLatency（GLASS_FRAME_LATENCY，默认 1）

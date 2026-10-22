@@ -450,6 +450,12 @@ fn state(engine: &Engine) -> Value {
                 "hovered": w.hovered,
                 "moving": w.moving,
                 "resizing": w.resizing,
+                // 遮挡剔除（B1）的可观测出口：被「z 序在画布之上、且不透明」的窗口
+                // 完整覆盖的块为 true —— 它不再驱动桌面采集，也不再计入光标影响盒，
+                // 但**仍然在画**（剔除的是触发源不是绘制集合），遮挡一移开 <=125 ms 就恢复。
+                // 面板不转发这个字段的话，dev 侧根本无法判断「玻璃为什么不动了」是
+                // 遮挡剔除、还是采集失效、还是渲染门控 —— 取证时实测踩过这个盲区。
+                "occluded": w.occluded,
             })
         })
         .collect();

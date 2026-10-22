@@ -13,12 +13,15 @@ PeekMessage 泵（PM_REMOVE；WM_QUIT → app.shutdown）
 → 每屏采集 try_capture(wait)          # DDA: AcquireNextFrame 阻塞 = 主循环唯一休眠点 + 脏矩形 + 局部拷贝
                                       # WGC: 帧池取帧；HDR 输出自动选 WGC（见 §4）
                                       # wait: 刚激活/本屏不需要背景 = 32 ms，否则 capture_wait_ms
+                                      # ★ 停产门 A：hidden_fs 的屏整屏 continue（并置 idle_capturing，
+                                      #   使恢复那一帧命中 just_activated）；停产门 B1 见 §2.1
 → ★ 帧首一次性消费上层命令            # runtime/commands.rs::apply(&mut app)：drain Command 队列
                                       #   一帧内连发 N 条同类 setter 只有最后一条生效（输入合并，方案 12.2.3）
 → prep：默认参数(default_style.to_params) + 质量档 apply、块几何/跨屏投影(StyleCache)、
         鼠标状态(read_cursor，钉死光标优先)、hover + 把手判定(先 hit_resize 再 hit_test)、
         拖拽/缩放每帧应用一次、每屏 collect_monitor_blocks、窗口区域(SetWindowRgn)、
-        点击穿透、光标影响盒 → mouse_relevant、独占全屏 4 Hz 轮询、快照发布(dirty 即时 / 4 Hz 兜底)
+        点击穿透、光标影响盒 → mouse_relevant、逐块遮挡剔除 8 Hz(runtime/occlusion.rs)、
+        独占全屏 4 Hz 轮询、快照发布(dirty 即时 / 4 Hz 兜底)
 → 渲染门控：触发源全空则整帧跳过（不 Clear、不 Pass A/B、不 Present、不 Commit）
 → 每屏 render_monitor：
      整屏 ClearRenderTargetView(0,0,0,0)      # 每帧自包含，见不变量 1
@@ -35,6 +38,39 @@ PeekMessage 泵（PM_REMOVE；WM_QUIT → app.shutdown）
 且**不动** `background_valid` / `pyramid_valid`（透明屏既没重算也没污染，账本保持原样最诚实）。
 同一标志还让 `wait_for_captures` 跳过该屏（不等采集就绪，启动更快），
 并让主循环的 `render_monitor` 前置条件 `!ready && needs_backdrop` 不拦它。
+
+### 2.1 两道停产门（A 整屏 / B1 逐块）与恢复时的账本诚实性
+
+「画布看不见」与「块不可见」都必须**真的停止工作**，否则是纯浪费：`[metrics]` 实测
+被全屏应用压住那一档是 DDA 107 次/秒、CPU 16.25% 单核，而 GPU 的 Pass A + Pass B 合起来
+已经把帧时间顶过 8.33 ms 预算（归因：baseline 77 fps、skip-PassA→110、skip-PassB→114）。
+
+| 门 | 触发 | 停掉什么 | 恢复 |
+|---|---|---|---|
+| **A｜整屏停产** | `MonitorRt::hidden_fs`（`fullscreen_app_on` 4 Hz，返回 `Option<HWND>`）。形状判据 = 前台窗口 `WS_POPUP` 且无 caption/thickframe 且铺满整块屏；**身份排除** = 自家画布 / 无前台 / `fg == GetShellWindow()`（`Progman` 桌面本身，实测误报源）；**cloaked 否决** = `dwm_cloaked(fg) == Some(true)`（查询失败时当未 cloaked，维持既有判定）。总开关 `EngineConfig.fullscreen_hide`（默认 true）与 `GLASS_FS_HIDE=0` 取「与」。命中日志打触发窗口的 `class`/`title`/`rect`（只在翻转沿构造，4 Hz 路径零分配） | 该屏**采集 + 渲染全跳**。采集段 `continue` 并置 `idle_capturing = true`；渲染段在 `!ready && needs_backdrop` 判定**之前** `continue`（`hidden_fs` 的屏 `ready` 往往仍是 `true`，只有这道门挡得住） | `hidden_fs` true→false：`compositor.invalidate()` + `ready = false`（**仅当 `needs_backdrop`**）⇒ 画布继续隐藏，直到采集到**新帧**命中既有的 `!ready && capture_ready()` 分支才 `ready=true` + 显示（零新状态机） |
+| **B1｜逐块摘触发源** | `Block::occluded`（`runtime/occlusion.rs` 8 Hz；判据 = 块的**绘制矩形** `draw_rect()` 被「z 序在本屏画布之上的不透明窗口」并集**完整覆盖**） | 该块不进采集需求扫描（`active` / `wants_bd`）、不进 `mouse_relevant`。**绘制集合不变**（`mon.blocks` / `cur_rects` / `prev_rects` / 脏区判据 / `set_click_through` 原样）⇒ 单帧像素输出逐位不变 | 解除只需 1 轮（≤125 ms）、置位需连续 2 轮（≤250 ms）；被拖拽的块强制判「未遮挡」。错判方向永远是「多渲染」 |
+
+⚠ A 的 `needs_backdrop` 条件**不可省**：全透明屏没有「新采集帧」可等，把 `ready` 打成 `false`
+会让它**永远不回来**（透明模式不采样桌面，本来也没有陈旧问题）。
+
+⚠ B1 为什么用**绘制矩形**（含阴影外扩）而不是几何矩形：Pass B 是 per-block viewport + scissor，
+绘制矩形是该块可见像素的**硬边界**。完整覆盖 ⇒ 该块贡献 0 个可见像素 ⇒ 它触发的一切工作
+都可证明是浪费。缩放反馈 border 画在玻璃形状**内部**（支撑窗只由 `grip` 决定，见不变量 5），
+因此判据**不需要**再外扩 `grip`；命中测试与点击穿透也**不读** `occluded`，穿透语义未变。
+
+**恢复帧的账本诚实性（单一来源）**：屏从停采恢复的那一帧
+（`just_activated = has_blocks && mon.idle_capturing`）**必须** `compositor.invalidate()`。
+停产期间桌面变了而我们一帧都没采集，`pyramid_valid` 却仍声称那块区域有效 ⇒ 恢复后露出陈旧背景
+（正是 `verify_validity` 抓的「金字塔虚报有效」那一类前科）。**不能只靠 commands 层兜底**：
+透明↔液态切换必然经过 `Command`，而「遮挡移开」与「全屏应用退出」都**不经过 commands**。
+`invalidate()` = `pyramid_valid=None` + `background_valid=false` + `prev_rects.clear()` +
+`has_presented=false`，与「采集源重建」是同一处理。成本：每次恢复多一次整屏 Pass A，
+而这类翻转本身稀有，恢复帧已经在付 32 ms 阻塞采集。
+
+**忙等红线（R-A2）**：采集段的 DDA 阻塞等待是主循环**唯一**的休眠点。两道门都让某些屏不再产生
+`new_backdrop`，因此「所有屏都停产」时必须落到 `!need_render` 分支的 `IDLE_WAIT_MS`(8 ms)
+速率下限上。少了那道兜底就是 DDA ACCESS_LOST 那次的实测结果：**96 kHz / 83% CPU**。
+改这两道门时必须复核 `tools/verify_occlusion.py` 的 loop Hz 断言（S4 阶段）。
 
 Pass A 内部顺序（`gfx/pyramid.rs::run`，全部按 `region` scissor）：
 

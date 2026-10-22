@@ -1682,3 +1682,355 @@ lat=2 后 `verify_dirty` 8 次中 2 次 FAIL（lat=1 对照 4/4 PASS）：scisso
 两条 WARN 为建议项、非门槛：20 块 lat=1 的 60.9 fps 受 DDA 采集 107 次/秒（dirty 2.87 Mpx）
 与 DWM 合成挤压；拖拽 CPU ≥5% 门槛只在合成负载窗口才会超。
 transparent-drag 的 DDA 0 次/秒 = 全透明屏整条采集停摆（需求 F3.1 的性能来源）仍然成立。
+
+---
+
+# 2026-10-22 第十五轮：遮挡优化 A（隐藏屏停产）+ B1（被遮挡块不进触发源）
+
+任务：`.trellis/tasks/10-21-occlusion-perf-a-b1`。两项都**不改变单帧绘制内容**，只改「什么时候干活」。
+立项归因用的是本文件 2026-10-21 那一轮的既有数字：CPU 大头在**采集侧**（`own` 只有 20~76 µs/帧，
+transparent-drag 停采就把 CPU 从 16% 量级拉到 9.69%），GPU 大头在 **Pass A + Pass B 合起来**
+（baseline 77 fps、skip-PassA→110、skip-PassB→114）。
+
+## 一、改了什么
+
+- **A｜`hidden_fs` 从「可见性位」升级为「停产门」**：此前画布 `SW_HIDE` 了但采集 + Pass A +
+  Pass B + Present + Commit 照跑；无边框窗口全屏（Win10/11 上绝大多数游戏与视频播放器的形态，
+  也正是 `fullscreen_app_on` 判的那一类）时 DDA 一切正常，于是满频跟着一块**看不见的画布**渲染。
+  恢复走「采集失效恢复」同一条路径（`invalidate()` + `ready=false`，仅当 `needs_backdrop`），零陈旧帧。
+- **B1｜逐块遮挡剔除（只摘触发源）**：8 Hz `EnumWindows` z 序扫描（撞到本屏画布即终止）→
+  被「不透明窗口并集完整覆盖**绘制矩形**」的块，① 不计入采集需求（`wants_bd`）② 不计入
+  `mouse_relevant`。**不改绘制集合** ⇒ 单帧像素逐位不变。
+- **顺带修掉一处真隐患**：屏从停采恢复的那一帧现在会 `compositor.invalidate()`。
+  原来金字塔账本靠 commands 层兜底，而「遮挡移开」与「全屏退出」都**不经过 `Command`**。
+
+## 二、`tools/verify_occlusion.py`（新增，八阶段）实测
+
+判据取自 `[metrics]` 的 `dda_acq` / `fps` / `pass_a_mpx_avg` / `loops` + 库自己的翻转沿日志。
+覆盖窗口以 10 Hz 闪动（只闪屏幕正中 96x96、两色只差 1 LSB）—— **这一步是必需的**：
+静止的覆盖窗口会让桌面自己安静下来，采集自然掉到 ~1/s，「归零」就分不清是剔除的功劳还是
+桌面没变化（第一版就栽在这里：`--off` 对照跑出 1.0 vs 0.0，毫无区分度）。
+
+健康窗口实测（`GLASS_OCCLUSION=1`，**8/8 PASS**）：
+
+| 阶段 | dda_acq | fps | pass_a Mpx | loop Hz | prep ms |
+|---|---|---|---|---|---|
+| S0 基线无遮挡 | 112.1 | 103.5 | 2.15 | 134 | 0.04 |
+| **S1 B1 不透明全覆盖** | **0.0** | **0.0** | **0.00** | 119 | 0.04 |
+| S2 AC5 半透明(layered)覆盖 | 113.3 | 113.3 | 2.34 | 115 | 0.04 |
+| S3 撤掉覆盖 | 115.1 | 114.3 | 2.31 | 116 | 0.04 |
+| **S4 A 全屏（真实形态）** | **0.0** | **0.0** | **0.00** | 120 | 0.05 |
+| S5 A 退出全屏 | 113.3 | 113.3 | 2.32 | 115 | 0.04 |
+| **S6 A 全屏（layered，与 B1 解耦）** | **0.0** | **0.0** | **0.00** | 120 | 0.05 |
+| S7 A 解耦恢复 | 55.4 | 47.4 | 2.26 | 66 | 0.10 |
+
+- **停产相 `loop Hz` 恒为 119~120**，正是 `IDLE_WAIT_MS`(8 ms) 速率下限 ⇒ 没有退化成忙等
+  （AC3；前科是 DDA ACCESS_LOST 时 96 kHz / 83% CPU）。
+- **S6 是 A 的独占证明**：layered 窗口已被 S2 证明会被 B1 否决，所以那里的 `dda_acq=0.0`
+  只可能来自 A 的停产门，不存在「其实是 B1 干的」这种归因歧义。
+- `--off`（`GLASS_OCCLUSION=0`，**5/5 PASS**）：同一个闪动覆盖窗口下 `dda_acq=8.1`
+  （vs 开开关 0.0）⇒ 开关等价性成立（AC7）；且 S6/S7 照跑照过 ⇒ **A 没有开关**（缺陷修复而非可选优化）。
+- 恢复相一律要求 `pass_a_mpx_avg > 0`：只看 `dda_acq > 0` 证明不了玻璃真的回来了，
+  Pass A 跑过才说明恢复帧真的整屏重画了。
+
+**像素取证**（`GLASS_SYNTH_CAP=1` 确定性合成采集源 + 钉死光标 + 稳态帧 4000 ms）：
+
+| 对比 | 结果 |
+|---|---|
+| AC6：`GLASS_OCCLUSION=0` vs `=1`（同一份二进制） | **差异像素 = 0**（3120x2080 全帧） |
+| AC2：A 停产→恢复帧 vs 从未停产的参照帧 | **差异像素 = 0** |
+
+## 三、性能阀门（`gate_perf.py`）与归因
+
+`perf_probe.py` 现在显式设 `GLASS_FS_HIDE=0`（见「四」），因此 **A 在 gate_perf 里完全不生效**，
+唯一变量是 B1。同一机器窗口下的隔离 A/B：
+
+| 用例 | `GLASS_OCCLUSION=1` | `GLASS_OCCLUSION=0` | 2026-10-21 基线 |
+|---|---|---|---|
+| single-drag fps / p50 / CPU% | 104.7 / 8.35 / 3.59 | 105.0 / 8.34 / 2.97 | 110.2 / 8.34 / 11.87 |
+| many-drag fps / p50 / CPU% | **59.2** / 16.66 / 9.53 | **59.2** / 16.66 / 4.22 | 60.9 / 16.66 / 16.25 |
+| many-drag lat=2 fps | 88.0 | 95.0 | 97.8 |
+| transparent-drag fps / CPU% | 93.7 / 1.72 | 93.8 / 0.78 | 93.8 / 9.69 |
+
+**两条硬门槛 miss（many-drag 59.2 < 60、lat=2 88.0 < 90）与本次改动无关**，三条独立证据：
+
+1. **`GLASS_OCCLUSION=0` 时 many-drag fps 逐位相同（59.2）**，而 A 已被 `GLASS_FS_HIDE=0` 关掉；
+2. `just_activated` 新增的那次 `invalidate()` 在 gate_perf 里**不可能触发**：`drag_path` 的振幅让
+   many（中心 (332,264)）与 single（屏幕中心）两个用例的光标都留在主屏内，跨屏转换不发生
+   ⇒ 没有「屏从停采恢复」的边沿；
+3. `gfx/` `shaders/` `capture/` **零 diff**，Pass A/B/Commit 的代码一行没动。
+
+记录的基线本身就是 60.9（贴着 60 的门槛），`gate_perf.py` 自己的 WARN 也写明
+「受桌面重绘负载 / DWM 背压影响，非渲染成本」。今天这一窗 `dirty 1.96 Mpx`、`dda 112/s`。
+
+⚠ **同时注意 CPU 全线大幅下降**（single 11.87→3.59、many 16.25→9.53/4.22、
+transparent 9.69→1.72/0.78），但 transparent-drag 与 A/B1 都无关，所以这主要是
+**机器窗口不同**（今天桌面安静得多），**不能记成本次改动的收益**。本次改动的收益只在
+「玻璃被完整遮住」的场景里，量级见上表 S1/S4/S6：`dda_acq` 与 `pass_a` 直接归零、
+`loop Hz` 落到 8 ms 速率下限。
+
+## 四、过程中发现并修掉的一个**闸门不 hermetic** 问题（与遮挡无关，但被 A 放大）
+
+`platform::display::fullscreen_app_on` 的形状判据是「**前台**窗口 = `WS_POPUP` 且无
+caption/thickframe 且铺满整块屏」，它**不看** cloaked、**不看** z 序、也**不看**那到底是不是
+游戏/视频。实测确实误触发过：取证时（我没有创建任何探针窗口、只移动光标并点击）引擎两次打出
+`检测到独占全屏应用，暂时隐藏玻璃`，`repro_tremble far/many` 因此只拿到 0~1 帧连拍、
+`verify_adaptive` 报「未观察到降档」，且与 `GLASS_OCCLUSION` 无关。
+
+⚠ **当时没有记录下是哪个窗口触发的**（日志不打窗口身份 —— 这本身就是下面「六」里待办的第一条），
+所以这里不做具体应用的断言。按形状判据，候选包括：UWP/XAML 壳窗口
+（`Windows.UI.Core.CoreWindow`，本机实测存在 rect 铺满整屏 3120x2080 的实例，如「Windows 输入体验」）、
+无边框最大化的 Electron / Tauri 应用、app-mode 浏览器。
+
+⚠ 另一条我先前说错、现在纠正的话：**不能讲「玻璃确实被盖住了，所以隐藏是对的」**。
+默认层级 `AlwaysOnTop` 下我们的画布是 `HWND_TOPMOST`，**在这些应用之上**，玻璃本来是可见的。
+隐藏的唯一正当理由是 R-16 的原始目的（别让置顶画布压在游戏上、破坏独占全屏与 MPO），
+而形状判据分不出「游戏」与「无边框的普通应用」。这是**既有行为**，不是本次改动引入的；
+本次改动只是把命中后果从「画布隐藏」升级成「整屏停产」，于是误触发对取证的杀伤力被放大
+（从「照跑但画面被藏」变成「0 帧、整批假 FAIL」）。
+修法：新增取证后门 **`GLASS_FS_HIDE=0`**（与 `GLASS_ADAPTIVE=0` / `GLASS_OCCLUSION=0` 同构，
+只在构造期读一次），并给 13 个取证脚本统一注入 —— 闸门必须对「用户前台开着哪个应用」保持 hermetic。
+`verify_occlusion.py` **刻意不设**它（它就是测 A 的）。
+
+修完之后同一批脚本在**默认配置**下全绿：`repro_tremble far` 连跑 3 次 22 / 21 / 22 帧 PASS、
+`repro_tremble many` 21 帧 PASS、`verify_adaptive` PASS（降档 −26.1 MB / 回升 / 显存回收符合预期）。
+
+⚠ 归因过程中的一次误判，记下来当教训：`repro_tremble` 的帧数在**同一配置内**就能从 4 帧跳到
+17 帧（`cap` 段单圈阻塞 124 ms、`dda 2.6/s` —— 采集后端当时正处在 DDA
+`DuplicateOutput 拒绝访问 0x80070005` → 回退 WGC 的劣化窗口）。所以「帧数少」既可能是我们的 bug、
+也可能是机器窗口，**必须用「开关关掉 ≈ 改动前行为」做配对 A/B 才能归因**，不能看单次数字。
+
+## 五、回归与闸门（最终二进制）
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --release --workspace` | **186 passed**（基线 154） |
+| `cargo test --workspace`（debug，抓溢出 / `Instant` 下溢） | pass |
+| `cargo clippy --workspace --all-targets --release -- -D warnings` | exit 0，零 warning，未加任何 `#[allow]` |
+| `cargo fmt --all -- --check` / `node scripts/check.mjs` | exit 0 / 全绿 |
+| `verify_dirty` ×3 | **PASS ×3**（脏矩形 == 全量，逐位一致） |
+| `verify_validity` | PASS（**金字塔虚报有效 = 0 帧、该重画却漏掉的块 = 0 次**） |
+| `verify_mouse_isolation` | PASS（非 hover 块逐位不变，不变量 5 完好） |
+| `verify_crossscreen` | PASS（跨屏拖拽 + DPI 换算） |
+| `repro_tremble far` ×3 / `many` | PASS（22 / 21 / 22 帧、21 帧） |
+| `verify_adaptive` | PASS |
+| `ab_latency` / `ab_memory` | PASS / PASS（frost 全 158.6 MB vs 半 122.3 MB，差 −36.4 MB） |
+| `gate_perf` | **FAIL**（many-drag 59.2 < 60、lat=2 88.0 < 90）—— 归因见「三」，与本次改动无关 |
+| `api/` + `core/` 的 `unsafe` | 仍为 **0**；`core/` 的 `windows::` 仍为 **0** |
+| `RAW_TARGETS` | 仍是 4 个（`boot / verify / metrics / adaptive`） |
+
+## 六、还没做 / 已知取舍
+
+- **B2**（真正停止绘制被遮挡的块）：前置条件是 `gfx/compositor.rs` 的
+  `prev_rects.len() != cur_rects.len()` → **整屏 full redraw** 判据先改成按 id 差集，
+  并给「消失的块」补擦旧矩形（现在的脏区并集只遍历 `cur_rects`，消失块的旧像素不会被擦 ⇒ 残影）。
+  收益只在「遮挡是常态」（`AlwaysOnBottom`）时才盖得过这些代价。
+- 遮挡移开后 **≤125 ms** 内玻璃里是旧桌面（B1 停采的必然代价；恢复帧会取新桌面 + 整屏重画）。
+  要亚帧恢复得上 `SetWinEventHook`。
+- `WS_EX_LAYERED` / 异形窗口（`GetWindowRgn != RGN_ERROR`）一律不算遮挡者，即使 alpha=255 ——
+  方向保守（多渲染），代价是漏剔一部分。
+- **默认 `AlwaysOnTop` 层级下 B1 收益接近 0**（枚举几乎立刻在自家画布处终止，置顶玻璃本来就不该
+  被普通窗口遮住）。真正吃到收益的是 `Normal` / `ClickToFront` / `AlwaysOnBottom`。
+  **A 与层级无关，任何层级都生效。**
+- ~~**`fullscreen_app_on` 的误触发没有根治，本次只给取证加了后门**~~ → **已在下面「七」根治**
+  （真凶是 `Progman`，即 Windows 桌面本身，由 R-E1 的身份日志当场抓到）。原待办按性价比排序：
+  ① **日志里打出触发窗口的 class / title / rect** —— 现在连是谁触发的都不知道，
+     这是最该先做的一步（一行 `GetClassNameW`，只在翻转沿调用，不在热路径）；
+  ② 判据里加 `DWMWA_CLOAKED` 检查（B1 的 `platform/occlusion.rs` 已有现成写法），
+     排除「存在但不可见」的 UWP 壳窗口；
+  ③ 用**桌面更新速率**区分游戏与静态应用（游戏/视频持续高频重绘，编辑器不会，
+     而 `dda_acq` / `dda_changed` 我们本来就在统计）。
+  ⚠ **不要**用「该窗口必须在我们画布之上」当判据：真游戏在无边框全屏时同样位于我们
+  TOPMOST 画布之下，加这条等于把 R-16 整个废掉。（我先前提过这个方向，是错的，已撤回。）
+- 某一次 S1 观测到 `prep` 段单圈 **3061 ms**（`loops=2 / win_s=6.12`）的**非复现**瞬时 stall；
+  同刺激重跑 prep 只有 0.039~0.078 ms。归因未确认（当时桌面更忙、同窗 `msg` 段也飙到 415 ms，
+  怀疑 USER/GDI 全局锁竞争）。已把它变成 `verify_occlusion.py` 的**常驻断言**
+  （`prep` 单圈中位 > 20 ms 即 FAIL），复发会被自动抓到而不是等人肉眼发现。
+
+## 七、追加轮 R-E：`fullscreen_app_on` 误触发（身份日志当场抓到真凶）
+
+第六节留的待办 ① 一做完，真凶立刻现形。给命中日志加上触发窗口身份后重跑取证，
+**S0 基线阶段**（脚本没有创建任何探针窗口）就打出：
+
+```
+[info] \\.\DISPLAY1 检测到独占全屏应用，暂时隐藏玻璃：class=Progman title="Program Manager" rect=[0, 0, 5040, 2080]
+```
+
+**是 Windows 桌面本身**。`Progman` 的样式是 `WS_POPUP` 且无 caption/thickframe，rect 铺满整个
+虚拟屏（3120x2080 + 1920x1080 = 5040x2080），**三条形状判据全中**；而「没有别的窗口持有焦点」时
+它就是前台窗口 —— 用户**点一下壁纸、或把所有窗口最小化**，玻璃就消失并整屏停产。
+取证期间被它命中三次；第四节那两轮 `repro_tremble` / `verify_adaptive` 的失败**全部**由它引起
+（当时被误当成 A/B1 的回归，是靠 `GLASS_OCCLUSION=0` + `GLASS_FS_HIDE=0` 的配对 A/B 才排除掉我们的代码）。
+cloaked 否决挡不住它（它没被 cloak），只能在**身份**这一层排除。
+
+修法（四项，全部零风险）：
+
+| # | 改动 | 为什么零风险 |
+|---|---|---|
+| R-E1 | `fullscreen_app_on` 改返回 `Option<HWND>`，命中日志追加 `class`/`title`/`rect`（只在**翻转沿**由 `window_desc()` 构造，4 Hz 轮询路径仍零分配） | 纯观测。原句「检测到独占全屏应用，暂时隐藏玻璃」原文保留，`verify_occlusion.py` 的 `MARKS["fs_on"]` 子串匹配不受影响 |
+| R-E2 | 否决 cloaked 窗口（`DWMWA_CLOAKED`）。**查询失败时当未 cloaked**、维持既有判定 | 只有确知 cloaked 才否决 ⇒ 对真游戏零影响。与遮挡扫描的保守方向**相反**，故共享的 `dwm_cloaked()` 返回 `Option<bool>`，方向由调用方决定（单一来源，不写死在 helper 里） |
+| R-E2b | 身份排除加 `fg == GetShellWindow()`。抽成纯函数 `is_non_candidate_foreground(fg, mon_hwnd, shell)` | 桌面在 z 序最底、盖不住任何东西，不可能是「独占全屏应用」。`GetShellWindow()` 失败时该条**自动失效**、退化成修复前行为，不会把所有窗口都当成桌面（那会让 R-16 整个失效） |
+| R-E3 | `EngineConfig.fullscreen_hide: bool`（默认 `true`），与 `GLASS_FS_HIDE=0` 取「与」 | 默认值不变 ⇒ 既有行为不变；上层多了个正式开关（此前只有取证后门） |
+
+**第六节待办 ③（用桌面更新速率区分游戏）仍然不做**：需要调阈值，且暂停/菜单画面的真游戏
+重绘率也很低 ⇒ 会漏检。R-E2b 已解决实测到的真凶，没有证据支持继续加启发式。
+同理，**「该窗口必须在画布之上」这个方向是错的**（真游戏同样在我们 TOPMOST 画布之下），已撤回。
+
+### R-E 的验收
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --release --workspace` | **197 passed**（186 → 193 → 197） |
+| `cargo clippy --workspace --all-targets --release -- -D warnings` / `fmt --check` / `node scripts/check.mjs` | exit 0 / exit 0 / 全绿 |
+| **AC16（R-16 正当场景未被废掉）** | `verify_occlusion.py` **8/8 PASS**：S4（真·无边框全屏窗口）与 S6（layered 解耦）仍 `dda=0.0 / fps=0.0 / passA=0.00 / loop_hz=120` |
+| **AC18（Progman 不再误判）** | 同一轮日志里 **Progman 命中 0 次**；S0 基线阶段不再出现 `fs_on`（修复前 S0 就被它打断，并连带让 S2/S7 假 FAIL） |
+| AC7（`--off`） | **5/5 PASS** |
+| 新增单测 | `is_fullscreen_shape` 5 条、`is_non_candidate_foreground` 4 条、`wide_len` 1 条、`fullscreen_hide` serde 1 条 |
+
+⚠ **R-E 之后 `repro_tremble far/many` 与 `verify_adaptive` 仍 FAIL（连拍 2~3 帧），但这一轮数据作废**：
+同窗实测机器健康判据 `rel_max = 152 / 332 / 366 / 279 ms`，而 `measurement-and-gates §1`
+要求 **< 5 ms**（超 30~70 倍）⇒「不满足则数据作废，不得下结论」。
+且这两个脚本都带 `GLASS_FS_HIDE=0`，那个 4 Hz 检测块**整块被跳过**，R-E 的改动在里面完全惰性，
+逻辑上不可能是 R-E 造成的。它们在 A+B1 二进制、健康窗口下的通过记录见第五节
+（`repro_tremble far` 22/21/22 帧、`many` 21 帧、`verify_adaptive` 降档 −26.1 MB）。
+**待办：在健康窗口用最终二进制复跑这三个脚本 + `gate_perf` 做最终确认。**
+
+### 后续更正（同日，最终 R-E 二进制）
+
+上面那条 ⚠ 已经查清并推翻，记在这里免得后人被误导：
+
+1. **真凶是 `Progman`（Windows 桌面本身）**，由 R-E1 新加的身份日志当场抓到 ——
+   见本节开头。修掉（R-E2b 身份排除）之后，`repro_tremble far` **18 帧 PASS**、
+   `many` **18 帧 PASS**、`verify_adaptive` **PASS**（降档 −26.1 MB / 回升 / 显存回收符合预期），
+   全部用最终 R-E 二进制。所以那两轮 FAIL 是 **`Progman` 误报 + 机器劣化叠加**，
+   与 A/B1/R-E 的实现都无关。
+2. 更正一处措辞：那两个脚本带 `GLASS_FS_HIDE=0`，检测块整块跳过，所以当时它们**不是**被
+   `Progman` 误报打死的（那是 `verify_occlusion.py` 的事）；它们纯粹是被劣化窗口打死的。
+   两条原因分开成立，别混成一条。
+3. 但今天的机器窗口**此后持续恶化**：`rel_max` 11~34 ms（门槛 < 5 ms），
+   single-drag `p50` 从 8.35 ms 恶化到 **173.66 ms**、`p95` **502.78 ms**，
+   而 `own_us` 只有 **114 µs** —— 时间全在阻塞等待（采集 / Present / DWM），不是我们的代码。
+   按 `measurement-and-gates §1`「不满足则数据作废」，**停止强行取绿**。
+4. 仍待健康窗口用最终二进制复跑：`verify_dirty` ×3、`verify_validity`、
+   `verify_mouse_isolation`、`verify_crossscreen`、`gate_perf`。
+   这四项在 A+B1 二进制上已通过（见第五节）；R-E 对它们的唯一实际差异是
+   `platform/occlusion.rs` 改调共享的 `display::dwm_cloaked`（`unwrap_or(true)`
+   语义逐字保持的纯重构）。`gate_perf` 的 `many-drag >= 60` 在今天所有可用窗口里
+   都是 59.2 / 57.2，且 `GLASS_OCCLUSION=0` 时逐位相同 ⇒ 与本次改动无关（第三节）。
+## 八、最终二进制（A + B1 + R-E）的收口状态
+
+### 已通过
+
+| 项 | 结果 |
+|---|---|
+| `cargo test --release --workspace` | **197 passed**（154 → 180 → 186 → 193 → 197） |
+| `cargo clippy --workspace --all-targets --release -- -D warnings` / `cargo fmt --all -- --check` / `node scripts/check.mjs` | exit 0（零 warning，未加 `#[allow]`）/ exit 0 / **全绿** |
+| `verify_dirty` ×3（spec 要求 ≥3 次） | **PASS ×3，差异像素全部 = 0**（含跨屏两屏） |
+| `verify_validity` | PASS：**金字塔虚报有效 = 0 帧、该重画却漏掉的块 = 0 次** |
+| `verify_mouse_isolation` | PASS：闭包外 0 块 0 差异；被拖块差异 > 0 |
+| `verify_crossscreen` | PASS |
+| `repro_tremble far` / `many` | PASS（18 帧 / 18 帧） |
+| `verify_adaptive` | PASS（降档 −26.1 MB / 回升 / 显存回收符合预期） |
+| `ab_latency` / `ab_memory` | PASS / PASS（frost 全 158.6 MB vs 半 122.3 MB，差 −36.4 MB） |
+| `verify_occlusion.py` | **8/8 PASS**；`--off` **5/5 PASS**；日志里 Progman 命中 **0** 次 |
+| `api/`+`core/` 的 `unsafe` / `RAW_TARGETS` | 仍为 **0** / 仍是 4 个 |
+
+⚠ 上述像素/正确性取证有一部分是在**机器劣化**的窗口里跑的，但结论仍然有效 ——
+劣化只拉低帧数与阈值型数字，不影响「同进程两帧逐位相等」「计数器为 0」这类**等价关系**判据
+（口径见 `.trellis/spec/backend/measurement-and-gates.md §1.2`）。
+`repro_tremble` 是其中唯一依赖帧数的，它拿到 18 帧、达标。
+
+## 九、`gate_perf`：重启后拿到的有效测量
+
+重启后**第一次**跑就是全天唯一一份健康数据（`dda 76~115/s`、`p50` 全部贴着 vsync）：
+
+| 用例 | 重启后第 1 轮（A+B1 开启） | 2026-10-21 基线 | 门槛 / 判定 |
+|---|---|---|---|
+| single-drag (lat=1) | **115.2** / p50 8.32 / CPU 2.19% | 110.2 / 8.34 / 11.87% | ≥90 且 ≤9.0 ms ⇒ **PASS** |
+| many-drag (lat=1) | **59.2** / 16.66 / CPU 5.47% | 60.9 / 16.66 / 16.25% | ≥60 ⇒ **FAIL，差 0.8** |
+| many-drag (lat=2, 合成负载) | **106.9** / 8.87 | 97.8 / 8.98 | ≥90 ⇒ **PASS** |
+| transparent-drag | **94.0** / 8.36 / Private 120.8 | 93.8 / 8.34 / 121.8 | ≥90 且 <200 MB ⇒ **PASS** |
+
+四条硬门槛过三条，只剩 `many-drag >= 60` 差 0.8 fps。**这 0.8 不是本次改动造成的**：
+
+1. **同机同会话的配对 A/B**：`GLASS_OCCLUSION=0` 时 `many-drag` 是**逐位相同的 59.2**
+   （今天另一次健康窗口也是 59.2）。
+2. **`just_activated` 那次 `invalidate()` 单独论证过它是惰性的** —— 它**不受**
+   `GLASS_OCCLUSION` / `GLASS_FS_HIDE` 控制，是上面那条 A/B 唯一没覆盖到的改动，所以必须单独说：
+   `just_activated = has_blocks && mon.idle_capturing`，而四个场景里
+   `needs_backdrop_now` 恒真（single/many）或恒假（transparent），`idle_capturing`
+   不会在测量窗口内翻转；只有「启动时块刚出现」那一次边沿，落在 warmup 之外。
+   真正会触发它的跨屏场景由 `verify_crossscreen` 覆盖，PASS。
+3. 基线 60.9 本身只比门槛高 **1.5%** ⇒ 这条门槛在这台机器上没有余量。
+
+**机器状态时间线（免得后人误读）**：重启后第 1 轮 = 全天最好（115.2 / 59.2 / 106.9 / 94.0）；
+之后每轮单调恶化 —— 第 2 轮 many 40.8，第 3 轮 single 80.4 / many 46.7 / lat2 64.4。
+这是开机后后台任务（索引、杀软、更新）逐渐爬升的典型形状，**不是代码退化**：
+同一轮里 `own_us` 始终 32~48 µs（我们自己的每帧工作），变化全在阻塞等待与 `dda/s`。
+⇒ **性能取证要在重启后尽快跑，越晚越差。**
+
+**结论与后续**：`many-drag >= 60` 处于机器能力边缘且已证明非本次回归，当作**独立议题**处理 ——
+要么承认基线随机器漂移、重新标定该门槛，要么把它改成相对量（如同机 A/B 不劣化 >3%）。
+
+## 十、A/B1 的**收益**直接测量（进程 CPU，轮转 A/B ×2 取中位数）
+
+前面几节证明的是「机制生效」（`dda_acq` / `pass_a_mpx_avg` 归零）。这一节量的是
+「归零到底换来了多少 CPU」，用 `OpenProcess` + `GetProcessTimes` 只取**被测进程自己**的
+CPU 时间，故 Python 侧泵消息不污染读数。
+
+场景：一块默认玻璃 + 一个不透明覆盖窗口（10 Hz 闪动，制造持续桌面脏区）；
+`GLASS_FS_HIDE=0` 固定，故测的是 **B1** 单独的效果。
+
+| 场景 | CPU% 单核 | dda/s | fps | passA Mpx |
+|---|---|---|---|---|
+| 无遮挡（玻璃可见，桌面 115 次/秒在变） | **11.36** | 115.6 | 115.6 | 1.83 |
+| 遮挡 + **剔除开** | **0.95** | **0.0** | **0.0** | **0.00** |
+| 遮挡 + 剔除关（≈改动前行为） | 1.47 | 10.8 | 10.8 | 1.19 |
+
+- **玻璃被完整遮住时的总开销：11.36% → 0.95% = −92%**（约 12 倍）。这是 A/B1 联合的收益量级。
+- **B1 单独**（同场景开/关对照）：1.47% → 0.95% = **−35%**；采集 10.8 次/秒 → 0、
+  Pass A 1.19 Mpx/帧 → 0。两轮独立重复方向一致（轮1 1.04→0.69，轮2 1.91→1.22）。
+
+### ⚠ 一个反直觉发现：停采**不是无条件更省**
+
+第一版测量脚本用 `time.sleep` 而不是泵消息，覆盖窗口的闪动**没被驱动** ⇒ 桌面静止
+（`dda` 只有 1.1/s），结果反过来了：
+
+| 桌面状态 | 剔除开 | 剔除关 |
+|---|---|---|
+| **静止**（无脏区） | 1.17% | **0.68%**（更低！） |
+| **活跃**（10.8 次/秒脏区） | **0.95%**（更低） | 1.47% |
+
+原因：停采后主循环落到 `!need_render` 分支的 `IDLE_WAIT_MS`(8 ms) 睡眠下限 =
+**125 次/秒唤醒**；而继续采集时是**阻塞在采集后端的内核等待里**，几乎不耗 CPU。
+所以「桌面本来就安静」时，停采反而比傻等贵一点点（0.5 个百分点，可忽略但符号是反的）。
+
+⇒ 正确的表述是：**A/B1 省的是「桌面在变、而玻璃看不见」那部分工作**，
+不是「任何时刻都更省」。桌面静止时本来也没有这部分工作可省。
+这也解释了为什么第一版脚本会测出反向结果 —— 它测的正是那个没有收益可拿的场景。
+
+### 测量方法教训（写给下一个人）
+
+测「省掉多少活」之前，必须先证明**两边都有活可省**：本例的判据是
+`dda/s` 在剔除关那一臂必须显著 > 0（这里 10.8/s）。第一版它只有 1.1/s，
+说明我的刺激（覆盖窗口闪动）没生效，测出来的比较无意义。
+凡是"A 比 B 省"的结论，都要先看 B 那一臂的工作量计数器是不是真的非零。
+
+## 十一、性能阀门改成两档（相对 A/B）之后，重跑仍然不可信
+
+§十 之后把 `gate_perf.py` 改成「相对 A/B 优先、绝对回退」（动因与做法见 CHANGELOG 与
+`measurement-and-gates §4`）。用 0.4.1 干净构建做的参考二进制实测两臂：
+
+| 尝试 | 结果 | 臂内散布 |
+|---|---|---|
+| REPS=2（改动后首跑） | single 新 95.3 vs 参考 93.0；many 新 74.2 vs 参考 **63.1**（"新臂莫名快 17.6%"）；transparent 新 89.2 vs 参考 93.3 → 表面劣化 4.4% | 未测量（当时还没有 `spread_pct`） |
+| REPS=3 + 散布测量 | 判 **「结果不可信」** | **22~130%** |
+
+⇒ **今天这台机器已进入完全不可用的性能取证状态**（散布比门槛大一个数量级），
+唯一两份有效数据是 §九 那份（重启后首轮）与 §十 的 CPU A/B。
+这反过来验证了新设计是必要的：旧闸门在 22~130% 的散布上会**毫不犹豫地签字或毫不犹豫地否决**，
+而现在它说"不可信，去换个窗口"。
+
+`many-drag >= 60` 的重新标定**没有做**（不做是为了不削弱闸门）：
+现在由相对档接管，绝对值降级为"该重新标定"的提示。若将来确认新档稳定，
+再把绝对表按新机器实测重标一次，而不是就地放宽。

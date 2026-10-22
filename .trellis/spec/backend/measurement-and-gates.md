@@ -80,6 +80,48 @@ cargo run --release --bin liquid-verre-playground -- --port 8787    # 手动看�
 > `performance_report.md`（阈值变更另见 §6）。CI 绿只代表「编译 / 单测 / 静态检查 / crate 可打包」，
 > **不代表视觉与性能没回归**；合并前的视觉与性能结论仍以本机取证为准。
 
+### 1.1 取证必须对「用户前台开着哪个应用」保持 hermetic（`GLASS_FS_HIDE=0`）
+
+`platform::display::fullscreen_app_on` 的形状判据是「前台窗口 = `WS_POPUP` 且无
+caption/thickframe 且铺满整块屏」，而**无边框最大化的普通应用**（Electron / Tauri 那一类：
+ChatGPT 桌面版、VS Code、app-mode 浏览器）完全符合这个形状。命中后画布被隐藏，
+且（0.4.2 起）**整屏停产** —— 于是取证脚本会在「前台恰好是这类应用」时拿到 0 帧连拍
+并整批假 FAIL（实测 `repro_tremble far/many` 只有 0~1 帧、`verify_adaptive` 报「未观察到降档」）。
+
+因此 `tools/` 下所有像素 / 性能脚本都必须设 **`GLASS_FS_HIDE=0`**（已注入 13 个脚本），
+唯一例外是 `tools/verify_occlusion.py` —— 它就是测这条停产门的，刻意不设。
+
+⚠ 同类陷阱：**帧数 / fps 偏低不一定是代码问题**。同一配置内 `repro_tremble` 的连拍帧数
+能从 4 帧跳到 17 帧（采集后端处在 DDA `DuplicateOutput 拒绝访问 0x80070005` → 回退 WGC 的
+劣化窗口时，`cap` 段单圈阻塞 124 ms、`dda` 只有 2.6/s）。归因必须用
+「把开关关掉 ≈ 改动前行为」做**配对 A/B**（`GLASS_OCCLUSION=0` + `GLASS_FS_HIDE=0`），
+不能看单次数字下结论。
+
+⚠ 取证脚本自己的窗口也是负载源：一个铺满屏的探针窗口若**整窗** 10 Hz 重画，
+等于每秒 6500 万像素的 GDI 填充，足以把机器打成劣化窗口（实测 `loop_hz` 掉到 2、
+`max_loop` 913 ms）。只需要「桌面有脏区」时，闪一小块就够（`verify_occlusion.py`
+闪屏幕正中 96x96、两色只差 1 LSB）。
+
+### 1.2 劣化窗口里哪些判据仍然有效（不要一刀切地全部重跑）
+
+§1 的 `rel_max < 5 ms` / `acq_max < 25 ms` 作废的是**阈值型**数字。判据要分两类看：
+
+| 类别 | 例子 | 劣化窗口下 |
+|---|---|---|
+| **等价关系型**（同一进程内两帧逐位相等、计数器必须为 0） | `verify_dirty`（增量 == 全量）、`verify_validity`（虚报/漏画计数）、`verify_mouse_isolation`（闭包外逐位一致）、`cmp_visual` 的开关 A/B | **仍然有效** —— 机器慢只减少帧数，不会让「两帧相等」变成「不相等」；反而要注意别把「样本太少」误读成「通过」 |
+| **帧数依赖型**（需要足够多的连拍样本） | `repro_tremble`（连拍帧数有下限） | **看帧数**：帧数达标则结论有效，未达标是「无法分析」而不是 FAIL |
+| **阈值型**（fps / p50 / CPU / Private 对标固定门檻） | `gate_perf`、`ab_latency`、`measure_*` | **一律作废**，不得下任何结论 |
+
+所以劣化窗口里正确的动作是：**继续跑等价关系型，停止重试阈值型**，并且把「为什么这一项没取到
+有效数据」连同**配对 A/B 的排除证据**一起记下来（形式：把特性全关 ≈ 改动前行为，
+若数字同样烂，即证明瓶颈在机器不在代码 —— 实测 `own_us` 73 vs 78 µs、
+15.9 vs 18.8 fps，关掉代码机器照样 15.9 fps）。
+
+⚠ **顺序纪律**：阈值型取证**独占机器**。`cargo build` / `cargo test` / 子代理编译
+都会把窗口打成劣化（实测反复出现），所以「先跑完 `gate_perf`，再跑任何会触发编译的东西
+（包括 `trellis-check`）」。重启机器后第一件事就是 `gate_perf`，此时 `target/` 里的产物还在，
+不需要重新构建。
+
 ## 2. 统计规则
 
 - 一律**轮转交错 + ≥3 重复 + 中位数/p95**；均值在 10~100 loops/窗口 下无意义。
@@ -168,7 +210,34 @@ cargo run --release --bin liquid-verre-playground -- --port 8787    # 手动看�
 默认 `corner_radius = 32.0` ⇒ 20 块全部 32。这是需求 F1「全部参数配置化」的直接结果，
 **不是回归**，但跨版本比对 many 布局时圆角带必然不同。
 
-## 4. 阀门与阈值（`tools/gate_perf.py`）
+## 4. 阀门与阈值（`tools/gate_perf.py`）—— 两档判定
+
+### 4.1 为什么改成两档
+
+绝对阈值（`many-drag >= 60` 等）在这台机器上**没有余量**：0.4.1 基线记录 60.9，
+而机器状态一漂移就落到 59.2；实测**关掉被测特性后逐位相同 59.2** ⇒ 那 0.8 不是回归，
+是尺子贴到了机器能力线。把绝对值调低来放行等于**静默削弱闸门**（下次真回归就不响了）。
+正解是「和同一台机器上的上一个版本比」。
+
+### 4.2 档位
+
+| 档 | 触发条件 | 硬判据 | 绝对值 |
+|---|---|---|---|
+| **相对 A/B** | 设了 `VERRE_OLD_EXE` 且文件存在 | 每个场景 `REPS` 轮 x 2 臂（**奇偶轮反序**抵消漂移）取中位数，新臂 fps 劣化 > `GATE_REL_MAX`（默认 3%）判 FAIL；`Private >= 200 MB` 恒为硬判据 | 只打印 + `ABS-DRIFT` 提示"该重新标定"，**不决定结论** |
+| **绝对（回退）** | 没设 / 文件不存在 | 沿用 4.3 的绝对门槛表；`Private` 同样硬判 | 就是判据本身 |
+
+**噪声优先于结论**：`spread_pct`（逐轮 fps 的 max-min/中位数）取两臂较大者，
+若 `散布 >= 劣化 x 0.8` ⇒ 判 **「结果不可信」并 FAIL**，措辞明确要求"换健康窗口重跑或加轮次"，
+**既不许宣布回归、也不许签字放行**。没有这条，3% 门槛在噪声 17% 的窗口里等于抛硬币
+（实测被"新臂莫名快 17.6%"骗过一次，也是 `REPS` 默认从 2 提到 **3** 的原因 ——
+2 轮不是省时间，是判据失效）。
+
+`tools/test_gate_logic.py`（纯逻辑、秒级、不启动 EXE）钉住 19 条判定路径：
+两档各自的通过/抓出、"判回归"与"判不可信"互斥、新臂更快不判失败、
+`Private` 在两档下都硬判、`REPS>=3`、`spread_pct` 的除零/单样本边界。
+**改 `gate_perf.py` 的判定必须同步跑它。**
+
+### 4.3 绝对门槛表（回退档；也是相对档的"该重新标定"参照）
 
 四个场景：`single-drag`（lat 默认 1）、`many-drag`（lat 默认 1）、
 `many-drag` + `GLASS_FRAME_LATENCY=2` + `GLASS_SIM_BACKDROP=900x700@120`、
@@ -192,6 +261,17 @@ cargo run --release --bin liquid-verre-playground -- --port 8787    # 手动看�
 
 每次运行都输出 `dda_acq` / `dirty_mpx_avg` / `own_us`（= `stage_us[0]+[1]+[3]` 的中位数），
 用于区分「我们慢」与「桌面 / DWM 忙」。
+
+### 4.4 参考二进制怎么来
+
+```powershell
+git worktree add ..\tarui-glass-ref <上一个发布的 tag 或 commit>
+cd ..\tarui-glass-ref; cargo build --release -p liquid-verre-playground
+# 拷出去后删掉 worktree，别把 1MB 二进制提交进仓库
+Copy-Item target\release\liquid-verre-playground.exe ..\gate-ref\liquid-verre-playground-x.y.z.exe
+git worktree remove --force ..\tarui-glass-ref
+$env:VERRE_OLD_EXE="..\gate-ref\liquid-verre-playground-x.y.z.exe"; python ..\tarui-glass\tools\gate_perf.py
+```
 
 ## 5. 提交前最小集合
 
