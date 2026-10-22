@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/measurement-and-gates.md", "reason": "闸门命令、阈值、被测 EXE 路径与 cmp_visual 口径"}
+{"file": ".trellis/spec/backend/rendering-pipeline.md", "reason": "9 条不变量逐条复核（尤其不变量 5 影响盒单一出口与脏区账本）"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "禁止/必须模式复核 + 新参数是否需要同步 playground schema"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "确认没有新增 RAW_TARGETS、热路径没有格式化日志"}
+{"file": ".trellis/spec/guides/graphics-change-checklist.md", "reason": "改管线后 11 问复核"}

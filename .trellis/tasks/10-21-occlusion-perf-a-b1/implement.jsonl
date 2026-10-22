@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/rendering-pipeline.md", "reason": "逐帧管线契约与 9 条不变量：停产门必须落在帧首门控之内，脏区/有效性账本语义不得改变"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "分层边界：新增 Win32 枚举只能进 platform/，纯几何与状态机只能进 core/，api 与 core 必须 0 unsafe"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "禁止/必须模式：热路径零堆分配、值类型不加 non_exhaustive、Instant 相减用 checked_sub"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "前缀即接口：不得新增 RAW_TARGETS，翻转沿日志走级别名"}
+{"file": ".trellis/spec/backend/graphics-d3d11-gotchas.md", "reason": "D3D11/DXGI 静默陷阱：涉及采集停摆与恢复帧的账本诚实性"}
+{"file": ".trellis/spec/guides/graphics-change-checklist.md", "reason": "改管线前 11 问：影响盒单一出口、debug 构建 panic、取证口径"}
