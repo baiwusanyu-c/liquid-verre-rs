@@ -8,7 +8,7 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
-## [0.4.2-unreleased]
+## [0.4.2] - 2026-10-23
 
 ### Added
 - **逐块遮挡剔除（B1）**：被「z 序在画布之上、且不透明」的窗口**完整覆盖**的玻璃块，
