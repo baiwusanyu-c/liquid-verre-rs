@@ -207,3 +207,52 @@ border 加粗根因定位（band 渐隐改实芯+AA，像素剖面与 4x 取证�
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: 遮挡优化 A+B1：隐藏屏停产与逐块摘触发源（含 Progman 误判修复、性能阀门两档化）
+<!-- trellis-session: v=2 fp=767fd6ad6f71298d -->
+
+**Date**: 2026-10-23
+**Task**: 遮挡优化 A+B1：隐藏屏停产与逐块摘触发源（含 Progman 误判修复、性能阀门两档化）
+**Branch**: `master`
+
+### Summary
+
+落地遮挡优化 A（hidden_fs 升级为停产门）+ B1（被完整遮挡的块不再驱动采集与光标触发源，不改绘制集合），并修掉身份日志当场抓到的 Progman 误判；性能阀门改成两档判定，重标了压在量化悬崖上的 many-drag 门槛。全程取证通过。
+
+### Main Changes
+
+- A：hidden_fs 从「可见性位」升级为「停产门」—— 采集段与渲染段整屏跳过，恢复走 invalidate() + ready=false 的既有采集失效路径，零陈旧帧
+- B1：platform/occlusion.rs 的 8 Hz z 序扫描 + core 的 rect_fully_covered / occlusion_step —— 被不透明窗口完整覆盖绘制矩形的块不再计入 wants_bd 与 mouse_relevant，不改绘制集合
+- 顺带修：屏从停采恢复那一帧现在会 compositor.invalidate()（遮挡移开与全屏退出都不经过 Command，原「靠 commands 层兜底」已不成立）
+- fullscreen_app_on：命中日志打出触发窗口 class/title/rect（新增 fullscreen_app_on 返回 Option<HWND>）+ cloaked 否决 + 排除 Progman 桌面本身 + 新增 EngineConfig.fullscreen_hide
+- gate_perf 改成两档判定（有 VERRE_OLD_EXE 走同机 A/B 相对不劣化，否则退回绝对门槛）+ spread_pct 噪声可辨识度 + REPS 默认 3 + GATE_SECONDS
+- 重标 many-drag(lat=1)：fps>=60 改为 fps>=55 且 p50<=17.5ms（p50 恒为 2 个 vsync、0.4.1 参考臂同一机器只有 59.3），p50 那条是防回归主力
+- 新增 tools/verify_occlusion.py（八阶段）与 tools/test_gate_logic.py（21 条纯逻辑用例）；12 个取证脚本补 --no-browser
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6e88cfb` | pref: 遮挡不绘制优化 |
+| `7219a6c` | pref: 遮挡不绘制优化 |
+| `31aea6f` | fix(tools): 取证脚本补 --no-browser；gate_perf 两档判定并重标 many-drag 门槛 |
+
+### Testing
+
+- [OK] cargo test --release --workspace 197 passed；clippy -D warnings / fmt --check / node scripts/check.mjs 全绿
+- [OK] verify_occlusion.py 8/8 PASS，--off 5/5 PASS；AC2/AC6 像素取证差异像素均为 0
+- [OK] BASELINE 八项回归（verify_dirty x3、verify_validity 虚报 0/漏画 0、verify_mouse_isolation、verify_crossscreen、repro_tremble far/many、verify_adaptive、ab_latency、ab_memory）全 PASS
+- [OK] 遮挡场景进程 CPU 11.36% -> 0.95%（-92%，约 12 倍）；B1 单独 1.47% -> 0.95%（-35%），两轮重复同向
+- [OK] gate_perf 相对 A/B 与绝对档在干净机器上均 PASS（退出码 0）：116.0 / 61.4 / 105.2 / 93.5 fps，own_us 14~36 us
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- B2（真正不绘制被遮挡的块）留待独立任务：前置是 gfx/compositor.rs 的 prev_rects.len() != cur_rects.len() 整屏重画判据先改成按 id 差集，并给消失的块补擦旧矩形
+- fullscreen_app_on 再误报时先看新日志里的窗口身份；不要采用「该窗口必须在画布之上」这条判据（真游戏同样在 TOPMOST 画布之下，会把 R-16 废掉）
+- 可选：SetWinEventHook 做亚帧恢复，替代当前 8 Hz 轮询带来的 ≤125 ms 陈旧桌面窗口
+- 一次非复现的 prep 单圈 3061 ms stall 归因未确认，已变成 verify_occlusion 的常驻断言（prep 中位 > 20 ms 即 FAIL），复发可自动抓到
