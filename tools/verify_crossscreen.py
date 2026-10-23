@@ -55,7 +55,9 @@ LOG = os.path.join(ROOT, "tools", "cross.log")
 if os.path.exists(LOG):
     os.remove(LOG)
 logfh = io.open(LOG, "wb")
-p = subprocess.Popen([EXE], env=env, cwd=ROOT, stdout=subprocess.DEVNULL,
+# ⚠ 必须 --no-browser：panel.rs 在不带它时会 `cmd /c start` 打开浏览器，而 playground 被
+# terminate 后标签页不会关 => 每次采样累积一个页面，CPU/内存被浏览器吃掉、浏览器还抢前台（前台一被交还就可能落到 `Progman` 上，连带触发独占全屏检测）。
+p = subprocess.Popen([EXE, "--no-browser"], env=env, cwd=ROOT, stdout=subprocess.DEVNULL,
                      stderr=logfh)
 # 等两块屏的画布都真正显示出来再开始拖，否则按下时窗口还不存在。
 t0 = time.perf_counter()

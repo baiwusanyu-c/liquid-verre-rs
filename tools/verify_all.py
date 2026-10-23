@@ -72,7 +72,9 @@ def run(exe, tag, env_extra, seconds, wait_files):
     # 这里补齐其余脚本。
     env["GLASS_ADAPTIVE"] = "0"
     env.update(env_extra)
-    p = subprocess.Popen([exe], env=env, cwd=ROOT, stdout=subprocess.DEVNULL,
+    # ⚠ 必须 --no-browser：panel.rs 在不带它时会 `cmd /c start` 打开浏览器，而 playground 被
+# terminate 后标签页不会关 => 每次采样累积一个页面，CPU/内存被浏览器吃掉、浏览器还抢前台（前台一被交还就可能落到 `Progman` 上，连带触发独占全屏检测）。
+    p = subprocess.Popen([exe, "--no-browser"], env=env, cwd=ROOT, stdout=subprocess.DEVNULL,
                          stderr=subprocess.PIPE)
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < seconds:

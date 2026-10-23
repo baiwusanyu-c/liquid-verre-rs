@@ -105,8 +105,50 @@ def main():
     check("[相对] 参考臂缺失时退回绝对档不崩", True)
 
     # ---- 2. 绝对回退档 ----
+    # 2026-10-23 重标后 `many-drag` 的绝对判据是「fps >= 55 且 p50 <= 17.5 ms」。
+    # 旧判据 fps >= 60 压在 2-vsync 量化悬崖上（p50 恒为 16.66 ms => 上限 60.0 fps），
+    # 0.4.1 参考臂在同一台干净机器上实测 59.3 也过不了 => 那是门槛定错，不是代码慢。
+    # 下面三条把新判据的两面和**主力那面**都钉住。
     rc, f, w, d = run_main(dict(BASE, **{"many-drag": 59.2}), BASE, with_ref=False)
-    check("[绝对] 59.2 => 抓出 many-drag < 60", rc == 1 and any("20 块默认档" in x for x in f), str(f))
+    check("[绝对] 59.2/正常节拍 => 不再假 FAIL（重标的理由）", rc == 0 and not f, str(f))
+
+    def rec_p50(fps, p50):
+        return {"fps": fps, "p50": p50, "p95": 15.0, "cpu": 3.0,
+                "priv": 150.0, "dda": 100.0, "dirty": 2.0, "own": 40.0}
+
+    def fake_p50(target, p50):
+        def go(case=None, extra=None, seconds=None, exe=None):
+            lat2 = case == "many-drag" and bool(extra and extra.get("GLASS_FRAME_LATENCY") == "2")
+            key = "many-drag-lat2" if lat2 else case
+            return rec(target[key]["fps"], target[key]["p50"])
+        return go
+
+    # 节拍从 16.66 滑到 25 ms（= 3 个 vsync）而 fps 仍蹭到 55 以上：必须 FAIL。
+    # 这条是防回归的主力 —— 旧判据只看 fps 时，这种退化会被抖动的 fps 完全掩盖。
+    tgt = dict(BASE); tgt["many-drag"] = {"fps": 56.0, "p50": 25.0}
+    gp.run = lambda **kw: None
+    base_run = fake_p50(tgt, 25.0)
+    # 直接构造一臂样本走真实判定路径：用 with_ref=False 的绝对档最省事
+    ns_local = {"gp": gp}
+    def run_abs_override(scene_fps_p50):
+        def go(case=None, extra=None, seconds=None, exe=None):
+            lat2 = case == "many-drag" and bool(extra and extra.get("GLASS_FRAME_LATENCY") == "2")
+            key = "many-drag-lat2" if lat2 else case
+            fp, pp = scene_fps_p50.get(key, (100.0, 8.4))
+            r = rec(fp); r["p50"] = pp; return r
+        gp.run = go
+        buf = io.StringIO(); real = sys.stdout; sys.stdout = buf
+        try:
+            os.environ.pop("VERRE_OLD_EXE", None)
+            rc = gp.main()
+        finally:
+            sys.stdout = real
+        return rc, [l for l in buf.getvalue().split("\n") if l.startswith("FAIL:")]
+    rc, f = run_abs_override({"many-drag": (56.0, 25.0)})
+    check("[绝对] 节拍滑到 3 个 vsync(25ms) => 抓出（主力判据）",
+          rc == 1 and any("20 块默认档" in x for x in f), str(f))
+    rc, f = run_abs_override({"many-drag": (54.0, 8.4)})
+    check("[绝对] fps 54 (<55) => 抓出", rc == 1 and any("20 块默认档" in x for x in f), str(f))
     rc, f, w, d = run_main(BASE, BASE, with_ref=False)
     check("[绝对] 全 100 => PASS", rc == 0 and not f, str(f))
     rc, f, w, d = run_main(dict(BASE, **{"single-drag": 80.0}), BASE, with_ref=False)

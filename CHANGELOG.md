@@ -102,6 +102,33 @@
   ⚠ 原句「检测到独占全屏应用，暂时隐藏玻璃」原文保留（`tools/verify_occlusion.py`
   的 `MARKS["fs_on"]` 按子串匹配），身份追加在后面。
 
+### 变更（工具链：取证脚手架自身的两处缺陷）
+- **12 个取证脚本启动 playground 时补上 `--no-browser`**（`perf_probe` / `cmp_visual` /
+  `verify_dirty` / `verify_validity` / `verify_mouse_isolation` / `verify_crossscreen` /
+  `repro_tremble` / `verify_adaptive` / `verify_all` / `ab_memory` / `measure_frost_half` /
+  `verify_env_ema`）。不带它时 `playground/src/panel.rs` 会 `cmd /c start` 打开默认浏览器，
+  而 playground 被 terminate 后**标签页不会关** ⇒ 每次采样累积一个页面：
+  CPU/内存被浏览器吃掉、DWM 重合成，而且浏览器抢前台后 Windows 可能把前台交还给**桌面本身**
+  （这正是「`Progman` 间歇命中独占全屏判据」为什么时有时无）。
+  一次 `gate_perf` 是 4~24 次采样，所以这个缺陷足以把整台机器"测"成单调恶化 ——
+  本仓库为此浪费了十几轮错误归因，教训记在 `measurement-and-gates.md §1.3`。
+- **`gate_perf.py` 的每场景测量秒数可用 `GATE_SECONDS` 覆盖**（默认仍是 10，与历史基线可比）。
+  机器不干净时可以用 `GATE_SECONDS=6` 把相对档的 24 次采样压进更短的时间窗；
+  样本变少导致的噪声上升会被 `spread_pct` 自动挡成「不可信」，不会放宽判据。
+
+### 变更（重标一条定错的性能硬门槛）
+- **`gate_perf` 的 `many-drag (lat=1)` 判据从 `fps >= 60` 改成 `fps >= 55` 且 `p50 <= 17.5 ms`**。
+  依据（干净机器实测，见 `measurement-and-gates.md §4.3.2`）：该场景 `p50` 每次实测都**精确等于
+  16.66 ms = 2 个 vsync 间隔**，即 120 Hz 屏上物理上限就是 60.0 fps，实测在 58.0 / 58.9 /
+  61.4 之间抖 —— 而**上一个发布版 0.4.1 在同一台机器上也只有 59.3**。旧门槛不是被我们踩破的，
+  是它自己压在量化悬崖上，过不过取决于抖到哪一侧。
+  **不是单纯放宽 fps**：新增的 `p50 <= 17.5 ms` 才是防回归主力（节拍从 2 个 vsync 滑到 3 个
+  = 40 fps 会立刻 FAIL，而那种退化只看 fps 会被抖动掩盖）。
+  `tools/test_gate_logic.py` 同步加到 21 条，含"59.2 + 正常节拍 => 不再假 FAIL"、
+  "56.0 + p50 25 ms => 必须 FAIL"、"54.0 => FAIL"。
+  ⇒ 重标后绝对档在干净机器上 **PASS（退出码 0）**：116.0 / 61.4 / 105.2 / 93.5 fps，
+  CPU 1.87~3.75%（连 `<5%` 的软门槛也过了），`own_us` 14~36 µs。
+
 ### 变更（工具链：性能阀门改成两档判定）
 - **`tools/gate_perf.py` 改成「相对 A/B 优先、绝对门槛回退」两档**。
   动因：`many-drag >= 60` 这条绝对硬门槛在本机**没有余量**（0.4.1 基线 60.9，机器一漂移就 59.2），

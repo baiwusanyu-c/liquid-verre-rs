@@ -263,7 +263,9 @@ def run_case(case: str, seconds: float, warmup: float) -> dict:
     # 透明玻璃场景（需求 F3.1 / 验收 A9）：用 playground 的 --transparent 把
     # 引擎默认样式切成透明模式，--no-demo-pair 保证场景里只有一块玻璃，
     # 与 single-* 场景的几何完全可比。
-    argv = [EXE] + (["--transparent", "--no-demo-pair"] if transparent else [])
+    argv = [EXE, "--no-browser"] + (["--transparent", "--no-demo-pair"] if transparent else [])
+    # ⚠ 必须 --no-browser：panel.rs 在不带它时会 `cmd /c start` 打开浏览器，而 playground 被
+# terminate 后标签页不会关 => 每次采样累积一个页面，CPU/内存被浏览器吃掉、浏览器还抢前台（前台一被交还就可能落到 `Progman` 上，连带触发独占全屏检测）。
     proc = subprocess.Popen(argv, env=env, cwd=ROOT,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE)

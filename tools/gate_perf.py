@@ -19,7 +19,9 @@
 
   硬门槛（FAIL 即退出码 1）：
     single-drag  fps >= 90  且 p50 <= 9.0 ms      （120Hz 屏单块必须锁相）
-    many-drag    fps >= 60                        （方案 ④ 的下限）
+    many-drag    fps >= 55  且 p50 <= 17.5 ms     （2026-10-23 重标，见 §4.3.2；
+                                                   旧值 fps >= 60 压在 2-vsync 量化悬崖上，
+                                                   0.4.1 参考臂同一台机器实测 59.3 也过不了）
     many-drag + SIM_BACKDROP(900x700@120) + lat=2  fps >= 90
         （确定性负载下测"我们自己的吞吐"；真实桌面的 fps 受桌面重绘率/DWM 背压
           支配，84~105 波动，只作软门槛）
@@ -58,11 +60,26 @@ REL_MAX_DEGRADE = float(os.environ.get("GATE_REL_MAX", "3.0"))
 # 3% 的门槛会被噪声完全吃掉 => 少一轮不是“省时间”，是“判据失效”。
 REPS = max(2, int(os.environ.get("GATE_REPS", "3")))
 
+# 每个场景的测量秒数。默认 10（与历史基线可比）。重启后的可用窗口只有 ~10-15 分钟，
+# 而相对档要 24 次采样，10s 档约 7 分钟刚好贴着上限 => 可用 GATE_SECONDS=6 压到 ~4.5 分钟。
+# 缩短只减样本数、不减判据严格度；噪声变大时 spread_pct 会把它挡下来（判不可信而不是乱签）。
+SECONDS_PER_CASE = float(os.environ.get("GATE_SECONDS", "10"))
+
 # 绝对门槛表只在**没有参考二进制**时作为硬判据使用（回退档）。
 ABS_GATES = [
     ("single-drag", lambda r: r["fps"] >= 90 and r["p50"] <= 9.0,
      "单块拖拽 fps/p50 未达标: %.1f fps / %.2f ms"),
-    ("many-drag", lambda r: r["fps"] >= 60, "20 块默认档 fps < 60: %.1f"),
+    # 2026-10-23 重标（依据见 measurement-and-gates.md §4.3.2）。旧判据 `fps >= 60` 在这台
+    # 120 Hz 机器上**物理不可稳定达成**：lat=1 默认档的 p50 实测恒为 16.66 ms = 恰好
+    # 2 个 vsync 间隔，即上限 60.0 fps，抖动落在 58~60 ⇒ 门槛正好压在量化悬崖上，
+    # 历史上那次 60.9 是运气。0.4.1 参考臂在同一台干净机器上实测 59.3 / p50 16.66 ms
+    # ⇒ 这不是代码慢，是门槛定错了。
+    # 所以**不是单纯放宽 fps**，而是换成两条真正管得住的判据：
+    #   - fps >= 55：悬崖之下，仍能抓住"掉到 3 个 vsync"（= 40 fps）这一级退化；
+    #   - p50 <= 17.5 ms：节拍不得滑出 2 个 vsync。**这条才是防回归的主力**
+    #     （哪怕 fps 靠抖动蹭到 55+，只要节拍从 16.66 退到 25 ms 就立刻 FAIL）。
+    ("many-drag", lambda r: r["fps"] >= 55 and r["p50"] <= 17.5,
+     "20 块默认档未达标: fps %.1f（需 >=55）/ p50 %.2f ms（需 <=17.5，不得滑出 2 个 vsync 节拍）"),
     ("many-drag-lat2", lambda r: r["fps"] >= 90,
      "20 块吞吐档(lat=2, 合成负载) fps < 90: %.1f"),
     ("transparent-drag", lambda r: r["fps"] >= 90 and r["p50"] <= 9.0,
@@ -70,8 +87,10 @@ ABS_GATES = [
 ]
 
 
-def run(case, extra=None, seconds=10.0, exe=None):
+def run(case, extra=None, seconds=None, exe=None):
     """跑一个场景。`exe` 非空时覆盖被测二进制（相对 A/B 的参考臂用它）。"""
+    if seconds is None:
+        seconds = SECONDS_PER_CASE
     env = dict(os.environ)
     if exe:
         env["VERRE_EXE"] = exe
