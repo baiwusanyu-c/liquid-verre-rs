@@ -10,6 +10,7 @@ pub mod config;
 pub mod engine;
 pub mod event;
 pub mod handle;
+pub mod input;
 
 pub use config::{
     CaptureBackend, CaptureConfig, DiagnosticsConfig, EngineConfig, GlassMode, GlassStyle,
@@ -19,6 +20,7 @@ pub use config::{
 pub use engine::Engine;
 pub use event::{EngineEvent, EventHandler, ResizeHandle, EVENT_QUEUE_CAP};
 pub use handle::{GlassWindow, MonitorSnapshot, Snapshot, WindowSnapshot};
+pub use input::{GlassInputSink, InputDecision, PointerButton, PointerEvent, PointerPhase};
 
 /// 液态玻璃的全参数表（= 内部 `core::params::LiquidParams`）。
 pub use crate::core::params::{LiquidParams, Profile, Shape};

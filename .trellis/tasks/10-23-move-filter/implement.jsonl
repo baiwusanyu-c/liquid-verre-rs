@@ -1,0 +1,6 @@
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/design.md","reason":"§4 move filter 总体契约（sanitize + clamp 顺序）"}
+{"file":".trellis/tasks/10-23-input-sink/design.md","reason":"依赖现场：input/drag.rs 会话时机与决策状态机（filter 插桩点）"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"clamp_finite/NaN 兜底与测试要求"}
+{"file":".trellis/spec/backend/measurement-and-gates.md","reason":"连拍取证与 gate_perf 口径（AC2）"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"filter 作废兜底走 warn-once 前缀纪律"}
+{"file":"AGENTS.md","reason":"坑 1 的 f32/ULP 敏感性与热路径纪律"}

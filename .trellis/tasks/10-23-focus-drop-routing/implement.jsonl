@@ -1,0 +1,7 @@
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/design.md","reason":"§3 焦点路由与拖入竞态总体设计 + 降级预案"}
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/research/code-claims-check.md","reason":"风险 1/5：TRANSPARENT 逐帧竞态与 ESC 死路径的现场证据"}
+{"file":".trellis/tasks/10-23-input-sink/design.md","reason":"依赖项：Down/Consumed 路径与 sink 契约（触发点所在）"}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"SetFocus 属 runtime 平台点位；level.rs SWP_NOACTIVATE 纪律"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"hwnd 无效=忽略+warn-once"}
+{"file":".trellis/spec/backend/measurement-and-gates.md","reason":"拖入命中取证与鼠标隔离回归的口径"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"取证通道前缀纪律"}

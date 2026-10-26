@@ -8,6 +8,42 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
+## [0.5.0-unreleased]
+
+### Added
+- **输入路由 `GlassInputSink`**（宿主集成能力 P0-2「库窗口即本体」第一块地基）：块内指针事件
+  （Down/Up/Move/DoubleClick/RightDown/Wheel）同步路由给宿主实现，`Down` 的返回值决定库是否
+  开移动会话——`Consumed` = 不开会话且**不 SetCapture**（OLE 拖出天然可用，`DoDragDrop` 锚在
+  宿主壳窗口）；`DragMove` = 开移动会话；`Ignored` = 库默认（等价 `DragMove`）。缩放把手带
+  （含块外扩 grip）优先级**恒高于 sink**；按压序列粘滞（Up 必回按压时消费的块）；
+  `cursor_override` 支持宿主覆盖块内光标。未设置 sink 的块与 0.4.2 **逐字节一致**——稳态帧
+  取证 single 布局 deep/interior/ring/outside 四段全 0，同机 A/B 性能档 -1.1%~0.3% 无回归。
+- 新取证脚本 `tools/verify_input_sink.py`：五条**行为**断言（Consumed 区按压拖动块不动 /
+  DragMove 区块随手移动 / 特殊事件到达 / 把手带优先于 sink / 按压期间 capture 归属），
+  物理输入注入 + `[verify]` rect 心跳 + GetCapture 采样；断言 1/2 互为对照组，删除路由实现
+  则 attach 心跳整体消失 ⇒ 源头 FAIL（设计上防「假门禁」）。开发期即由它抓到两处单测与
+  8 个回归脚本都没覆盖的真缺陷：把手带缩放按压的会话收尾被绑在 sink 转发分支上（Up 漏结束，
+  块被停放光标一路拉伸到屏幕极限）、`WM_MOUSEWHEEL` 的 delta 误取 wParam 低位字（恒 0）。
+- **内容层 `update_content` / `clear_content`**（宿主集成能力 P0-1）：每块可挂一张预乘 BGRA8
+  位图（物理像素，行距 w·4，可选 dirty 半开区间子区上传），层序「本块玻璃之上、上层块玻璃之下、
+  resize border 反馈之下」，随块圆角掩码裁剪，1:1 不拉伸；同内容静态零成本（零上传零额外 draw），
+  无内容构建与 0.4.2 **像素零差异**（single 四段全 0）且 A/B 性能档无回归；参数非法丢弃 +
+  warn-once（不返回 Err），w/h=0 等价 clear；文本/图标由宿主渲染进位图，库不内置文字管线。
+- 新取证脚本 `tools/verify_content.py`：五条硬 FAIL 断言（checker 精确采样 / 上层玻璃盖下层内容 /
+  clear 逐位回基线 / dirty 子区隔离 / resize+clear+重推无残留），开发期用「批量 pass 探针 exe」
+  做过判别力自测（同一采样点在错误结构下 25/25 裸纹素、正确结构下 0/25），杜绝「永远绿」的假门禁；
+  它并在 bring-up 中抓到 4 个真缺陷（`UpdateSubresource` 带子矩形时的源指针语义、清除不脏化、
+  `region_dirty` 误置、截图帧竞态）。
+- **焦点路由 `set_focus_hwnd` + `EngineEvent::FocusHint`**（宿主集成能力 P1-1）：
+  块被按压且 sink 返回 `Consumed` 时发出 `FocusHint { id, hwnd }`，宿主在**自己的线程**
+  对壳窗口执行 `SetFocus`（同线程合法必成）——库不代调跨线程焦点：`AttachThreadInput`
+  实测对无消息泵的目标线程会挂死渲染线程，首版据此裁决移除全部库侧 SetFocus/attach 代码；
+  守卫拒绝登记画布自身 HWND（画布永不获得键盘）。
+- 新取证脚本 `tools/verify_focus_drop.py`：FR3 拖入命中稳定性（实时心跳矩形 + pid 归属 +
+  9 点×50 轮 400ms 前置轮询，实测块内命中 4500/4500、稳定漏检 0，反向对照证明穿透开关
+  在动）+ FR1 端到端（`FocusHint`/`focus_applied ret≠0`、按压后心跳不停=防冻结回归、
+  连击 100 无告警风暴）。
+
 ## [0.4.2] - 2026-10-23
 
 ### Added

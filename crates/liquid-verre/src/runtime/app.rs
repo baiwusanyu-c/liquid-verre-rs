@@ -11,6 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::GWLP_USERDATA;
 
 use crate::api::config::{GlassStyle, ResizeOptions, WindowConfig, WindowLevel};
 use crate::api::handle::{Command, MonitorSnapshot, Shared, Snapshot, WindowSnapshot};
+use crate::api::input::SinkRef;
 use crate::capture::Capture;
 use crate::core::block::Block;
 use crate::core::draw::{DrawBlock, ResizeFeedback};
@@ -66,6 +67,7 @@ pub(crate) struct App {
     /// 两次运行会得到不同的图（hover / 缩放把手反馈都是光标驱动的）。
     pub pinned_cursor: Option<[f32; 2]>,
     pub press: f32,
+    pub route_state: crate::core::routing::RouteState,
     pub drag_velocity: [f32; 2],
 
     pub rebuild_monitors: bool,
@@ -106,6 +108,13 @@ pub(crate) struct App {
     pub monitor_rects: Vec<([i32; 2], [i32; 2])>,
     /// 样式展开缓存（避免每帧对每块重跑 `sanitize`）。
     pub style_cache: StyleCache,
+    pub block_sinks: Vec<(u32, SinkRef)>,
+    /// 每块按压时的焦点目标 HWND（0 = 未设置）。
+    pub block_focus_hwnds: Vec<(u32, isize)>,
+    /// set_focus_hwnd 防呆守卫的 warn-once 位。
+    pub focus_guard_warned: bool,
+
+    pub content_store: crate::gfx::ContentStore,
     /// 命令缓冲（复用，热路径零分配）。
     pub cmd_buf: Vec<Command>,
     /// 快照缓冲（复用）。
@@ -117,6 +126,28 @@ pub(crate) struct App {
 }
 
 /// `App` 里持有的拖拽会话（独立类型别名只是为了签名短一点）。
+impl App {
+    #[inline]
+    pub(crate) fn sink_for(
+        &self,
+        id: u32,
+    ) -> Option<std::sync::Arc<dyn crate::api::input::GlassInputSink>> {
+        self.block_sinks
+            .iter()
+            .find(|(bid, _)| *bid == id)
+            .and_then(|(_, sr)| sr.0.clone())
+    }
+
+    #[inline]
+    pub(crate) fn focus_hwnd_for(&self, id: u32) -> Option<isize> {
+        self.block_focus_hwnds
+            .iter()
+            .find(|(bid, _)| *bid == id)
+            .map(|(_, hwnd)| *hwnd)
+            .filter(|h| *h != 0)
+    }
+}
+
 pub(crate) type DragSessionRef = crate::input::DragSession;
 
 impl SpawnSpec {
@@ -514,6 +545,7 @@ pub(crate) fn render_monitor(app: &mut App, mi: usize, ctx: &FrameCtx, full_redr
         influence_px: mon.influence_px(),
         max_lag_seconds: mon.max_lag,
         needs_backdrop: mon.needs_backdrop,
+        content_store: &app.content_store,
     };
     if let Err(e) = mon.compositor.render(gfx, glass, &input) {
         // 直接借用字段：log 宏只在级别开启时求值，克隆一个 String 进每帧渲染路径

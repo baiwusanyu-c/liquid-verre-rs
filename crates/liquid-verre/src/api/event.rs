@@ -80,6 +80,20 @@ pub enum EngineEvent {
         /// 窗口 id。
         id: u32,
     },
+    /// 块在按压（左键 Down 且宿主 sink 返回 Consumed）时请求键盘焦点。
+    ///
+    /// **库不代调 SetFocus**：跨线程焦点在 Win32 没有安全代调方式——
+    /// AttachThreadInput 对无消息泵的目标线程会挂死调用方（2026-10-26 实测：
+    /// 渲染线程在 attach 处冻结，取证心跳当场停摆）。本事件把「该给焦点了」的
+    /// 时机送还给宿主：宿主在 `poll_events`（自己的线程）收到后对自己的壳窗口
+    /// `SetFocus`——同线程调用，合法且必成；或在 sink 的 Down 回调里
+    /// PostMessage 给壳窗口（PostMessage 任意线程合法），两条路等价。
+    FocusHint {
+        /// 被按压并请求焦点的块 id。
+        id: u32,
+        /// `set_focus_hwnd` 登记的宿主窗口句柄（isize 形式的 HWND）。
+        hwnd: isize,
+    },
     /// 开始拖动位置。
     MoveStarted {
         /// 窗口 id。

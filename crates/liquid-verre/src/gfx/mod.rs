@@ -8,6 +8,7 @@
 //! `GLASS_FRAME_LATENCY`），清单见 `diag/env.rs` 模块文档；它们都不进热路径。
 
 pub(crate) mod compositor;
+pub(crate) mod content_layer;
 pub(crate) mod dcomp;
 pub(crate) mod device;
 pub(crate) mod glass_renderer;
@@ -17,6 +18,7 @@ pub(crate) mod shaders;
 pub(crate) mod swapchain;
 
 pub(crate) use compositor::Compositor;
+pub(crate) use content_layer::ContentStore;
 pub(crate) use dcomp::DComp;
 pub(crate) use device::Device;
 pub(crate) use glass_renderer::GlassRenderer;

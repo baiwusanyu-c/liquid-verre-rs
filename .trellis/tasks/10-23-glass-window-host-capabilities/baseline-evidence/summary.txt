@@ -1,0 +1,18 @@
+﻿=== baseline evidence run start 2026-10-23T16:55:24.3032391+08:00
+01_cargo_test exit=0 26s
+02_clippy exit=0 4s
+03_fmt exit=0 1s
+04_check_mjs exit=0 2s
+05_cmp_visual_self exit=0 77s
+06_verify_dirty_r1 exit=0 37s
+07_verify_dirty_r2 exit=0 38s
+08_verify_dirty_r3 exit=0 38s
+09_mouse_isolation exit=0 51s
+10_validity exit=0 14s
+11_tremble_far exit=0 8s
+12_tremble_many exit=0 8s
+13_adaptive exit=0 51s
+14_ab_latency exit=0 215s
+15_ab_memory exit=0 193s
+16_gate_perf exit=0 432s
+=== baseline evidence run done 2026-10-23T17:15:17.4476970+08:00

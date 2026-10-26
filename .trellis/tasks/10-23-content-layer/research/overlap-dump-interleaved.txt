@@ -1,0 +1,33 @@
+=== verify_content.py��P0-1 Ӳ���԰棩EXE=D:\github-project\liquid-verre-rs\target\release\liquid-verre-playground.exe ===
+  PASS ����1��checker ��ȷ���� 25 �� + 128px ������ + ���������һ��
+  DUMP (1652, 1110) stack=(94, 108, 125, 255) bare=(94, 108, 125, 255) raw_expect=220
+  DUMP (1756, 1110) stack=(185, 81, 161, 255) bare=(185, 81, 161, 255) raw_expect=220
+  DUMP (1860, 1110) stack=(142, 98, 129, 255) bare=(142, 98, 129, 255) raw_expect=30
+  DUMP (1964, 1110) stack=(104, 120, 105, 255) bare=(104, 120, 105, 255) raw_expect=30
+  DUMP (2068, 1110) stack=(225, 122, 169, 255) bare=(225, 122, 169, 255) raw_expect=220
+  DUMP (1652, 1170) stack=(170, 143, 184, 255) bare=(170, 143, 184, 255) raw_expect=30
+  DUMP (1756, 1170) stack=(221, 128, 198, 255) bare=(221, 128, 198, 255) raw_expect=30
+  DUMP (1860, 1170) stack=(145, 154, 151, 255) bare=(145, 154, 151, 255) raw_expect=220
+  DUMP (1964, 1170) stack=(154, 145, 142, 255) bare=(154, 145, 142, 255) raw_expect=220
+  DUMP (2068, 1170) stack=(212, 87, 146, 255) bare=(212, 87, 146, 255) raw_expect=30
+  DUMP (1652, 1230) stack=(159, 92, 155, 255) bare=(159, 92, 155, 255) raw_expect=30
+  DUMP (1756, 1230) stack=(151, 99, 142, 255) bare=(151, 99, 142, 255) raw_expect=30
+  DUMP (1860, 1230) stack=(83, 123, 98, 255) bare=(83, 123, 98, 255) raw_expect=220
+  DUMP (1964, 1230) stack=(162, 110, 132, 255) bare=(162, 110, 132, 255) raw_expect=220
+  DUMP (2068, 1230) stack=(238, 127, 175, 255) bare=(238, 127, 175, 255) raw_expect=30
+  DUMP (1652, 1290) stack=(214, 135, 203, 255) bare=(214, 135, 203, 255) raw_expect=30
+  DUMP (1756, 1290) stack=(153, 156, 161, 255) bare=(153, 156, 161, 255) raw_expect=30
+  DUMP (1860, 1290) stack=(131, 166, 142, 255) bare=(131, 166, 142, 255) raw_expect=220
+  DUMP (1964, 1290) stack=(221, 131, 174, 255) bare=(221, 131, 174, 255) raw_expect=220
+  DUMP (2068, 1290) stack=(176, 110, 128, 255) bare=(176, 110, 128, 255) raw_expect=30
+  DUMP (1652, 1350) stack=(201, 144, 197, 255) bare=(201, 144, 197, 255) raw_expect=30
+  DUMP (1756, 1350) stack=(122, 172, 147, 255) bare=(122, 172, 147, 255) raw_expect=30
+  DUMP (1860, 1350) stack=(163, 162, 158, 255) bare=(163, 162, 158, 255) raw_expect=220
+  DUMP (1964, 1350) stack=(230, 133, 178, 255) bare=(230, 133, 178, 255) raw_expect=220
+  DUMP (2068, 1350) stack=(134, 126, 105, 255) bare=(134, 126, 105, 255) raw_expect=30
+  PASS ����2���ص��� 25 ���Ϊ��������̬�����յ�ȷ��������Ч���� bare �в��죩
+  PASS ����3��clear ��ȫͼ 6489600 �����������ݻ�����λ���
+  PASS ����4������ 65536 ����ȫ��д�������ⲻ͸���� 0 �Ķ���partial==full ȫͼ��
+  PASS ����5��seq==direct==noclear ȫͼ�����³ߴ�ͼ�� 1:1 �޲���
+=== ȫ�� 5 ������ PASS ===
+INTERLEAVED exit code: 0

@@ -1,0 +1,5 @@
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/design.md","reason":"§3 承诺的契约与降级条件核对"}
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/prd.md","reason":"§4 门禁 + R5 验收语义"}
+{"file":".trellis/spec/backend/measurement-and-gates.md","reason":"回归脚本全表（无视觉改动仍需 8 脚本全绿）"}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"平台点位边界复查"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"质量红线复查"}

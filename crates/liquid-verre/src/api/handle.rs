@@ -17,6 +17,7 @@ use crate::api::config::{
     EngineConfig, GlassMode, GlassStyle, Rect, ResizeOptions, WindowConfig, WindowLevel, ZOrder,
 };
 use crate::api::event::{EngineEvent, EventHandler, EVENT_QUEUE_CAP};
+use crate::api::input::SinkRef;
 use crate::error::Error;
 
 /// 上层下发的命令。渲染线程在帧首一次性消费（`drain_into`）。
@@ -31,33 +32,105 @@ pub(crate) enum Command {
     /// 改新建窗口的默认缩放配置（已存在的窗口不受影响）。
     SetDefaultResize(ResizeOptions),
     /// 新建窗口（id 由调用侧预分配，因此句柄可以立刻返回给上层）。
-    Create { id: u32, config: WindowConfig },
+    Create {
+        id: u32,
+        config: WindowConfig,
+    },
     /// 销毁窗口。
-    Destroy { id: u32 },
+    Destroy {
+        id: u32,
+    },
     /// 销毁全部窗口。
     DestroyAll,
     /// 设置矩形（逻辑像素）。
-    SetRect { id: u32, rect: Rect },
+    SetRect {
+        id: u32,
+        rect: Rect,
+    },
     /// 只改尺寸（保持左上角）。
-    SetSize { id: u32, width: f32, height: f32 },
+    SetSize {
+        id: u32,
+        width: f32,
+        height: f32,
+    },
     /// 只改位置。
-    SetPosition { id: u32, x: f32, y: f32 },
+    SetPosition {
+        id: u32,
+        x: f32,
+        y: f32,
+    },
     /// 设置样式；`None` = 恢复继承引擎默认。
-    SetStyle { id: u32, style: Option<GlassStyle> },
+    SetStyle {
+        id: u32,
+        style: Option<GlassStyle>,
+    },
     /// 设置缩放交互配置。
-    SetResize { id: u32, options: ResizeOptions },
+    SetResize {
+        id: u32,
+        options: ResizeOptions,
+    },
     /// 只改缩放总开关（`set_resizable` 用，避免读-改-写整份 ResizeOptions）。
-    SetResizable { id: u32, enabled: bool },
+    SetResizable {
+        id: u32,
+        enabled: bool,
+    },
     /// 单字段样式补丁，在渲染线程的权威状态上叠加（见 `StylePatch`）。
-    PatchStyle { id: u32, patch: StylePatch },
+    PatchStyle {
+        id: u32,
+        patch: StylePatch,
+    },
     /// 设置叠放次序。
-    SetZ { id: u32, order: ZOrder },
+    SetZ {
+        id: u32,
+        order: ZOrder,
+    },
     /// 显示 / 隐藏。
-    SetVisible { id: u32, visible: bool },
+    SetVisible {
+        id: u32,
+        visible: bool,
+    },
     /// 是否可被鼠标命中。
-    SetInteractive { id: u32, interactive: bool },
+    SetInteractive {
+        id: u32,
+        interactive: bool,
+    },
     /// 是否可拖拽移动位置。
-    SetMovable { id: u32, movable: bool },
+    SetMovable {
+        id: u32,
+        movable: bool,
+    },
+    SetInputSink {
+        id: u32,
+        sink: SinkRef,
+    },
+    /// 更新本块内容纹理（预乘 BGRA8，物理像素，行距 = w_phys * 4）。
+    /// dirty 为块内半开区间 [left, top, right, bottom)（物理像素），None = 全量。
+    UpdateContent {
+        id: u32,
+        w_phys: u32,
+        h_phys: u32,
+        buffer: std::sync::Arc<[u8]>,
+        dirty: Option<[u32; 4]>,
+    },
+    /// 清除本块内容纹理（释放 GPU 资源）。
+    ClearContent {
+        id: u32,
+    },
+    /// 登记块按压时的焦点目标 HWND（isize = HWND 形态）。
+    ///
+    /// hwnd = 0 清除登记。**库不代调 SetFocus**（跨线程焦点没有安全代调方式，
+    /// attach 手法实测挂死渲染线程——见 EngineEvent::FocusHint 文档）：
+    /// 块被按压且 sink 返回 Consumed 时（含该次按压的抬层），库发出
+    /// `EngineEvent::FocusHint { id, hwnd }`，宿主在自己线程里对壳窗口 SetFocus。
+    ///
+    /// **守卫**：若 hwnd 等于任一画布自身 HWND，登记被丢弃 + warn-once
+    /// （画布永不经任何路径获得键盘，WM_KEYDOWN 的 ESC→Shutdown 分支
+    /// 因此维持死路径）。
+    SetFocusHwnd {
+        id: u32,
+        /// 目标 HWND（0 = 清除）。
+        hwnd: isize,
+    },
 }
 
 /// 单个玻璃窗口的只读状态（来自快照）。
@@ -184,6 +257,8 @@ pub(crate) struct Shared {
     /// 否则命令队列会被宿主的后续调用无限撑大（独立审查 P2-5）。
     stopped: AtomicBool,
     fatal: Mutex<Option<Error>>,
+    warn_oversize: AtomicBool,
+    warn_len: AtomicBool,
 }
 
 impl std::fmt::Debug for Shared {
@@ -223,6 +298,8 @@ impl Shared {
             started: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             fatal: Mutex::new(None),
+            warn_oversize: AtomicBool::new(false),
+            warn_len: AtomicBool::new(false),
         })
     }
 
@@ -250,6 +327,18 @@ impl Shared {
     /// 标记「渲染线程已退出」（由 `Engine` 的线程闭包调用）。
     pub(crate) fn mark_stopped(&self) {
         self.stopped.store(true, Ordering::Release);
+    }
+
+    /// warn-once gate: content size > 8192.
+    /// Returns true the first time (caller should log), false thereafter.
+    pub(crate) fn warn_content_oversize(&self) -> bool {
+        !self.warn_oversize.swap(true, Ordering::Relaxed)
+    }
+
+    /// warn-once gate: content buffer length mismatch.
+    /// Returns true the first time (caller should log), false thereafter.
+    pub(crate) fn warn_content_len(&self) -> bool {
+        !self.warn_len.swap(true, Ordering::Relaxed)
     }
 
     /// 抢占式标记「已启动」；返回 false 表示是第一次。
@@ -555,6 +644,92 @@ impl GlassWindow {
         });
     }
 
+    /// Set input routing sink.
+    pub fn set_input_sink(
+        &self,
+        sink: Option<std::sync::Arc<dyn crate::api::input::GlassInputSink>>,
+    ) {
+        self.shared.push(Command::SetInputSink {
+            id: self.id,
+            sink: SinkRef(sink),
+        });
+    }
+
+    /// 登记该块按压时的焦点目标 HWND（宿主壳窗口）。
+    ///
+    /// hwnd = 0 清除登记。**库不代调 SetFocus**（Win32 无跨线程安全代法，
+    /// attach 手法实测会挂死渲染线程，见 `EngineEvent::FocusHint` 文档）：
+    /// 块被按压且 sink 返回 Consumed 时，库在**事件队列与 poll_events** 里发出
+    /// `EngineEvent::FocusHint { id, hwnd }`，宿主在自己线程收到后对 hwnd 执行
+    /// SetFocus（同线程合法必成），或平时直接在 sink 的 Down 回调里 PostMessage
+    /// 给自己的壳窗口——两条路等价，焦点始终由宿主自己拥有。
+    ///
+    /// **守卫**：若 hwnd 等于任一画布自身 HWND，登记被丢弃并打印一次
+    /// [warn]——画布永不经任何路径获得键盘。
+    ///
+    /// isize 即 HWND 形态，与 WindowSnapshot::canvas_handle() 风格一致。
+    pub fn set_focus_hwnd(&self, hwnd: isize) {
+        self.shared
+            .push(Command::SetFocusHwnd { id: self.id, hwnd });
+    }
+
+    /// Update content texture (premultiplied BGRA8, physical pixels).
+    ///
+    /// `buffer` row pitch = `w_phys * 4` (no padding); `dirty` is a half-open
+    /// interval `[left, top, right, bottom)` in block-local physical pixels,
+    /// `None` = full upload.
+    ///
+    /// Validation failures (wrong length, size > 8192) are discarded with a
+    /// warn-once log; no `Err` is returned. Size 0 is equivalent to
+    /// [`clear_content`](Self::clear_content).
+    ///
+    /// This method does a single `memcpy` (`buffer` -> `Arc<[u8]>`); the actual
+    /// texture upload happens on the render thread at frame start, latency <= 1 frame.
+    pub fn update_content(&self, w_phys: u32, h_phys: u32, buffer: &[u8], dirty: Option<[u32; 4]>) {
+        // 校验决策在 core::content（0-unsafe 纯函数，AC2 单测矩阵盯着判定表）。
+        match crate::core::content::plan_update(w_phys, h_phys, buffer.len()) {
+            crate::core::content::ContentPlan::Clear => self.clear_content(),
+            crate::core::content::ContentPlan::TooLarge => {
+                if self.shared.warn_content_oversize() {
+                    log::warn!(
+                        "[content] update_content id={}: size {}x{} exceeds {}, discarded",
+                        self.id,
+                        w_phys,
+                        h_phys,
+                        crate::core::content::MAX_CONTENT_DIM
+                    );
+                }
+            }
+            crate::core::content::ContentPlan::LenMismatch => {
+                if self.shared.warn_content_len() {
+                    log::warn!(
+                        "[content] update_content id={}: buffer len {} != w*h*4, discarded",
+                        self.id,
+                        buffer.len()
+                    );
+                }
+            }
+            crate::core::content::ContentPlan::Upload => {
+                let copy: std::sync::Arc<[u8]> = buffer.to_vec().into_boxed_slice().into();
+                self.shared.push(Command::UpdateContent {
+                    id: self.id,
+                    w_phys,
+                    h_phys,
+                    buffer: copy,
+                    dirty,
+                });
+            }
+        }
+    }
+
+    /// Clear content texture (release GPU memory).
+    ///
+    /// Call before hiding, recycling, or resizing. Repeated calls or calls on
+    /// blocks without content are harmless.
+    pub fn clear_content(&self) {
+        self.shared.push(Command::ClearContent { id: self.id });
+    }
+
     /// 设置叠放次序（需求 F4）。
     pub fn set_z_order(&self, order: ZOrder) {
         self.shared.push(Command::SetZ { id: self.id, order });
@@ -834,6 +1009,63 @@ mod tests {
                 patch: StylePatch::TintColor([0.25, 0.5, 0.75, 1.0])
             }
         );
+    }
+
+    #[test]
+    fn update_content_valid_input_enqueues_upload_command() {
+        let (shared, w) = pair();
+        // 2x1 BGRA8 = 8 字节，合法；dirty 半开区间原样带进命令（裁剪在 gfx 消费时做）。
+        w.update_content(2, 1, &[7u8; 8], Some([0, 0, 1, 1]));
+        let cmds = pending(&shared);
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            Command::UpdateContent {
+                id,
+                w_phys,
+                h_phys,
+                buffer,
+                dirty,
+            } => {
+                assert_eq!(*id, w.id());
+                assert_eq!((*w_phys, *h_phys), (2, 1));
+                assert_eq!(&buffer[..], &[7u8; 8]);
+                assert_eq!(*dirty, Some([0, 0, 1, 1]));
+            }
+            other => panic!("意外命令 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_content_invalid_inputs_are_discarded_without_commands() {
+        let (shared, w) = pair();
+        // 长度 != w*h*4 => 丢弃
+        w.update_content(2, 1, &[0u8; 7], None);
+        // 单边超上限 => 丢弃
+        w.update_content(8193, 1, &[0u8; 8], None);
+        w.update_content(1, 8193, &[0u8; 8], None);
+        assert!(
+            pending(&shared).is_empty(),
+            "非法参数不得入队（可恢复错误契约：丢弃 + warn-once，不是 Err）"
+        );
+    }
+
+    #[test]
+    fn update_content_zero_size_is_equivalent_to_clear() {
+        // FR6：w/h=0 不是错误，语义等价 clear_content。
+        let (shared, w) = pair();
+        w.update_content(0, 5, &[], None);
+        let cmds = pending(&shared);
+        assert_eq!(cmds.len(), 1, "0 尺寸应转译为恰好一条 ClearContent");
+        assert!(matches!(cmds[0], Command::ClearContent { id } if id == w.id()));
+    }
+
+    #[test]
+    fn clear_content_enqueues_its_command() {
+        let (shared, w) = pair();
+        w.clear_content();
+        let cmds = pending(&shared);
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Command::ClearContent { id } if id == w.id()));
     }
 
     #[test]

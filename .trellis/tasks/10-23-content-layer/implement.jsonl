@@ -1,0 +1,13 @@
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/prd.md","reason":"§3 硬约束 C1-C8 + §4 第一门禁（零差异压倒一切）"}
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/design.md","reason":"§1 内容层总体设计：命令/纹理/shader c19/逐块交错绘制/失效收口"}
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/capability-list.md","reason":"宿主源清单 P0-1 一节：update_content 签名与 dirty 语义出处"}
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/research/code-claims-check.md","reason":"风险 3/4：内容 dirty 与影响盒统一、c19 起新增的来龙去脉"}
+{"file":".trellis/spec/backend/rendering-pipeline.md","reason":"Pass A/B 管线契约 + c0..c18 表 + border pass——内容层必须挂对位置"}
+{"file":".trellis/spec/backend/graphics-d3d11-gotchas.md","reason":"子资源上传/blend 状态/纹理 pitch 等静默陷阱清单"}
+{"file":".trellis/spec/guides/graphics-change-checklist.md","reason":"图形/管线改动前的 8 问检查单（本项目 bug 高发区）"}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"unsafe 只进 gfx；采集/渲染边界；面板不进库"}
+{"file":".trellis/spec/backend/error-handling.md","reason":"buffer 校验失败=丢弃+warn-once，不返回 Err"}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"前缀即接口 + 热路径禁格式化日志"}
+{"file":".trellis/spec/backend/measurement-and-gates.md","reason":"AC1/AC3/AC4 的门禁命令与取证口径"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"测试要求与禁止模式"}
+{"file":"AGENTS.md","reason":"坑 1（f32 ULP 敏感性）+ 取证脚本纪律 + 中文编码规则"}

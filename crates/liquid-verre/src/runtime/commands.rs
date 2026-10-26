@@ -59,6 +59,7 @@ fn apply_one(app: &mut App, cmd: Command) -> bool {
             }
             true
         }
+
         Command::SetWindowLevel(level) => {
             if app.level == level {
                 return false;
@@ -92,6 +93,7 @@ fn apply_one(app: &mut App, cmd: Command) -> bool {
                 return false;
             }
             app.manager.clear();
+            app.content_store.clear_all();
             app.style_cache.clear();
             app.hover = None;
             app.hover_handle = Default::default();
@@ -286,6 +288,73 @@ fn apply_one(app: &mut App, cmd: Command) -> bool {
             app.snapshot_dirty = true;
             false
         }
+        Command::SetInputSink { id, sink } => {
+            if let Some(pos) = app.block_sinks.iter().position(|(bid, _)| *bid == id) {
+                if sink.0.is_none() {
+                    app.block_sinks.remove(pos);
+                } else {
+                    app.block_sinks[pos] = (id, sink);
+                }
+            } else if sink.0.is_some() {
+                app.block_sinks.push((id, sink));
+            }
+            false
+        }
+        Command::UpdateContent {
+            id,
+            w_phys,
+            h_phys,
+            buffer,
+            dirty,
+        } => {
+            // 失效走既有统一收口（C4）：返回 true => 主循环 need_render => 整帧重画
+            // （Pass B 本来就画全部块，不变量 1）。不新增第二套脏区账本；
+            // region 由块矩形决定，内容更新**不**改窗口区域，所以**不**置 region_dirty
+            // （上一版误置导致每帧 SetWindowRgn 重建——已删）。
+            app.content_store.update(
+                &app.gfx.device,
+                &app.gfx.ctx,
+                id,
+                w_phys,
+                h_phys,
+                &buffer,
+                dirty,
+            );
+            true
+        }
+        Command::ClearContent { id } => {
+            app.content_store.clear(id);
+            // true 是行为正确性要求（2026-10-26 回炉发现）：清除**改变画面**，必须触发
+            // 一帧重画。返回 false 时静止桌面上的 clear 要等下一个无关触发源才生效，
+            // verify_content.py 断言 3 会直接抓到这个。
+            true
+        }
+        Command::SetFocusHwnd { id, hwnd } => {
+            if hwnd != 0 {
+                for m in app.monitors.iter() {
+                    if m.hwnd.0 as isize == hwnd {
+                        if !app.focus_guard_warned {
+                            log::warn!(
+                                "[warn] set_focus_hwnd({}): HWND 0x{:x} is canvas itself, ignored (further suppressed)",
+                                id, hwnd
+                            );
+                            app.focus_guard_warned = true;
+                        }
+                        return false;
+                    }
+                }
+            }
+            if let Some(pos) = app.block_focus_hwnds.iter().position(|(bid, _)| *bid == id) {
+                if hwnd == 0 {
+                    app.block_focus_hwnds.remove(pos);
+                } else {
+                    app.block_focus_hwnds[pos] = (id, hwnd);
+                }
+            } else if hwnd != 0 {
+                app.block_focus_hwnds.push((id, hwnd));
+            }
+            false
+        }
     }
 }
 
@@ -302,6 +371,8 @@ fn destroy(app: &mut App, id: u32) -> bool {
         app.drag = None;
         app.press = 0.0;
     }
+    app.content_store.clear(id);
+    app.block_focus_hwnds.retain(|(bid, _)| *bid != id);
     for m in app.monitors.iter_mut() {
         m.region_dirty = true;
     }

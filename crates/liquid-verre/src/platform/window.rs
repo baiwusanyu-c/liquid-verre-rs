@@ -23,7 +23,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::api::config::WindowLevel;
 use crate::api::event::EngineEvent;
 use crate::api::handle::Command;
+use crate::api::input::{PointerButton, PointerEvent, PointerPhase};
 use crate::core::handle::ResizeEdges;
+use crate::core::routing::{self, PhaseKind, RouteAction, RouteInput, RouteState, SinkDecision};
 use crate::error::{Error, ErrorKind, Result};
 use crate::input::{DragSession, MoveState, ResizeState};
 use crate::platform::{display::MonitorInfo, level};
@@ -169,19 +171,39 @@ pub(crate) unsafe fn app_of(hwnd: HWND) -> Option<&'static mut App> {
         Some(&mut *(raw as *mut App))
     }
 }
-
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_LBUTTONDOWN => {
-                on_button_down(hwnd);
+                dispatch_pointer(hwnd, PointerPhase::Down, Some(PointerButton::Left), 0);
+                LRESULT(0)
+            }
+            WM_LBUTTONDBLCLK => {
+                dispatch_pointer(hwnd, PointerPhase::DoubleClick, None, 0);
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN => {
+                dispatch_pointer(hwnd, PointerPhase::RightDown, Some(PointerButton::Right), 0);
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                dispatch_pointer(
+                    hwnd,
+                    PointerPhase::Up(Some(PointerButton::Right)),
+                    Some(PointerButton::Right),
+                    0,
+                );
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wp.0 >> 16) as i16) as i32 / 120;
+                dispatch_pointer(hwnd, PointerPhase::Wheel, None, delta);
                 LRESULT(0)
             }
             WM_MOUSEMOVE => {
-                // 只记光标位置；hover / 把手判定在主循环里每帧做一次
-                // （方案 12.2.3 输入合并：1000 Hz 消息 → 一帧一次）。
                 if let Some(app) = app_of(hwnd) {
                     app.cursor = app.read_cursor();
+                    forward_move_to_sink(app);
                 }
                 LRESULT(0)
             }
@@ -190,7 +212,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                     return LRESULT(HTTRANSPARENT as isize);
                 };
                 let c = app.read_cursor();
+                let pressing = matches!(app.route_state, RouteState::Pressing(_));
                 let hit = app.drag.is_some()
+                    || pressing
                     || app.manager.hit_test(c[0], c[1]).is_some()
                     || app.manager.hit_resize(c[0], c[1]).is_some();
                 LRESULT(if hit {
@@ -200,8 +224,6 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 })
             }
             WM_SETCURSOR => {
-                // 只在客户区（= 命中玻璃块）改光标；其余情况交回默认处理，
-                // 否则会覆盖宿主应用的光标。
                 let hit_test_code = (lp.0 as u32) & 0xffff;
                 if hit_test_code == HTCLIENT {
                     if let Some(app) = app_of(hwnd) {
@@ -213,16 +235,29 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                                 return LRESULT(1);
                             }
                         }
+                        let c = app.read_cursor();
+                        if let Some(hit_id) = app.manager.hit_test(c[0], c[1]) {
+                            if let Some(sink) = app.sink_for(hit_id) {
+                                if let Some(cursor_id) = sink.cursor_override(hit_id) {
+                                    let cursor =
+                                        LoadCursorW(None, PCWSTR(cursor_id as usize as *const u16))
+                                            .unwrap_or_default();
+                                    if !cursor.0.is_null() {
+                                        SetCursor(cursor);
+                                        return LRESULT(1);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_LBUTTONUP => {
-                on_button_up(hwnd);
+                dispatch_pointer(hwnd, PointerPhase::Up(None), Some(PointerButton::Left), 0);
                 LRESULT(0)
             }
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
-                // 分辨率 / 缩放 / 拔插显示器：重建每屏画布与采集。
                 if let Some(app) = app_of(hwnd) {
                     app.rebuild_monitors = true;
                 }
@@ -234,8 +269,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 LRESULT(0)
             }
             WM_KEYDOWN => {
-                // 画布带 WS_EX_NOACTIVATE，正常情况下拿不到键盘焦点；
-                // 真的拿到时 ESC 请求引擎退出（与重构前的行为一致）。
+                // ESC -> Shutdown：正常情况下这是死路径，因为画布 WS_EX_NOACTIVATE
+                // 不接收键盘消息。set_focus_hwnd 的守卫确保画布永不经库获得焦点，
+                // 因此此分支仅在 standalone 调试（Win32 API 直调 SetFocus 给画布）时可达，
+                // 作为逃生门保留。详见 research/esc-and-focus-guard.md。
                 if wp.0 == 0x1B {
                     if let Some(app) = app_of(hwnd) {
                         app.shared.push(Command::Shutdown);
@@ -256,72 +293,126 @@ unsafe fn request_render(hwnd: HWND) {
     }
 }
 
-/// 按下：先判缩放把手（角优先于边），再判整块移动。
-unsafe fn on_button_down(hwnd: HWND) {
+// 焦点相关 FFI（SetFocus/AttachThreadInput）已于 2026-10-26 移除：跨线程代调
+// SetFocus 无安全实现（attach 挂死渲染线程，实测），焦点语义改为 FocusHint 事件。
+
+/// 统一指针事件分发：坐标换算 -> 命中测试 -> sink 查询 -> 状态机 -> 执行动作。
+unsafe fn dispatch_pointer(
+    hwnd: HWND,
+    phase: PointerPhase,
+    button: Option<PointerButton>,
+    wheel_delta: i32,
+) {
     let Some(app) = app_of(hwnd) else { return };
     let c = app.read_cursor();
     app.cursor = c;
-    let handle = app.manager.hit_resize(c[0], c[1]);
-    let hit = match handle {
-        Some((id, _)) => Some((id, handle.map(|(_, e)| e))),
-        None => app.manager.hit_test(c[0], c[1]).map(|id| (id, None)),
+
+    let hit_resize = app.manager.hit_resize(c[0], c[1]);
+    let hit_test = if hit_resize.is_none() {
+        app.manager.hit_test(c[0], c[1])
+    } else {
+        None
     };
-    let Some((id, edges)) = hit else { return };
 
-    // 不可移动的块：只有缩放把手能开始会话；按内部直接放弃（不 SetCapture、
-    // 不发 MoveStarted），但点击抬层仍然生效（见下）。
-    if edges.is_none() {
-        if let Some(b) = app.manager.get(id) {
-            if !b.movable {
-                if app.manager.bring_to_front(id) {
-                    app.geometry_changed = true;
+    let phase_kind = match phase {
+        PointerPhase::Down => PhaseKind::Down,
+        PointerPhase::Up(_) => PhaseKind::Up,
+        PointerPhase::Move => PhaseKind::Move,
+        PointerPhase::DoubleClick => PhaseKind::DoubleClick,
+        PointerPhase::RightDown => PhaseKind::RightDown,
+        PointerPhase::Wheel => PhaseKind::Wheel,
+    };
+
+    let sink_decision = if phase_kind == PhaseKind::Down {
+        hit_test.and_then(|id| {
+            app.sink_for(id).map(|sink| {
+                if let Some(b) = app.manager.get(id) {
+                    let ev = PointerEvent {
+                        block_local: [c[0] - b.x, c[1] - b.y],
+                        phase,
+                        button,
+                        wheel_delta,
+                    };
+                    match sink.on_pointer(id, &ev) {
+                        crate::api::input::InputDecision::Consumed => SinkDecision::Consumed,
+                        crate::api::input::InputDecision::DragMove => SinkDecision::DragMove,
+                        crate::api::input::InputDecision::Ignored => SinkDecision::Ignored,
+                    }
+                } else {
+                    SinkDecision::Ignored
                 }
-                if app.level.raises_on_click() {
-                    level::raise_on_click(hwnd);
+            })
+        })
+    } else {
+        None
+    };
+
+    let input = RouteInput {
+        hit_resize,
+        hit_test,
+        sink_decision,
+        phase: phase_kind,
+    };
+    let result = routing::route(app.route_state, input);
+    let prev_state = app.route_state;
+    app.route_state = result.state;
+
+    match result.action {
+        RouteAction::StartResize { block, edges } => {
+            start_resize_session(app, hwnd, block, edges, c);
+        }
+        RouteAction::StartMove { block } => {
+            start_move_session(app, hwnd, block, c);
+        }
+        RouteAction::Consume => {
+            let was_pressing = matches!(prev_state, RouteState::Pressing(_));
+            if !was_pressing {
+                if let Some(hit_id) = hit_test {
+                    // 抬层（z-order + window level）
+                    if app.manager.bring_to_front(hit_id) {
+                        app.geometry_changed = true;
+                    }
+                    if app.level.raises_on_click() {
+                        level::raise_on_click(hwnd);
+                    }
+                    // FR1 焦点语义（2026-10-26 裁决）：库侧绝不代调 SetFocus/AttachThreadInput。
+                    // 跨线程代焦点在 Win32 没有安全实现——attach 对无消息泵的目标线程会挂死
+                    // 渲染线程（实测：插桩走到 consume_focus_enter 后心跳当场停摆，进程活着但
+                    // 渲染线程冻结）。改为发 FocusHint：宿主在自己线程（poll_events）里对自己的
+                    // 壳窗口 SetFocus，同线程调用合法且必成。守卫（apply_one）仍保证登记的不是
+                    // 画布自身——画布永不经任何路径获得键盘。
+                    if let Some(focus_hwnd) = app.focus_hwnd_for(hit_id) {
+                        app.shared.emit(EngineEvent::FocusHint {
+                            id: hit_id,
+                            hwnd: focus_hwnd,
+                        });
+                    }
                 }
+                app.press = 1.0;
                 app.shared.request_render();
-                return;
             }
         }
-    }
-
-    // 点击到最前：同层内抬到最上面；WindowLevel::ClickToFront 还要抬画布窗口。
-    if app.manager.bring_to_front(id) {
-        app.geometry_changed = true;
-    }
-    if app.level.raises_on_click() {
-        level::raise_on_click(hwnd);
-    }
-
-    let Some(b) = app.manager.get(id) else { return };
-    let s = b.scale.max(1e-3);
-    // origin 的 w/h 存**逻辑单位**，跨屏拖拽 / 缩放才不会被按下那一刻的像素尺寸锁死。
-    let origin = [b.x, b.y, b.width / s, b.height / s];
-    let min_size = [b.resize.min_width, b.resize.min_height];
-    let now = app.t0.elapsed().as_secs_f64();
-    app.min_drag_size = min_size;
-    app.drag = Some(match edges {
-        Some(e) => DragSession::Resize(ResizeState::begin(id, e, c, origin, now)),
-        None => DragSession::Move(MoveState::begin(id, c, origin, now)),
-    });
-    app.hover = Some(id);
-    app.hover_handle = edges.unwrap_or(ResizeEdges::NONE);
-    app.press = 1.0;
-    let _ = SetCapture(hwnd);
-    app.shared.request_render();
-    match edges {
-        Some(e) => {
-            if let Some(handle) = e.public() {
-                app.shared.emit(EngineEvent::ResizeStarted { id, handle });
+        RouteAction::Forward { sink_block } => {
+            if let Some(sink) = app.sink_for(sink_block) {
+                if let Some(b) = app.manager.get(sink_block) {
+                    let ev = PointerEvent {
+                        block_local: [c[0] - b.x, c[1] - b.y],
+                        phase,
+                        button,
+                        wheel_delta,
+                    };
+                    let _ = sink.on_pointer(sink_block, &ev);
+                }
             }
         }
-        None => app.shared.emit(EngineEvent::MoveStarted { id }),
+        RouteAction::Noop => {}
     }
-}
 
-/// 抬起：结束会话并上抛结果矩形（逻辑像素）。
-unsafe fn on_button_up(hwnd: HWND) {
-    if let Some(app) = app_of(hwnd) {
+    // 左键 Up 的会话收尾必须与路由结果无关：0.4.2 语义里 WM_LBUTTONUP 无条件结束
+    // 拖拽/缩放并 ReleaseCapture。把收尾绑在 Forward 分支会漏掉「把手带缩放 Down
+    // 不设 owner => Up 走 Noop」的路径（verify_input_sink.py 实测：缩放会话不结束，
+    // 块被停放光标一路拉伸到屏幕极限）。右键 Up（Up(Some(Right))）不参与左键会话收尾。
+    if phase_kind == PhaseKind::Up && button != Some(PointerButton::Right) {
         app.press = 0.0;
         if let Some(session) = app.drag.take() {
             let id = session.id();
@@ -341,9 +432,104 @@ unsafe fn on_button_up(hwnd: HWND) {
                 m.region_dirty = true;
             }
         }
+        let _ = ReleaseCapture();
+        request_render(hwnd);
     }
-    let _ = ReleaseCapture();
-    request_render(hwnd);
+}
+
+/// Move 事件转发给 sink。
+unsafe fn forward_move_to_sink(app: &mut App) {
+    let c = app.cursor;
+    let target = match app.route_state {
+        RouteState::Pressing(owner) => Some(owner.block),
+        RouteState::Idle => app.manager.hit_test(c[0], c[1]),
+    };
+    if let Some(block_id) = target {
+        if let Some(sink) = app.sink_for(block_id) {
+            if let Some(b) = app.manager.get(block_id) {
+                let ev = PointerEvent {
+                    block_local: [c[0] - b.x, c[1] - b.y],
+                    phase: PointerPhase::Move,
+                    button: None,
+                    wheel_delta: 0,
+                };
+                let _ = sink.on_pointer(block_id, &ev);
+            }
+        }
+    }
+}
+
+/// 开始缩放会话。
+unsafe fn start_resize_session(
+    app: &mut App,
+    hwnd: HWND,
+    block: u32,
+    edges: ResizeEdges,
+    c: [f32; 2],
+) {
+    if app.manager.bring_to_front(block) {
+        app.geometry_changed = true;
+    }
+    if app.level.raises_on_click() {
+        level::raise_on_click(hwnd);
+    }
+    let Some(b) = app.manager.get(block) else {
+        return;
+    };
+    let s = b.scale.max(1e-3);
+    let origin = [b.x, b.y, b.width / s, b.height / s];
+    let min_size = [b.resize.min_width, b.resize.min_height];
+    let now = app.t0.elapsed().as_secs_f64();
+    app.min_drag_size = min_size;
+    app.drag = Some(DragSession::Resize(ResizeState::begin(
+        block, edges, c, origin, now,
+    )));
+    app.hover = Some(block);
+    app.hover_handle = edges;
+    app.press = 1.0;
+    let _ = SetCapture(hwnd);
+    app.shared.request_render();
+    if let Some(handle) = edges.public() {
+        app.shared
+            .emit(EngineEvent::ResizeStarted { id: block, handle });
+    }
+}
+
+/// 开始移动会话。
+unsafe fn start_move_session(app: &mut App, hwnd: HWND, block: u32, c: [f32; 2]) {
+    if let Some(b) = app.manager.get(block) {
+        if !b.movable {
+            if app.manager.bring_to_front(block) {
+                app.geometry_changed = true;
+            }
+            if app.level.raises_on_click() {
+                level::raise_on_click(hwnd);
+            }
+            app.shared.request_render();
+            return;
+        }
+    }
+    if app.manager.bring_to_front(block) {
+        app.geometry_changed = true;
+    }
+    if app.level.raises_on_click() {
+        level::raise_on_click(hwnd);
+    }
+    let Some(b) = app.manager.get(block) else {
+        return;
+    };
+    let s = b.scale.max(1e-3);
+    let origin = [b.x, b.y, b.width / s, b.height / s];
+    let min_size = [b.resize.min_width, b.resize.min_height];
+    let now = app.t0.elapsed().as_secs_f64();
+    app.min_drag_size = min_size;
+    app.drag = Some(DragSession::Move(MoveState::begin(block, c, origin, now)));
+    app.hover = Some(block);
+    app.hover_handle = ResizeEdges::NONE;
+    app.press = 1.0;
+    let _ = SetCapture(hwnd);
+    app.shared.request_render();
+    app.shared.emit(EngineEvent::MoveStarted { id: block });
 }
 
 /// 把画布窗口区域限制成「所有块 ⊕ 外扩量」的并集。

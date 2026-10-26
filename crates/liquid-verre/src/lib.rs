@@ -75,9 +75,10 @@ pub(crate) mod runtime;
 
 pub use api::{
     CaptureBackend, CaptureConfig, DiagnosticsConfig, Engine, EngineConfig, EngineEvent,
-    EventHandler, GlassMode, GlassStyle, GlassWindow, LiquidParams, LogLevel, MonitorSnapshot,
-    Profile, Rect, ResizeFeedbackOptions, ResizeHandle, ResizeOptions, Shape, TransparentParams,
-    WindowConfig, WindowLevel, WindowSnapshot, ZOrder, EVENT_QUEUE_CAP,
+    EventHandler, GlassInputSink, GlassMode, GlassStyle, GlassWindow, InputDecision, LiquidParams,
+    LogLevel, MonitorSnapshot, PointerButton, PointerEvent, PointerPhase, Profile, Rect,
+    ResizeFeedbackOptions, ResizeHandle, ResizeOptions, Shape, TransparentParams, WindowConfig,
+    WindowLevel, WindowSnapshot, ZOrder, EVENT_QUEUE_CAP,
 };
 pub use build_info::{BuildInfo, BUILD_INFO};
 pub use error::{Error, ErrorKind, Result};

@@ -7,14 +7,17 @@
 //! - [`style`]：样式缓存（避免每帧重算 `sanitize`）
 //! - [`geometry`]：矩形 / 影响盒运算的单一来源
 //! - [`quality`]：自适应质量控制器
+//! - [`routing`]：输入路由决策状态机
 //! - [`sdf`]：折射 LUT 与逐块参数夹紧
 
 pub(crate) mod block;
+pub(crate) mod content;
 pub(crate) mod draw;
 pub(crate) mod geometry;
 pub(crate) mod handle;
 pub(crate) mod manager;
 pub(crate) mod params;
 pub(crate) mod quality;
+pub(crate) mod routing;
 pub(crate) mod sdf;
 pub(crate) mod style;

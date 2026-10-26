@@ -190,6 +190,25 @@ border pass，否则悬停把手时直边会残留一条白色高光（参考图
   hover 与把手都不命中 ⇒ `feedback == ResizeFeedback::NONE`，`draw_borders` 直接返回。
   要验这次改动只能用连拍（`GLASS_SHOT_EVERY_MS`）+ 肉眼，或把光标物理停放到把手上。
 
+### 3.4c 内容层 = 逐块交错叠加 pass（P0-1，2026-10-26）
+
+shaders/content_vs.hlsl + shaders/content_ps.hlsl，自有 cbuffer ContentCb : register(b1)
+（c0 块矩形(画布px): left/top / width/height、c1 纹理 w,h / effective_radius / AA_width、
+c2 画布尺寸），自有纹理 SRV 槽 **	9**（Texture2D texContent : register(t9)）。
+
+- 在 Pass B 的 z 序循环内，每块玻璃 Draw 后立即 draw_content_for_block：
+  切换到 content_vs/content_ps、设 scissor、Draw(6)、**立即切回玻璃 VS/PS 并重绑 t0..t8**
+  （否则下一块玻璃静默消失——gotchas #3，2026-10-26 bring-up 实测抓到的坑）。
+- PS 用整数 Load 取纹素（	exContent.Load(int3(t, 0))），不占采样器；
+  1:1 纹理映射（块内像素偏移 = 纹素下标），无缩放。
+- 输出经 SdRoundBox 圆角掩码裁剪（半径 = 与玻璃 PS 同源的 ffective_radius，
+  单一来源 C5），整段 premultiplied alpha。
+- 与玻璃 pass 共用 RT、viewport（整画布）、raster（scissor 开）、premul blend、
+  depth；**独占** b1 cbuffer 与 t9 SRV 槽。玻璃只用 b0 + t0..t8，无冲突。
+- ContentCb 的 Rust 镜像共 CONTENT_CB_FLOATS = 3 * 4 个 f32。
+- 无内容的块零开销跳过（HashMap 仅当 store 非空才查）；空 store ⇒ 整帧零新增 API 调用，
+  像素输出与 0.4.2 基线逐位一致（第一门禁前提）。
+
 ### 3.5 环境变量
 
 完整表见 `README.md`。主循环那批（`GLASS_METRICS` / `GLASS_DEFAULT_BLOCK` / `GLASS_MANY` /

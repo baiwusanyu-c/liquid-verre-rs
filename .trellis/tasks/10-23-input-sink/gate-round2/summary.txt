@@ -1,0 +1,17 @@
+﻿=== round2 gate run start 2026-10-23T18:33:35.1395253+08:00
+01_cargo_test exit=0 15s
+02_clippy exit=0 3s
+03_fmt exit=1 1s
+04_check_mjs exit=1 2s
+05_sink_behavior exit=0 16s
+06_cmp_visual exit=0 76s
+07_verify_dirty_r1 exit=0 35s
+08_verify_dirty_r2 exit=0 35s
+09_verify_dirty_r3 exit=0 35s
+10_mouse_isolation exit=0 51s
+11_validity exit=0 14s
+12_tremble_far exit=0 7s
+13_tremble_many exit=0 8s
+14_adaptive exit=0 50s
+15_gate_ab exit=0 431s
+=== round2 gate run done 2026-10-23T18:46:33.4102368+08:00

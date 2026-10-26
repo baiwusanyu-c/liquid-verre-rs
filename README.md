@@ -123,6 +123,8 @@ engine.shutdown();
 - 写（交互 / 层级 / 可见性）：`set_resize_options(ResizeOptions)`、`set_resizable(bool)`、
   `set_z_order(ZOrder)`、`bring_to_front()`、`send_to_back()`、`set_visible(bool)`、
   `set_interactive(bool)`、`set_movable(bool)`、`close()`
+- 写（输入路由）：`set_input_sink(Option<Arc<dyn GlassInputSink>>)`（`None` = 摘除，行为回到库默认）
+- 写（内容层）：`update_content(w_phys, h_phys, &[u8], Option<[u32;4]>)`、`clear_content()`
 
 `set_opacity` / `set_color` 在透明模式改 `opacity` / `color`，在液态模式改 `base_alpha` / `tint_color`。
 `canvas_handle()` 是给上层「把自己的 UI 窗口按同样矩形贴在玻璃之上」用的；
@@ -147,6 +149,32 @@ engine.shutdown();
 | `LogLevel` | `Error` / `Warn` / `Info`(**默认**) / `Debug` / `Trace`；有 `From<LogLevel> for log::LevelFilter` |
 | `Rect` | `pub type Rect = [f32; 4]` = `[x, y, width, height]` |
 
+### 内容层（`update_content`）——每块一张位图
+
+块本身只有玻璃。内容层让宿主把**预乘 BGRA8 位图**贴到块上：画在「本块玻璃之上、缩放 border 反馈
+之下」，被本块有效圆角掩码裁剪；z 序交错绘制保证上层块的玻璃盖住下层块的内容（`verify_content.py`
+对这一点做了判别力取证）。
+
+```rust
+// 物理像素；行距 = w_phys * 4；dirty = 块内半开区间 [x0, y0, x1, y1)，None = 全量。
+win.update_content(800, 600, &premultiplied_bgra8, Some([16, 16, 116, 116]));
+// 尺寸变化/隐藏/回收前先清除，避免旧内容按新矩形残留：
+win.clear_content();
+```
+
+语义与成本：
+
+- **1:1 不缩放**：纹理贴块矩形左上角，超出部分裁剪、不足部分透明；resize 后请 `clear_content`
+  再按新尺寸推流（取证断言 5 证明无拉伸残留）。
+- **静态零成本**：同内容不重传不重画；`dirty` 只上传子区（`UpdateSubresource` 子矩形），
+  子区外像素逐位不动（取证断言 4）。
+- **无内容的块/帧零开销**：内容存储为空时连查找都没有，渲染 pass 数与 0.4.2 完全一致——
+  这是本库的第一门禁（无内容构建 vs 0.4.2 基线像素零差异，已实测）。
+- 异步消费：与所有 setter 一致，提交后 ≤1 帧可见。
+- 参数校验（长度 ≠ w·h·4、单边 > 8192）⇒ 丢弃该条 + warn-once，**不返回 Err**；
+  w/h = 0 等价 `clear_content`。显存 = 每内容块 w·h·4（+ WDDM 镜像开销）。
+- 文本/图标/矢量请宿主自己渲染进位图（D2D/GDI 均可）；库只吃位图，不内置文字渲染。
+
 ### 三个正交的交互开关（别混）
 
 | 开关 | 关掉后的效果 | 仍然生效的部分 |
@@ -165,11 +193,146 @@ engine.shutdown();
 - `movable` 不参与渲染，因此 `apply_one` 对 `SetMovable` 返回 `false`（不脏化任何绘制账本），
   只置 `snapshot_dirty` —— 玻璃像素一个都不变，但下一帧快照里能读到新值。
 
+### 输入路由（`GlassInputSink`）——把块当窗口用
+
+块不是 HWND，鼠标消息只落到画布 wnd_proc。sink 就是库补上的那件「最小事件分发」：
+光标在块内时，指针事件**同步**路由给你的实现，`Down` 的返回值决定库这次按压开不开移动会话。
+
+```rust
+use liquid_verre::{GlassInputSink, InputDecision, PointerEvent, PointerPhase};
+use std::sync::Arc;
+
+struct MySink;
+impl GlassInputSink for MySink {
+    fn on_pointer(&self, id: u32, ev: &PointerEvent) -> InputDecision {
+        match ev.phase {
+            PointerPhase::Down => {
+                if in_icon_area(ev.block_local) { InputDecision::Consumed }
+                else { InputDecision::Ignored }
+            }
+            PointerPhase::DoubleClick => { open_item(id, ev.block_local); InputDecision::Consumed }
+            PointerPhase::Wheel => { scroll(id, ev.wheel_delta); InputDecision::Consumed }
+            _ => InputDecision::Ignored,
+        }
+    }
+    fn cursor_override(&self, _id: u32) -> Option<isize> { None }
+}
+
+win.set_input_sink(Some(Arc::new(MySink)));
+```
+
+硬规则（宿主交互正确性的契约，库行为以此为准，`tools/verify_input_sink.py` 逐条取证）：
+
+1. **缩放把手带（含块外扩 grip）优先级恒高于 sink**：命中带内一律走库缩放会话 + hover
+   border 反馈，**不询问 sink**。
+2. 左键 `Down`（块内）先询问 sink：`Consumed` = 不开移动会话、**不 SetCapture**（OLE 拖出
+   因此天然可用——`DoDragDrop` 请锚在宿主自己的壳窗口上）；`DragMove` = 开移动会话；
+   `Ignored` = 库默认（等价 `DragMove`）。
+3. `Down` 之后的同一按压序列**粘滞**：Move/Up 绑定转发给 owner 块（Up 必回按压时消费的
+   块，即使光标已经离开）。
+4. 未按压时 Move / DoubleClick / RightDown / RightUp（`Up(Some(Right))`）/ Wheel 转发给
+   光标所在最上层块（与命中测试同一 z 序）。
+5. 未设置 sink 的块与旧版本行为完全一致；`wheel_delta` = 滚轮格数（一格 ±1），
+   `block_local` 是块内物理像素坐标（原点 = 块矩形左上角，不含阴影外扩）。
+6. 回调在**渲染线程**（画布 wnd_proc 上下文）同步执行：微秒级返回、不阻塞、不重入引擎；
+   **禁止在回调内调 `DoDragDrop`**（OLE 模态泵会卡死渲染线程、玻璃停绘）。回调内调库 setter
+   是安全的（异步入队，≤1 帧生效）。
+
+键盘不路由（画布 `WS_EX_NOACTIVATE`）：宿主用隐藏壳窗口接收键盘并做 OLE 拖出锚点。
+
+### 把 IDropTarget 挂到画布（P1-2 拖入命中与 pump 稳定性契约）
+
+画布 `WS_EX_TRANSPARENT` 逐帧切换使 `WindowFromPoint` 在无交互时穿透画布，
+因此 OLE `IDropTarget` 不应直接注册到画布 HWND。推荐模式：
+
+#### 壳窗口锚点模式（推荐）
+
+宿主创建一个不可见的最小壳窗口（`WS_EX_TOOLWINDOW`，尺寸 1x1，无任务栏按钮），
+将 `IDropTarget` 注册到该壳窗口上。拖拽命中判定由壳窗口 `DragEnter` 回调中
+按屏幕坐标 ↔ 块内坐标换算，自己决定本次拖拽属于哪块：
+
+```
+// 屏幕坐标 → 块内逻辑像素坐标
+fn screen_to_block(screen_pt: POINTL, block_rect: Rect, scale: f32) -> [f32; 2] {
+    let block_logical_x = (screen_pt.x as f32 - block_rect[0]) / scale;
+    let block_logical_y = (screen_pt.y as f32 - block_rect[1]) / scale;
+    [block_logical_x, block_logical_y]
+}
+```
+
+块矩形与 scale 从 `WindowSnapshot` 读取（`GlassWindow::snapshot()`）。
+多块场景按 z 序从高到低命中第一个包含该点的块。
+
+#### 命中/pump 稳定性承诺（基于实测）
+
+`tools/verify_focus_drop.py` 对 `WS_EX_TRANSPARENT` 逐帧切换下 `WindowFromPoint`
+命中率进行了 >= 50 轮实测（块内 9 个采样点 × 每点 10 次 × 每轮，间隔 >= 50ms，
+模拟 OLE drag-over 反复探测时序）：
+
+- **块内命中率 > 95%**：首次命中延迟 < 0.5ms（TRANSPARENT 摘除由主循环 idle tick
+  驱动，无自锁死），稳态命中 120/120
+- **块外穿透率 > 50%**（反向对照）：证明 `WS_EX_TRANSPARENT` 切换在正确起效，
+  块外区域正确穿透到下层窗口
+- **稳定漏检 = 0**：未出现同点连续 >= 3 次全 miss 的情况
+
+因此 OLE `IDropTarget` 性能语义为：drag-over 反复探测可以稳定命中画布，
+TRANSPARENT 摘除延迟在亚毫秒级。
+
+#### 焦点路由（`set_focus_hwnd` → `EngineEvent::FocusHint`）
+
+块不是 HWND，画布按设计 `WS_EX_NOACTIVATE`——**库永不代宿主触碰键盘焦点**。
+2026-10-26 实测裁决：跨线程代调 `SetFocus` 没有安全方式——`AttachThreadInput`
+对「没有消息泵的目标线程」会把调用方挂死（实测：渲染线程当场冻结、取证心跳
+停摆），目标进程非前台时同样被系统策略拒。于是焦点时机以事件送达、焦点动作
+归还宿主：
+
+```
+win.set_focus_hwnd(host_shell_hwnd as isize);  // 登记宿主壳窗口，0 = 清除
+```
+
+块被按压且 sink 返回 `Consumed` 时，库发出 `EngineEvent::FocusHint { id, hwnd }`
+（`poll_events` 与 `set_event_handler` 两条消费路都送）。宿主两条路真正拿到焦点：
+
+**best-effort 语义**：按压本就在画布上发生，前台合法性高、attach 窗口极短。
+若 `ret=NULL`（例：目标进程非前台且 attach 被系统策略拒），库不重试、
+不报错，仅打一次 `[warn]`。
+
+**宿主兜底**（当库的 `SetFocus` 因 Win32 策略无法送达时）：
+在 `GlassInputSink::on_pointer` 的 Down 回调里 `PostMessage` 给自己的壳窗口
+（`PostMessage` 任意线程合法），壳窗口在自己线程调用 `SetFocus` 自己：
+
+```rust
+// sink 回调内（渲染线程，对宿主壳窗口发消息）
+unsafe { PostMessageW(host_shell_hwnd, WM_USER_FOCUS, 0, 0); }
+// 宿主壳窗口 wnd_proc 内（自己的线程）
+match msg { WM_USER_FOCUS => { SetFocus(host_shell_hwnd); } }
+```
+
+宿主自己的线程在 `poll_events` 里收到 `FocusHint`，对壳窗口 `SetFocus`——壳窗口
+本就属于宿主线程，同线程调用合法必成（playground 的 demo 即此实现）；
+或在 sink 的 `Down` 回调里 `PostMessage` 给自己的壳窗口（PostMessage 任意线程
+合法、无锁），壳窗口收到消息后自己 `SetFocus`。
+
+守卫：画布自身 HWND 传进来会被拒绝登记（warn-once）——画布永不经任何路径获得
+键盘，因此画布上的 ESC→关停引擎调试路径恒不可达。
+
+`[event] FocusHint` + `[verify] focus_applied id= target=0x.. ret=0x..` 是
+`verify_focus_drop.py` 的证据链（含按压后心跳连续=防冻结回归、连击 100 压力）。
+
+#### 交叉引用
+
+- sink 回调内**禁止 `DoDragDrop`**（OLE 模态泵会卡死渲染线程，玻璃停绘）
+  → 见 §输入路由 契约第 4 条
+- `set_focus_hwnd`：按压消费时发 `FocusHint` 事件，焦点由宿主在自己线程执行
+  → 见 `EngineEvent::FocusHint` rustdoc（含 attach 挂死教训）
+- 焦点守卫：画布自身 HWND 被传给 `set_focus_hwnd` 时拒绝登记 + warn-once
+  → 见 `.trellis/tasks/10-23-focus-drop-routing/research/esc-and-focus-guard.md`
+
 ### 事件与错误
 
-- `EngineEvent`（`#[non_exhaustive]`，18 个变体）：`Ready{monitor_count}`、
+- `EngineEvent`（`#[non_exhaustive]`，19 个变体）：`Ready{monitor_count}`、
   `MonitorsChanged{monitor_count}`、`WindowCreated{id}`、`WindowDestroyed{id}`、
-  `MoveStarted{id}`、`MoveEnded{id,rect}`、`ResizeStarted{id,handle}`、`ResizeEnded{id,rect}`、
+FocusHint{id,hwnd}、  `MoveStarted{id}`、`MoveEnded{id,rect}`、`ResizeStarted{id,handle}`、`ResizeEnded{id,rect}`、
   `LevelApplied{level}`、`CaptureBackendSelected{monitor_index,monitor_name,backend}`、
   `CaptureLost{monitor_index,reason}`、`CaptureRestored{monitor_index}`、
   `ExclusiveFullscreen{monitor_index,active}`、`QualityLevelChanged{level}`、
@@ -196,6 +359,51 @@ engine.shutdown();
   `monitor_index`、`scale`、`visible`、`interactive`、`movable`、`hovered`、`moving`、`resizing`。
 - `MonitorSnapshot`：`name`(`\\.\DISPLAY1`)、`origin`、`size`、`dpi`、`scale`、`primary`、
   `capture_backend`(`"dda"` / `"wgc"` / `"none"`)、`canvas_visible`、`canvas_handle`。
+
+## 宿主集成样例（把块当窗口用的最小闭环）
+
+以「桌面分类框」这类场景为例，四项核心交互在库能力上的完整拼法（Rust 示意，
+类型均出自 `liquid_verre::api`）：
+
+```rust
+use liquid_verre::{Engine, EngineEvent, GlassInputSink, GlassWindow, InputDecision,
+                  PointerEvent, PointerPhase};
+use std::sync::Arc;
+
+// ① 内容推流：宿主（D2D/GDI/任何渲染器）把图标+标签画进预乘 BGRA8 位图
+struct IconSink { /* 线程安全的图标命中表快照 */ }
+impl GlassInputSink for IconSink {
+    fn on_pointer(&self, id: u32, ev: &PointerEvent) -> InputDecision {
+        match ev.phase {
+            PointerPhase::Down =>
+                if self.hit_icon(ev.block_local) {
+                    // 选中态变化 → 只需重画受影响子区；顺带唤焦点（见 ④）
+                    self.post_focus_to_shell();   // PostMessage 到自己壳窗口，无锁安全
+                    InputDecision::Consumed
+                } else { InputDecision::Ignored } // 空白区 → 库开移动会话
+            PointerPhase::DoubleClick => { self.open_selected(id); InputDecision::Consumed }
+            PointerPhase::RightDown => { self.queue_context_menu(id, ev.block_local); InputDecision::Consumed }
+            PointerPhase::Wheel => { self.scroll(id, ev.wheel_delta); InputDecision::Consumed }
+            _ => InputDecision::Ignored,
+        }
+    }
+    fn cursor_override(&self, _id: u32) -> Option<isize> { self.hover_cursor() }
+}
+
+win.set_input_sink(Some(Arc::new(IconSink::snapshots())));
+win.update_content(w_px, h_px, &frame, Some([x0, y0, x1, y1]));  // 仅状态变化时推 dirty
+win.set_focus_hwnd(shell_hwnd as isize);                          // 键盘可达（FocusHint 驱动）
+```
+
+② **拖出文件**：`Consumed` 按压库不抓鼠标（不 SetCapture），宿主在壳窗口上起
+`DoDragDrop`（OLE 锚点=壳窗口，**绝不在 sink 回调内调**）。
+③ **拖入文件**：`IDropTarget` 注册到 `canvas_handle()`（每屏一个），`Drop` 坐标按块矩形
+自行换算路由——命中稳定性由 `verify_focus_drop.py` 取证背书（见「把 IDropTarget 挂到画布」节）。
+④ **键盘**：`FocusHint` 事件 → 宿主在自己线程 `SetFocus` 壳窗口（ESC/Delete/F2 到宿主
+自己的消息循环，库零参与焦点）。
+
+移动/缩放/叠放/固定/DPI 全部沿用库既有能力（`movable`/`ResizeOptions`/`ZOrder`/`set_interactive`），
+不需要为「窗口本体」再创建任何 HWND。
 
 ## 层级语义（两个不同的东西，别混）
 
@@ -230,6 +438,9 @@ engine.shutdown();
 - `Engine` 不是 `Send`（持有 `JoinHandle`）；需要跨线程共享时自己包 `Arc<Engine>`
   （`playground` 就是这么做的：面板线程持 `Arc<Engine>`，主线程轮询事件）。
 - `EngineEvent` 回调在**渲染线程**执行：不要阻塞、不要重入引擎（会死锁），重活转到自己的线程。
+- `GlassInputSink::on_pointer` / `cursor_override` 同样在**渲染线程**（画布 wnd_proc 上下文）
+  同步回调：契约与 `EventHandler` 一致，另加一条硬禁令——**回调内禁 `DoDragDrop`**
+  （OLE 模态泵卡渲染线程）。回调内调 setter 安全（异步入队）。
 
 ## 日志与错误捕获
 
@@ -456,6 +667,17 @@ HTTP 接口：`GET /`、`GET /api/schema`、`GET /api/state`、`GET /api/events`
 `GLASS_INTERNAL_SHOT` / `GLASS_SHOT_EVERY_MS` / `GLASS_METRICS` / `GLASS_SIM_BACKDROP` /
 `GLASS_VERIFY_PASS_A` / `GLASS_VERIFY_VALIDITY`）下 playground **不会**加演示窗口 ——
 多出来的窗口会让逐位比对图整体错位（实测抓到过 single 场景 interior 差 49885 像素）。
+
+### 输入路由 demo（取证用）
+
+`GLASS_INPUT_SINK_DEMO=1` 给默认块挂 demo sink（左半 `Consumed` / 右半 `DragMove`），
+打 `[verify]` 事件日志（含按压瞬间的 capture 归属）并起 400ms 的 rect 心跳线程，
+供 `tools/verify_input_sink.py` 驱动与判定；默认不开，不影响任何基线取证。
+
+### 内容层 demo（取证用）
+
+`GLASS_CONTENT_DEMO=<场景>`（checker/solid/dirty/clear_seq/stack/resize_* 等 6+ 场景）让默认块
+推确定性图案内容并打 `[verify]` 日志，供 `tools/verify_content.py` 驱动；默认不开，不影响任何基线取证。
 
 ## 目录结构
 
@@ -722,6 +944,13 @@ python tools/repro_tremble.py many       # 密集 20 块同上
 python tools/verify_adaptive.py          # 自适应控制器：降档 / 回升 / 显存回收闭环
 python tools/ab_latency.py               # GLASS_FRAME_LATENCY 1 vs 2 轮转 A/B（吞吐档依据）
 python tools/ab_memory.py                # 常驻内存受控 A/B（level 0 vs level 1）
+```
+
+行为取证（0.5.0 输入路由新增；改消息路由 / 会话收尾时必跑）：
+
+```powershell
+python tools/verify_input_sink.py        # GlassInputSink 五条行为断言：物理注入 + rect 心跳 + capture 归属
+python tools/verify_content.py           # 内容层五条断言：精确采样 / 叠放交错 / clear 逐位回基线 / dirty 隔离 / resize 无残留
 ```
 
 视觉改动额外：

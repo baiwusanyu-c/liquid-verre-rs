@@ -16,6 +16,8 @@ pub const BLUR_UP: &str = include_str!("../../shaders/blur_up.hlsl");
 pub const ENV_EMA: &str = include_str!("../../shaders/env_ema.hlsl");
 pub const BORDER_VS: &str = include_str!("../../shaders/border_vs.hlsl");
 pub const BORDER_PS: &str = include_str!("../../shaders/border_ps.hlsl");
+pub const CONTENT_VS: &str = include_str!("../../shaders/content_vs.hlsl");
+pub const CONTENT_PS: &str = include_str!("../../shaders/content_ps.hlsl");
 
 pub fn compile(src: &str, entry: &str, target: &str) -> crate::error::Result<ID3DBlob> {
     let entry_c = std::ffi::CString::new(entry).unwrap();

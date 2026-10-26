@@ -1,0 +1,7 @@
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/prd.md","reason":"§4 门禁 + A1-A5 跨子任务验收"}
+{"file":".trellis/tasks/10-23-glass-window-host-capabilities/design.md","reason":"§1 设计逐条核对实现走样与否"}
+{"file":".trellis/spec/backend/rendering-pipeline.md","reason":"零差异回归判据：9 条不变量 + cbuffer 冻结"}
+{"file":".trellis/spec/guides/graphics-change-checklist.md","reason":"渲染改动的复核检查单"}
+{"file":".trellis/spec/backend/measurement-and-gates.md","reason":"验收命令全表（cmp_visual/verify_dirty×3/gate_perf/ab_memory）"}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"质量红线复查"}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"分层边界复查：gfx unsafe 归属、api 导出面"}

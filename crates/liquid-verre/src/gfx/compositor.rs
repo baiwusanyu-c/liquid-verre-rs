@@ -53,6 +53,7 @@ pub struct FrameInput<'a> {
     pub max_lag_seconds: f32,
     /// 本屏是否存在需要桌面背景的块。`false` = 全是透明玻璃，整条 Pass A 跳过。
     pub needs_backdrop: bool,
+    pub content_store: &'a crate::gfx::content_layer::ContentStore,
 }
 
 /// 交换链后备缓冲：只有 RTV（flip-model 后备缓冲不允许创建 SRV）
@@ -437,6 +438,7 @@ impl Compositor {
             cursor_screen,
             canvas_origin,
             prev_cursor_canvas,
+            content_store,
             drag_velocity,
             time,
             press,
@@ -844,6 +846,7 @@ impl Compositor {
                 time,
                 press,
                 hover_id,
+                Some(content_store),
             );
             // 缩放反馈 border：独立叠加 pass，盖在全部玻璃之上（需求 F2）。
             // 没有块需要反馈时 draw_borders 内部直接返回，零状态切换。

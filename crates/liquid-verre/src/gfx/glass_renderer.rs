@@ -28,6 +28,8 @@ const CB_FLOATS: usize = 19 * 4;
 /// BorderCb 的槽位数（b0..b6）。
 const BORDER_CB_FLOATS: usize = 7 * 4;
 
+const CONTENT_CB_FLOATS: usize = 3 * 4;
+
 /// LUT 缓存条目。键 = `(ior 的位模式, profile)` —— LUT 只由这两项决定
 /// （见 `core::sdf::build_refraction_lut`），因此同键必然同内容。
 struct LutEntry {
@@ -99,6 +101,9 @@ pub struct GlassRenderer {
     bvs: ID3D11VertexShader,
     bps: ID3D11PixelShader,
     bcb: ID3D11Buffer,
+    cvs: ID3D11VertexShader,
+    cps: ID3D11PixelShader,
+    ccb: ID3D11Buffer,
     /// 环境色 EMA（方案 12.6）
     pub env_ema: [f32; 3],
     /// 本帧真正执行了 Draw 的块数（metrics 用）
@@ -213,6 +218,24 @@ impl GlassRenderer {
         };
         let bcb = make_dynamic_cbuffer(device, (BORDER_CB_FLOATS * 4) as u32)?;
 
+        let cvs_blob = compile(crate::gfx::shaders::CONTENT_VS, "vs_main", "vs_5_0")?;
+        let cps_blob = compile(crate::gfx::shaders::CONTENT_PS, "ps_main", "ps_5_0")?;
+        let cvs = unsafe {
+            let mut o = None;
+            device
+                .CreateVertexShader(bytes(&cvs_blob), None, Some(&mut o))
+                .map_err(|e| e.to_string())?;
+            o.ok_or("CreateVertexShader(content)")?
+        };
+        let cps = unsafe {
+            let mut o = None;
+            device
+                .CreatePixelShader(bytes(&cps_blob), None, Some(&mut o))
+                .map_err(|e| e.to_string())?;
+            o.ok_or("CreatePixelShader(content)")?
+        };
+        let ccb = make_dynamic_cbuffer(device, (CONTENT_CB_FLOATS * 4) as u32)?;
+
         let default_key = lut_key(&default_params);
         Ok(Self {
             vs,
@@ -225,6 +248,9 @@ impl GlassRenderer {
             bvs,
             bps,
             bcb,
+            cvs,
+            cps,
+            ccb,
             lut_srv,
             luts: std::cell::RefCell::new(Vec::new()),
             bound_lut: std::cell::Cell::new(default_key),
@@ -344,6 +370,7 @@ impl GlassRenderer {
         time: f32,
         press: f32,
         hover_id: Option<u32>,
+        contents: Option<&crate::gfx::content_layer::ContentStore>,
     ) {
         self.drawn.set(0);
         // t4 在下面的 PSSetShaderResources(0..9) 里被重置成默认 LUT，
@@ -367,6 +394,17 @@ impl GlassRenderer {
             return;
         };
 
+        let srvs = [
+            Some(capture.clone()),
+            Some(frost.srv.clone()),
+            Some(soft.srv.clone()),
+            Some(env16.srv.clone()),
+            Some(self.lut_srv.clone()),
+            Some(blur0.srv.clone()),
+            Some(blur1.srv.clone()),
+            Some(blur2.srv.clone()),
+            Some(blur3.srv.clone()),
+        ];
         unsafe {
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(TOPO_TRIANGLE);
@@ -388,18 +426,17 @@ impl GlassRenderer {
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
             ctx.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
             ctx.VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
-            let srvs = [
-                Some(capture.clone()),
-                Some(frost.srv.clone()),
-                Some(soft.srv.clone()),
-                Some(env16.srv.clone()),
-                Some(self.lut_srv.clone()),
-                Some(blur0.srv.clone()),
-                Some(blur1.srv.clone()),
-                Some(blur2.srv.clone()),
-                Some(blur3.srv.clone()),
-            ];
             ctx.PSSetShaderResources(0, Some(&srvs));
+        }
+        // 内容层（P0-1）：只有 store 里真的有层时才多绑一个 CB 槽位（b1）；
+        // 空 store => 本帧与重构前逐位一致，零新增 API 调用（FR5 / 第一门禁前提）。
+        let store = contents.filter(|s| !s.is_empty());
+
+        if store.is_some() {
+            unsafe {
+                ctx.VSSetConstantBuffers(1, Some(&[Some(self.ccb.clone())]));
+                ctx.PSSetConstantBuffers(1, Some(&[Some(self.ccb.clone())]));
+            }
         }
 
         for &index in order {
@@ -587,13 +624,114 @@ impl GlassRenderer {
                 ctx.Draw(6, 0);
             }
             self.drawn.set(self.drawn.get() + 1);
+            // 内容必须**在本块玻璃之后、下一块玻璃之前**画（FR3）。
+            // 为什么不是「全部玻璃画完再统一画内容」的批量 pass：那样下层块的内容会
+            // 浮在上层块玻璃之上。具体实例：两块 50% 重叠（下块先画），批量结构下重叠区
+            // 采到的像素 = 裸 checker 纹素（内容覆盖了上层玻璃的混色结果）；交错结构下
+            // = 上层玻璃 premul 混在内容上。verify_content.py 断言 2 就是拿这个对照
+            // 数值做的硬判据（2026-10-26 实测数据见该脚本头部注释）。
+            // 无内容的块在这里只付一次 HashMap 查找（且仅当 store 非空）；空 store
+            // 时 store=None，连查找都没有。
+            if let Some(store) = store {
+                if let Some(layer) = store.get(block.id) {
+                    self.draw_content_for_block(
+                        ctx,
+                        block,
+                        p.corner_radius,
+                        layer,
+                        canvas_w,
+                        canvas_h,
+                        out_w,
+                        out_h,
+                        &srvs,
+                    );
+                }
+            }
         }
 
         unsafe {
             let null: [Option<ID3D11ShaderResourceView>; 9] =
                 [None, None, None, None, None, None, None, None, None];
             ctx.PSSetShaderResources(0, Some(&null));
+            if store.is_some() {
+                // t9 只在有内容时被写过；解绑防 hazard（gotchas #3）。
+                let null9: [Option<ID3D11ShaderResourceView>; 1] = [None];
+                ctx.PSSetShaderResources(9, Some(&null9));
+            }
             ctx.OMSetRenderTargets(None, None);
+        }
+    }
+
+    /// 画单块内容（紧接该块玻璃的 Draw 之后）。
+    ///
+    /// 与玻璃 pass 共享的东西**都不重绑**：RT、viewport（整画布）、raster（scissor 开）、
+    /// premul blend、depth、CB 槽位 0（玻璃 cbuffer）、t0..t8（玻璃纹理）、s0（linear
+    /// clamp）。内容只用自己的 b1 cbuffer 与 t9 纹理槽位——PS 用整数 `Load` 取点，
+    /// 不经过采样器，所以连 sampler 都不占。切换成本 = 2 次 SetShader + 1 次 SetSRV +
+    /// 1 次 CB 更新 + 1 次 scissor + 1 次 Draw，且只对**有内容的块**发生。
+    #[allow(clippy::too_many_arguments)]
+    fn draw_content_for_block(
+        &self,
+        ctx: &ID3D11DeviceContext,
+        block: &DrawBlock,
+        radius: f32,
+        layer: &crate::gfx::content_layer::ContentLayer,
+        canvas_w: f32,
+        canvas_h: f32,
+        out_w: i32,
+        out_h: i32,
+        glass_srvs: &[Option<ID3D11ShaderResourceView>; 9],
+    ) {
+        // 纹理锚定块矩形左上角 1:1；锚点取整保证纹素边界与设备像素对齐
+        // （取证断言 1 的「精确 checker 值」依赖这一点）。scissor 用同一取整矩形。
+        let rx0 = block.x.round() as i32;
+        let ry0 = block.y.round() as i32;
+        let rw = (block.width.round() as i32).max(1);
+        let rh = (block.height.round() as i32).max(1);
+        let sx = rx0.max(0);
+        let sy = ry0.max(0);
+        let ex = rx0.saturating_add(rw).max(0);
+        let ey = ry0.saturating_add(rh).max(0);
+        let mut cb = ContentCb {
+            v: [0.0; CONTENT_CB_FLOATS],
+        };
+        let set4 = |cb: &mut ContentCb, slot: usize, a: f32, b: f32, c: f32, d: f32| {
+            let i = slot * 4;
+            cb.v[i] = a;
+            cb.v[i + 1] = b;
+            cb.v[i + 2] = c;
+            cb.v[i + 3] = d;
+        };
+        set4(&mut cb, 0, rx0 as f32, ry0 as f32, rw as f32, rh as f32);
+        // c1.z = 该块本次绘制用的**最终** corner radius（与玻璃 c3.y 同一个
+        // p.corner_radius，C5 单一来源——不是第二处半径推导）。
+        set4(&mut cb, 1, layer.w as f32, layer.h as f32, radius, 1.25);
+        set4(&mut cb, 2, canvas_w, canvas_h, 0.0, 0.0);
+        if update_cbuffer(ctx, &self.ccb, &cb).is_err() {
+            return;
+        }
+        unsafe {
+            ctx.PSSetShaderResources(9, Some(&[Some(layer.srv.clone())]));
+            let cx1 = ex.min(out_w);
+            let cy1 = ey.min(out_h);
+            ctx.RSSetScissorRects(Some(&[WinRect {
+                left: sx,
+                top: sy,
+                right: cx1,
+                bottom: cy1,
+            }]));
+            ctx.VSSetShader(&self.cvs, None);
+            ctx.PSSetShader(&self.cps, None);
+            ctx.Draw(6, 0);
+            // 切回玻璃管线。t9 的 content SRV 绝不能活到下一块玻璃：bind_lut 在
+            // 逐块 LUT 切换时只重绑 t4 单槽，若 content pass 之后不整体重绑
+            // t0..t8，玻璃采样与绘制会踩 gotchas #3 的静默丢弃（2026-10-26
+            // bring-up 实测：content pass 后下一块玻璃整块消失，红屏实验定位）。
+            ctx.VSSetShader(&self.vs, None);
+            ctx.PSSetShader(&self.ps, None);
+            ctx.PSSetShaderResources(0, Some(glass_srvs));
+            let null9: [Option<ID3D11ShaderResourceView>; 1] = [None];
+            ctx.PSSetShaderResources(9, Some(&null9));
         }
     }
 }
@@ -615,6 +753,12 @@ pub(crate) struct BorderTarget<'a> {
 #[derive(Clone, Copy)]
 struct BorderCb {
     v: [f32; BORDER_CB_FLOATS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ContentCb {
+    v: [f32; CONTENT_CB_FLOATS],
 }
 
 impl GlassRenderer {
