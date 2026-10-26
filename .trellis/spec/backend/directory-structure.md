@@ -53,7 +53,9 @@ liquid-verre-rs/
 │     │  ├─ handle.rs             # GlassWindow 句柄（Clone+Send+Sync）、Command 枚举、Shared（命令队列 +
 │     │  │                        #   快照 RwLock + 事件队列 + 渲染请求位 + fatal 槽）、
 │     │  │                        #   Snapshot / WindowSnapshot / MonitorSnapshot
-│     │  └─ event.rs              # EngineEvent（18 变体）/ EventHandler / ResizeHandle（8 方向）/ EVENT_QUEUE_CAP=256
+│     │  ├─ event.rs              # EngineEvent（19 变体，0.5.0 增 FocusHint）/ EventHandler / ResizeHandle（8 方向）/ EVENT_QUEUE_CAP=256
+│     │  └─ input.rs              # GlassInputSink / PointerEvent / PointerPhase（Up 携按钮）/ InputDecision
+│     │                            #   + SinkRef(pub(crate) 命令负载)；线程契约与 DoDragDrop 禁令写死在 rustdoc
 │     │
 │     ├─ core/                    # ★ 纯逻辑领域模型：**零 `windows::` 引用、零 `unsafe`**，因此全部可单测
 │     │  ├─ params.rs             # LiquidParams（37 字段）+ Profile + Shape + sanitize + scaled(DPI) + inert()
@@ -61,6 +63,10 @@ liquid-verre-rs/
 │     │  │                        #   occluded / occl_streak + occlusion_step（遮挡迟滞状态机：置位需连续
 │     │  │                        #     OCCLUSION_CONFIRM_POLLS=2 轮命中、**解除只需 1 轮**；streak 到阈值即饱和，不许溢出 i8）
 │     │  ├─ manager.rs            # 块集合 / z 序（Front/Back/Absolute/Relative）/ hit_test / hit_resize / 跨屏归属
+│     │  ├─ routing.rs            # 输入按压仲裁状态机（把手带恒优先 → sink 决策 → PressOwner 粘滞），
+│     │  │                        #   route() 纯函数，转移矩阵 31 单测（P0-2）
+│     │  ├─ content.rs            # 内容层入参校验纯函数：plan_update（长度/8192 上限/0⇒clear）+ clip_dirty
+│     │  │                        #   （半开区间裁剪/退化⇒Empty），api 侧委托此处（P0-1）
 │     │  ├─ handle.rs             # ResizeEdges（8 方向常量）+ hit_handle（先角后边）+ to_shader_edges/corners
 │     │  │                        #   （直边与对角掩码在**源头**互斥）+ cursor_id（WM_SETCURSOR）
 │     │  ├─ draw.rs               # DrawBlock（按 DPI 展开后的渲染投影块，Copy）+ ResizeFeedback + draw_rect
@@ -123,7 +129,10 @@ liquid-verre-rs/
 │     │  │                        #   （外扩 32/24/16/8）、env EMA、frost 半分辨率档、scissor 幂等
 │     │  ├─ glass_renderer.rs     # Pass B：per-block CB 打包（c0..c18，见 rendering-pipeline §3.4）、
 │     │  │                           #   border 叠加 pass（draw_borders / BorderCb，见 §3.4b）、
-│     │  │                        #   逐块 LUT 缓存（MAX_LUTS=8，键 = ior 位模式 | profile）、z 序绘制
+│     │  │                        #   逐块 LUT 缓存（MAX_LUTS=8，键 = ior 位模式 | profile）、z 序绘制；
+│     │  │                        #   玻璃→内容逐块交错（draw_content_for_block，见 rendering-pipeline §3.4c）
+│     │  ├─ content_layer.rs      # 内容层 ContentStore：block_id→{texture,SRV,w,h} 生命周期 +
+│     │  │                        #   dirty 子区上传（Map 逐行；子矩形源指针必须指块左上角——踩过坑）
 │     │  └─ gpu_timer.rs          # D3D11 timestamp query（GLASS_GPU_TIMINGS=1 才创建；**禁止进闭环判据**）
 │     │
 │     ├─ capture/                 # 桌面采集（细节不得泄漏到 gfx/，一律经 Capture 封装）
@@ -225,11 +234,13 @@ liquid-verre-rs/
 2. **`core/` 不得依赖 `windows::`。** 需要平台信息（DPI、光标、显示器几何）时由 `runtime/` 取值后
    **作为参数传入**（例：`Block::effective_radius(&self, style)`、`DragSession::apply(cursor, now, scale, min_size)`）。
    这样 `core/` 的每一条规则都能被 `cargo test --release --workspace` 覆盖。
-3. **`unsafe` 只允许出现在 Win32 / GPU / COM 边界**：`platform/`（24 处）、`gfx/`（69 处）、
+3. **`unsafe` 只允许出现在 Win32 / GPU / COM 边界**：`platform/`（31 处）、`gfx/`（82 处）、
    `capture/`（32 处），以及 `runtime/`（13 处：`RoInitialize`、`SetProcessDpiAwarenessContext`、
    消息泵 `PeekMessageW/TranslateMessage/DispatchMessageW`、`GWLP_USERDATA` 绑定与解绑、`DestroyWindow`）
    与 `input/cursor.rs`（1 处 `GetCursorPos`）。
    **`api/` 与 `core/` 必须保持 0 个 `unsafe`**（现状已如此，改动后仍须为 0）。
+   **焦点 FFI 特别禁令**：`SetFocus` / `AttachThreadInput` 不得出现在库内任何位置——跨线程代调
+   实测要么恒失败（ret=0x0）要么挂死渲染线程（0.5.0 事故档案），焦点语义 = FocusHint 事件归宿主。
    每个 `unsafe` 块上方要写清「不变量由谁保证」。
 4. **上层不得直接触碰 GPU 资源。** 一切改动走 `api::handle::Command` 队列：上层 setter 推命令 +
    置渲染请求位，渲染线程**帧首一次性** `drain_into` 消费（`runtime/commands.rs::apply`）。

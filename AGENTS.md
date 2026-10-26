@@ -50,6 +50,11 @@ python tools/gate_perf.py                                         # 性能阀门
 被测 EXE = `target/release/liquid-verre-playground.exe`（`VERRE_EXE` / `VERRE_OLD_EXE` 可覆盖）；
 **库默认不自建窗口**，取证脚本一律显式设 `GLASS_DEFAULT_BLOCK=1`。
 
+0.5.0 宿主集成能力另有三件**功能行为取证**（触碰对应路径必复跑；同样不进 CI）：
+`verify_input_sink`（sink 六规则行为断言）、`verify_content`（内容层层序/dirty 隔离/零残留）、
+`verify_focus_drop`（拖入命中稳定性 + FocusHint 端到端 + 连击 100 + 按压后心跳防冻结断言）。
+三件都带**判别力设计**（反向对照/无证据=FAIL），改断言前先想「删实现它还红吗」。
+
 ## 发版与 CI（本地助手 + GitHub Actions）
 
 ```powershell
@@ -89,7 +94,10 @@ node scripts/release.mjs --bump patch --ship      # 一键发版：上面全部 
   （`RoInitialize`、DPI 感知、消息泵、`GWLP_USERDATA`、`DestroyWindow`）与 `input/cursor.rs`。
   **`api/` 与 `core/` 必须保持 0 个 `unsafe`。**
 - 上层不得直接触碰 GPU 资源或 `Manager`，一律走 `Command` 队列（setter 异步、帧首一次性消费、
-  延迟 ≤1 帧）+ `Snapshot` 读（最终一致）。
+  延迟 ≤1 帧）+ `Snapshot` 读（最终一致）。新增 `Command` 变体**只许追加枚举尾部**（并行纪律）。
+- 输入按压仲裁（把手带/sink/z 序/粘滞）归 `core/routing.rs`、内容参数校验归 `core/content.rs`
+  （纯函数 0-unsafe 可单测）；**库内永不调用 SetFocus/AttachThreadInput**（见历史坑 4），
+  焦点时机 = `EngineEvent::FocusHint` 事件，动作归宿主线程。
 - 采集细节不得泄漏到 `gfx/`（经 `capture::Capture` 封装）；`gfx/` 原则上不读环境变量
   （例外清单登记在 `diag/env.rs` 的文档注释里，都只在构造期读一次）。
 - 面板 / 调试类代码不得进库（全在 `playground/`）；库里只保留 `tools/` 依赖的确定性布局。
@@ -114,7 +122,7 @@ cbuffer：`c0..c17` 语义**冻结**（历史取证图的比对基准）；新�
 （`c18` = mode/opacity/handleGrabbed）；`CB_FLOATS = 19 * 4`。
 缩放反馈 border 是独立叠加 pass（`shaders/border_vs|ps.hlsl` + `BorderCb`），不占用玻璃 cbuffer。
 
-## 改这些地方之前必读（三个历史坑，都有实测数字）
+## 改这些地方之前必读（四个历史坑，都有实测数字）
 
 1. **`tint_opacity: 0.01` 与 `blur_min: 20.0 * 0.12` 不是手误**，是旧二进制**稳态帧**真正渲染的值：
    旧面板 `SharedParams::apply()` 每帧写回、且用 `Arc<AtomicIsize>` 存值 ⇒ `0.018` 截断成 `0.01`、
@@ -131,6 +139,13 @@ cbuffer：`c0..c17` 语义**冻结**（历史取证图的比对基准）；新�
    过去只设初值、主循环立刻回到真实光标 ⇒「光标在玻璃内移动」用例**恒为 0 差异**（空转测试）。
    `cmp_visual.py` 另用 `SetCursorPos` 物理停放 + 看门狗，光标停在离玻璃 **> 3*mouse_radius** 处，
    让 `gate` 精确为 0。窗口过程与主循环都必须走 `read_cursor()`，否则命中测试与渲染用的光标会打架。
+
+4. **库侧焦点代调是死路，别写回来（2026-10-26 事故级实锤）**：Win32 的 `SetFocus` 只作用于
+   调用线程创建的窗口——渲染线程代宿主 SetFocus 恒 `ret=0x0`（功能等于零）；改走
+   `AttachThreadInput` 桥接则对**没有消息泵的目标线程把渲染线程原地挂死**（插桩实锤：
+   `consume_focus_enter` 日志后取证心跳当场停摆，进程活着玻璃停绘——第一门禁红线）。
+   终态设计 = `set_focus_hwnd` 只做登记，按压消费时发 `EngineEvent::FocusHint`，
+   宿主在自己线程 SetFocus（同线程必成）。守卫拒绝登记画布自身 HWND——画布永不接触键盘。
 
 ## 测量与取证
 

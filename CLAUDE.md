@@ -80,7 +80,7 @@ cbuffer：`c0..c17` 语义**冻结**（历史取证图的比对基准），新�
    缩放反馈 border 是**独立叠加 pass**（`shaders/border_vs|ps.hlsl` + `BorderCb` b0..b6，
    `GlassRenderer::draw_borders` 在 Pass B 之后画），不占用玻璃 cbuffer。
 
-## 改这些地方之前必读（三个历史坑，都有实测数字）
+## 改这些地方之前必读（四个历史坑，都有实测数字）
 
 1. **默认参数 `tint_opacity: 0.01` 与 `blur_min: 20.0 * 0.12` 不是手误。**
    它们是重构前那个二进制**稳态运行时真正渲染出来的值**：旧面板 `SharedParams::apply()`
@@ -103,6 +103,11 @@ cbuffer：`c0..c17` 语义**冻结**（历史取证图的比对基准），新�
    物理停放 + 看门狗，并把光标停在离玻璃 **> 3*mouse_radius** 的地方，
    让鼠标点光的有限支撑窗 `gate` 精确为 0。窗口过程与主循环都必须走 `read_cursor()`，
    否则命中测试用真实光标、渲染用钉死光标会打架。
+
+4. **库侧焦点代调是死路，别写回来（2026-10-26 实锤）**：跨线程 `SetFocus` 恒返 NULL
+   （`ret=0x0`），`AttachThreadInput` 桥接会挂死渲染线程（实测：按压后取证心跳停摆、
+   进程活着玻璃停绘）。终态 = `set_focus_hwnd` 登记 + 按压消费时发 `EngineEvent::FocusHint`，
+   宿主在自己线程 SetFocus；守卫拒绝画布自身 HWND。库内禁止再出现 SetFocus/attach FFI。
 
 ## 日志与错误
 

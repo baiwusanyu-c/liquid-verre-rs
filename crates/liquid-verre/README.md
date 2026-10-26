@@ -21,6 +21,13 @@ popup.set_corner_radius(40.0);
 # Ok::<(), liquid_verre::Error>(())
 ```
 
+## 宿主集成能力（0.5.0）
+
+把玻璃块当窗口本体用：每块可挂内容位图（`update_content`，预乘 BGRA8、dirty 子区上传）、
+块内指针事件同步路由给宿主 sink（`set_input_sink`，按压缩可消费/可拖拽二选一）、
+焦点时机以 `EngineEvent::FocusHint` 事件送达宿主（库不代调 SetFocus，Win32 所迫）。
+契约与坑的完整说明在根 README「输入路由 / 内容层 / 焦点路由 / 宿主集成样例」四节。
+
 ## 平台
 
 仅支持 Windows（D3D11 + DXGI Desktop Duplication / WGC + DirectComposition）。

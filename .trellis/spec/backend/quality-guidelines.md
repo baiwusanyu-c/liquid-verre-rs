@@ -24,6 +24,8 @@
   `WindowConfig { rect, ..Default::default() }`，而这恰恰是配置类 API 最重要的可用性。
   加字段靠 `Default` + serde `#[serde(default)]` 保持源码兼容。
   **只有** `ErrorKind` 与 `EngineEvent` 标 `#[non_exhaustive]`（那边加变体才是常态）。
+- 输入协议枚举（`PointerPhase` / `InputDecision` / `PointerButton`）按"值类型"对待——**不加**
+  `non_exhaustive`，宿主可穷举 match 是设计权利；未来确需加变体时按 semver major 处理（0.5.0 评审定）。
 - **面板 / 调试类代码进库**：浏览器页面、HTTP 服务器、演示布局全在 `playground/`。
   库里只允许保留 `tools/` 取证脚本依赖的确定性布局（`seed_diagnostic_blocks`）。
 - **上层直接触碰 GPU 资源或 `Manager`**：一律走 `api::handle::Command` 队列 + `Snapshot` 读。

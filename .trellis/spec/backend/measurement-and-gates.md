@@ -73,6 +73,9 @@ cargo run --release --bin liquid-verre-playground -- --port 8787    # 手动看�
 > + `cargo test --release --workspace` + `cargo package -p liquid-verre-rs --list` 干跑；
 > `release.yml` 也只多跑 `node scripts/check.mjs` + `node scripts/package.mjs`。
 > **像素取证（`cmp_visual` / `verify_*` / `repro_tremble`）与性能阀门（`gate_perf`）一律不进 CI**：
+> （0.5.0 起 `verify_*` 含功能行为取证三件套：`verify_input_sink` / `verify_content` /
+> `verify_focus_drop`——触碰输入路由/内容层/焦点路径必复跑；三件均按「判别力」设计，
+> 断言禁止"无证据也 PASS"的逃生口。）
 > 它们依赖 DDA 桌面复制、真实 vsync 节拍与可交互的桌面会话（`SetCursorPos` 物理停放光标、
 > `GLASS_INTERNAL_SHOT` 落盘取证图、`[metrics]` 行里的 `rel_max` / `acq_max` 健康判据），
 > GitHub runner 的无交互会话里既采不到桌面也测不出有意义的 fps / 延迟 —— 跑出来只会是假绿或假红。

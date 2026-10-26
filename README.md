@@ -125,6 +125,7 @@ engine.shutdown();
   `set_interactive(bool)`、`set_movable(bool)`、`close()`
 - 写（输入路由）：`set_input_sink(Option<Arc<dyn GlassInputSink>>)`（`None` = 摘除，行为回到库默认）
 - 写（内容层）：`update_content(w_phys, h_phys, &[u8], Option<[u32;4]>)`、`clear_content()`
+- 写（焦点协调）：`set_focus_hwnd(isize)`（登记宿主壳窗口；按压被消费时库发 `EngineEvent::FocusHint`，焦点由宿主在自己线程执行；0 = 清除，画布自身 HWND 会被守卫拒绝）
 
 `set_opacity` / `set_color` 在透明模式改 `opacity` / `color`，在液态模式改 `base_alpha` / `tint_color`。
 `canvas_handle()` 是给上层「把自己的 UI 窗口按同样矩形贴在玻璃之上」用的；
@@ -332,7 +333,7 @@ match msg { WM_USER_FOCUS => { SetFocus(host_shell_hwnd); } }
 
 - `EngineEvent`（`#[non_exhaustive]`，19 个变体）：`Ready{monitor_count}`、
   `MonitorsChanged{monitor_count}`、`WindowCreated{id}`、`WindowDestroyed{id}`、
-FocusHint{id,hwnd}、  `MoveStarted{id}`、`MoveEnded{id,rect}`、`ResizeStarted{id,handle}`、`ResizeEnded{id,rect}`、
+  FocusHint{id,hwnd}、`MoveStarted{id}`、`MoveEnded{id,rect}`、`ResizeStarted{id,handle}`、`ResizeEnded{id,rect}`、
   `LevelApplied{level}`、`CaptureBackendSelected{monitor_index,monitor_name,backend}`、
   `CaptureLost{monitor_index,reason}`、`CaptureRestored{monitor_index}`、
   `ExclusiveFullscreen{monitor_index,active}`、`QualityLevelChanged{level}`、
@@ -401,6 +402,12 @@ win.set_focus_hwnd(shell_hwnd as isize);                          // 键盘可�
 自行换算路由——命中稳定性由 `verify_focus_drop.py` 取证背书（见「把 IDropTarget 挂到画布」节）。
 ④ **键盘**：`FocusHint` 事件 → 宿主在自己线程 `SetFocus` 壳窗口（ESC/Delete/F2 到宿主
 自己的消息循环，库零参与焦点）。
+
+需要**拖拽吸附**的块：不要等库的会话再事后修正（会互相回写抖动），直接让 sink 返回
+`Consumed` 接管拖拽——Down 记锚点，序列内每次 Move 用 `set_rect(吸附后的位置)` 驱动
+（异步入队 ≤1 帧，与库会话同等延迟）；不需要吸附的块返回 `Ignored` 继续用库的 movable
+拖拽。两种块在同一引擎内 per-block 共存。**库刻意不提供 move-filter 注入点**：窗口位置
+策略属于宿主，「库只做玻璃」是边界（0.5.0 评审裁决，见任务归档记录）。
 
 移动/缩放/叠放/固定/DPI 全部沿用库既有能力（`movable`/`ResizeOptions`/`ZOrder`/`set_interactive`），
 不需要为「窗口本体」再创建任何 HWND。
