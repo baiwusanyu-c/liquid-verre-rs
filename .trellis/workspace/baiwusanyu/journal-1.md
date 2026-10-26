@@ -256,3 +256,25 @@ border 加粗根因定位（band 渐隐改实芯+AA，像素剖面与 4x 取证�
 - fullscreen_app_on 再误报时先看新日志里的窗口身份；不要采用「该窗口必须在画布之上」这条判据（真游戏同样在 TOPMOST 画布之下，会把 R-16 废掉）
 - 可选：SetWinEventHook 做亚帧恢复，替代当前 8 Hz 轮询带来的 ≤125 ms 陈旧桌面窗口
 - 一次非复现的 prep 单圈 3061 ms stall 归因未确认，已变成 verify_occlusion 的常驻断言（prep 中位 > 20 ms 即 FAIL），复发可自动抓到
+
+
+## Session 6: 库窗口即本体能力补齐：P0-1 内容层 + P0-2 输入路由 + P1 焦点路由(FocusHint)
+<!-- trellis-session: v=2 fp=cb341e44e648640e -->
+
+**Date**: 2026-10-26
+**Task**: 库窗口即本体能力补齐：P0-1 内容层 + P0-2 输入路由 + P1 焦点路由(FocusHint)
+**Branch**: `master`
+
+### Summary
+
+Trellis 任务树 10-23-glass-window-host-capabilities 全部完成并归档（move-filter 保留 planning 待启）。交付：GlassWindow 新增 update_content/clear_content（逐块交错绘制、dirty 子区上传、无内容零开销）、GlassInputSink 输入路由（六规则状态机 core/routing.rs 31 单测）、set_focus_hwnd 事件化（FocusHint，库零焦点 FFI）。行为取证三件套 verify_input_sink/verify_content/verify_focus_drop 均带判别力自检与防假门禁设计。过程战果：抓到并修复 6 个真缺陷（缩放会话收尾绑错分支、wheel 高位字、UpdateSubresource 子矩形源指针、clear 不脏化、region_dirty 误置、attach 跨线程挂死渲染线程——最后一枚经插桩二分实锤后裁决库侧焦点全部事件化）。第一门禁全程守住：无内容/无 sink 构建 vs 0.4.2 cmp_visual single 四段全 0，gate_perf 同机 A/B 全部 -1.1%~0.6% 无回归，8 回归脚本 + verify_dirty x3 多轮全绿。架构再审（research/architecture-native-window.md）：用户拍板维持画布+能力补齐路线，否决 per-window 重写。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d4ea46b` | feat(host): P0-1 内容层 + P0-2 输入路由 + P1 焦点路由（FocusHint）+ 三行为取证脚本，全量门禁绿 |
+
+### Status
+
+[OK] **Completed**
