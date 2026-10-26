@@ -8,7 +8,7 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
-## [0.5.0-unreleased]
+## [0.5.0] - 2026-10-26
 
 ### Added
 - **输入路由 `GlassInputSink`**（宿主集成能力 P0-2「库窗口即本体」第一块地基）：块内指针事件
