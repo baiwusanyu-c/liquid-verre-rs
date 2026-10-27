@@ -136,6 +136,10 @@ cbuffer：`c0..c17` 语义**冻结**（历史取证图的比对基准），新�
   （`SIM_BACKDROP` 场景禁止做「增量==全量」像素对比；时间维度用连拍 `GLASS_SHOT_EVERY_MS`；
   跨版本视觉用**稳态帧** `GLASS_INTERNAL_SHOT_AT_MS=2500` + 四段 deep/interior/ring/outside）。
 - 视觉取证只能看 `GLASS_INTERNAL_SHOT` 的 composed 图（`WDA_EXCLUDEFROMCAPTURE` 使 OS 截屏看不到玻璃）。
+- 0.5.1 宿主四缺陷修复另立两件**行为取证**（触碰重建/穿透路径必复跑，不进 CI）：
+  `verify_monitors_rebuild`（WM_DISPLAYCHANGE → 引擎存活 + 块 rect 逐位不变，#1/#4/#5 红绿对照，基线实测 3 红）
+  与 `verify_clickthrough_recovery`（盖块→停产→移开→进块 ≤300ms 摘穿透 + 反向对照，#3 常驻回归位）。
+  ⚠ 两脚本枚举画布必须按 pid 过滤（truncate 泄漏前科：孤儿画布恒穿透，打中错窗口会把活测成死）。
 
 ## 协作约定
 

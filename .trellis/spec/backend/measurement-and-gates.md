@@ -167,6 +167,10 @@ playground 被 terminate 后**标签页不关** => 每次采样累积一个页�
 | `verify_dirty` | 脏区书本账（增量==全量） | 真实桌面；取证帧强制全量，故测不出持久化类缺陷 |
 | `repro_tremble far\|many` | 拖一块时其他块逐帧不变 | 静态合成源；排除首 2 帧与末 1 帧（teardown） |
 | `cmp_visual` | 跨版本视觉等价（见 §3.1） | 需要 `VERRE_OLD_EXE` / `VERRE_EXE` 两个二进制 |
+| `verify_monitors_rebuild` | 显示器变化重建路径行为（#1/#4/#5） | `PostMessage(WM_DISPLAYCHANGE)` 广播刺激，不碰系统显示配置；判别力=基线实测 3 红；断言含「块 rect 逐位不变」（scale≠1 屏才有牙齿，脚本自报判别力） |
+| `verify_clickthrough_recovery` | 遮挡停产后穿透自锁解除（#3） | 盖块→停产日志→移开→进块 ≤300ms 摘穿透 + 块外反向对照 + 物理拖拽终局；无停产日志=FAIL（禁止空转 PASS） |
+
+**教训（勿重犯）**：按类名枚举画布**必须过滤 pid**（`GetWindowThreadProcessId`）——跨进程残留与孤儿窗口（0.5.1 #5 前科：`GLASS_MONITORS` truncate 泄漏的恒穿透孤儿）会混进 `FindWindowExW` 枚举，刺激打中孤儿 = 静默蒸发，把活测成死（rebuild 脚本第一版栽过）。
 
 **教训（勿重犯）**：`SIM_BACKDROP` 场景下做「增量==全量」像素对比是无效 oracle
 （假脏区外的真实桌面变化是合理陈旧；合成源下脏区恒 `[0,0,0,0]` 使金字塔永不跟踪）——
