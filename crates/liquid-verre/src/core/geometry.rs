@@ -214,6 +214,33 @@ pub fn rect_fully_covered(target: [i32; 4], covers: &[[i32; 4]]) -> bool {
     open.is_empty()
 }
 
+/// 点到显示器的归属：到各屏中心距离最近的下标。
+///
+/// 纯算术（0 unsafe、0 依赖），不读环境变量。
+/// 原在 platform/display.rs，现沉入 core 以获得单测判别力
+/// （design #4：归屏算法的正确性不应依赖真实显示器枚举）。
+/// 空数组返回 0（与原入口一致）。
+#[must_use]
+pub fn index_at(rects: &[([i32; 2], [i32; 2])], x: f32, y: f32) -> usize {
+    if rects.is_empty() {
+        return 0;
+    }
+    let mut best = 0;
+    let mut best_d = f32::MAX;
+    for (i, &(origin, size)) in rects.iter().enumerate() {
+        let w = size[0] as f32;
+        let h = size[1] as f32;
+        let cx = (x - (origin[0] as f32 + w * 0.5)).abs();
+        let cy = (y - (origin[1] as f32 + h * 0.5)).abs();
+        let d = cx * cx + cy * cy;
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +525,16 @@ mod tests {
             resize_influence_px(400.0),
             "极大 grip 下缩放项应当主导"
         );
+    }
+    #[test]
+    fn index_at_returns_closest_monitor_by_center_distance() {
+        let rects = [([0, 0], [1000, 800]), ([1000, 0], [1200, 900])];
+        assert_eq!(index_at(&rects, 0.0, 0.0), 0, "A 屏左上角");
+        assert_eq!(index_at(&rects, 999.0, 799.0), 0, "A 屏右下角");
+        assert_eq!(index_at(&rects, 1500.0, 500.0), 1, "B 屏内部");
+        assert_eq!(index_at(&rects, -400.0, -300.0), 0);
+        assert_eq!(index_at(&rects, 5000.0, 5000.0), 1);
+        assert_eq!(index_at(&rects, f32::NAN, f32::NAN), 0);
+        assert_eq!(index_at(&[], 100.0, 100.0), 0);
     }
 }

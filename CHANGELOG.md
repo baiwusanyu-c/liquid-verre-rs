@@ -8,6 +8,27 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
+## [0.5.1-unreleased]
+
+### Fixed
+- **#1 画布重建误杀渲染线程**: WM_DESTROY 无条件 PostQuitMessage 导致显示器变化时的
+  画布重建误当成引擎退出信号。现改为只在 App::shutdown 已置位时才发 PostQuitMessage，
+  且重建路径先解绑 GWLP_USERDATA (app_of 返回 None = 双保险)。
+- **#2 RegisterClassExW 类已存在容忍分支永不命中**: Error::code() 返回 HRESULT
+  (0x80070582)，与裸 Win32 错误码 1410 做数值比较恒不相等。改用严格相等纯函数
+  is_class_already_exists，附单测钉死。
+- **#3 遮挡停产后点击穿透自锁的库侧兜底定时器**: 采集停产 / 遮挡期间没有帧时钟，
+  穿透状态机与遮挡复检不得依赖鼠标消息自身唤醒。现每个画布装 100 ms
+  SetTimer 兜底定时器 (宿主实测光标进块 900ms 不解除，PostMessage 唤醒即恢复)。
+- **#4 MonitorsChanged 后块 DPI 重估基准被强清**: 两个真根因:
+  1) rebuild_monitors 中 refresh_monitor_rects() 在归屏判定之后才调用，导致用旧屏矩形判新块；
+  2) 归屏前强清 b.scale = 1.0 摧毁新旧换算基准，200% 屏 rebuild 后宽度重乘 2.0
+  (宿主 2x 膨胀前科)。归屏算术现沉入 core::block::rehome_block 纯函数，
+  附 6 条单测矩阵。
+- **#5 GLASS_MONITORS truncate 泄漏孤儿画布**: 被丢弃显示器的 HWND 未 DestroyWindow，
+  导致孤儿窗口占据 topmost z 序带。现在 truncate / rebuild 两处都先释放资源再丢结构。
+  monitor_limit 口径在 boot 和 rebuild 两处对称应用。
+
 ## [0.5.0] - 2026-10-26
 
 ### Added

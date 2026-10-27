@@ -165,7 +165,17 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
     if let Some(n) = env.monitor_limit.or(cfg.monitor_limit) {
         if n >= 1 && n < monitors_rt.len() {
             log::info!("只用前 {n} 块屏（monitor_limit）");
-            monitors_rt.truncate(n);
+            // 修复 #5：truncate 前先销毁被丢弃显示器的画布。
+            // 原实现只丢 MonitorRt 结构，HWND 未 DestroyWindow，
+            // 导致孤儿窗口占据 topmost z 序带且吞消息。
+            // 此时尚未 bind_hwnds，无悬垂指针风险；
+            // 采集/合成器随 MonitorRt drop 自然释放。
+            for m in monitors_rt.drain(n..) {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(m.hwnd);
+                }
+            }
+            // drain 已移除元素，不再调 truncate
         }
     }
 
@@ -241,6 +251,7 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         t0: Instant::now(),
         frames: 0,
         quality,
+        monitor_limit: env.monitor_limit.or(cfg.monitor_limit).map(|n| n.max(1)),
         backend_pref: cfg.capture.backend,
         style_cache: StyleCache::default(),
         block_sinks: Vec::new(),

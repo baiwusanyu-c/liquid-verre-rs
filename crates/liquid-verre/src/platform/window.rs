@@ -49,6 +49,12 @@ const CANVAS_CLASS_NAME_W: &[u16] = &{
     buf
 };
 
+/// 兜底唤醒定时器 ID（100 ms）。
+///
+/// 唯一性登记：本库画布窗口只有这一个定时器，不与其它 id 冲突
+/// （WM_TIMER 分支按 id 过滤，wp 不是它就不动作）。
+const TIMER_ID_WAKEUP: usize = 0x5E55_0001;
+
 /// 类名的 `PCWSTR` 形式。
 #[must_use]
 pub(crate) fn class_name_w() -> PCWSTR {
@@ -78,8 +84,10 @@ pub(crate) fn register_class(hinst: HINSTANCE) -> Result<PCWSTR> {
     };
     if unsafe { RegisterClassExW(&wc) } == 0 {
         let err = windows::core::Error::from_win32();
-        // ERROR_CLASS_ALREADY_EXISTS = 1410
-        if err.code().0 as u32 != 1410 {
+        // 注意：err.code() 是 HRESULT —— ERROR_CLASS_ALREADY_EXISTS(1410) 的
+        // HRESULT 形态是 0x80070582，与裸 1410 做数值比较永不相等（0.5.0 前科，
+        // 判据本体见 is_class_already_exists + 单测）。
+        if !is_class_already_exists(err.code().0) {
             return Err(Error::with_source(
                 ErrorKind::WindowCreation,
                 "RegisterClassExW 失败",
@@ -88,6 +96,17 @@ pub(crate) fn register_class(hinst: HINSTANCE) -> Result<PCWSTR> {
         }
     }
     Ok(name)
+}
+
+/// 判断 HRESULT 是否对应「窗口类已存在」（ERROR_CLASS_ALREADY_EXISTS=1410）。
+///
+/// HRESULT_FROM_WIN32(1410) = 0x80070582。与裸 1410 做数值比较永不相等
+/// —— 这是 0.5.0 的 #2 根因：Error::code() 返回 HRESULT，不是 Win32 错误码。
+/// 此处取**严格相等**，不用低 16 位掩码（防撞车，如 0x80070005 的低 16 位巧合）。
+#[must_use]
+pub(crate) fn is_class_already_exists(code: i32) -> bool {
+    // windows-core 0.58 的 HRESULT::from_win32(1410).0 = 0x80070582
+    code as u32 == 0x8007_0582
 }
 
 /// 创建一块显示器的全屏画布窗口。
@@ -143,6 +162,12 @@ pub(crate) fn create_canvas(
         {
             log::warn!("SetWindowDisplayAffinity({}): {e:?}", info.name);
         }
+    }
+    // 兜底定时器：采集停产 / 遮挡期间没有帧时钟，穿透状态机与遮挡复检
+    // 不得依赖鼠标消息自身唤醒。100 ms 分辨率足够：不追求帧级响应，
+    // 只保证「停产恢复后 100 ms 内巡检到」。
+    unsafe {
+        let _ = SetTimer(hwnd, TIMER_ID_WAKEUP, 100, None);
     }
     Ok(hwnd)
 }
@@ -257,6 +282,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 dispatch_pointer(hwnd, PointerPhase::Up(None), Some(PointerButton::Left), 0);
                 LRESULT(0)
             }
+            WM_TIMER => {
+                // 只响应我们的兜底唤醒定时器
+                if wp.0 == TIMER_ID_WAKEUP {
+                    request_render(hwnd);
+                }
+                LRESULT(0)
+            }
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
                 if let Some(app) = app_of(hwnd) {
                     app.rebuild_monitors = true;
@@ -265,7 +297,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
                 LRESULT(0)
             }
             WM_DESTROY => {
-                PostQuitMessage(0);
+                // 画布销毁 ≠ 引擎退出：显示器变化（WM_DISPLAYCHANGE）时
+                // 会销毁旧画布重建新画布，无条件 PostQuitMessage 会把渲染线程
+                // 一起杀掉（宿主实测前科）。
+                // 重建路径先 unbind（GWLP_USERDATA 清 0），故 app_of 返回 None
+                // 是双保险；shutdown 的写入在渲染线程，wnd_proc 经 DispatchMessageW
+                // 同线程调用，bool 无跨线程可见性问题。
+                if app_of(hwnd).is_some_and(|app| app.shutdown) {
+                    PostQuitMessage(0);
+                }
                 LRESULT(0)
             }
             WM_KEYDOWN => {
@@ -720,5 +760,13 @@ mod tests {
         // 重构前叫 LiquidGlassCanvas；改名后 is_own_window 的判据必须同步
         assert_eq!(CANVAS_CLASS_NAME, "LiquidVerreCanvas");
         assert!(!CANVAS_CLASS_NAME.contains("Glass"));
+    }
+
+    #[test]
+    fn is_class_already_exists_only_matches_0x80070582() {
+        assert!(super::is_class_already_exists(0x8007_0582u32 as i32));
+        assert!(!super::is_class_already_exists(0x8007_0005u32 as i32));
+        assert!(!super::is_class_already_exists(1410));
+        assert!(!super::is_class_already_exists(0));
     }
 }

@@ -220,3 +220,73 @@ fn poll_events_without_running_engine_is_empty() {
     assert_eq!(engine.quality_level(), 0);
     assert!(engine.snapshot().windows.is_empty());
 }
+
+#[test]
+#[ignore = "需要真实桌面会话：cargo test --release -p liquid-verre-rs -- --ignored"]
+fn two_round_engine_lifecycle_does_not_fail_on_class_already_exists() {
+    // 修复 #2 的集成验证体：同进程两轮 Engine::new + start + shutdown
+    // 第二轮不得报 ErrorKind::WindowCreation（RegisterClassExW “类已存在”应被容忍）。
+    // start 需要显示器；无显示器时直接 skip（不 panic）。
+
+    use liquid_verre::{Engine, EngineConfig, ErrorKind};
+
+    let config = EngineConfig::default();
+
+    // 第一轮
+    let mut engine = match Engine::new(config.clone()) {
+        Ok(e) => e,
+        Err(e) => {
+            if e.kind() == ErrorKind::MonitorEnumeration {
+                eprintln!("无显示器，跳过集成测试");
+                return;
+            }
+            panic!("第一轮 Engine::new 失败: {e}");
+        }
+    };
+    match engine.start() {
+        Ok(()) => {}
+        Err(e) => {
+            if e.kind() == ErrorKind::MonitorEnumeration {
+                eprintln!("无显示器，跳过集成测试");
+                return;
+            }
+            panic!("第一轮 start 失败: {e}");
+        }
+    };
+    engine.shutdown();
+    // 等待渲染线程结束
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!engine.is_running(), "shutdown 后 is_running 应为 false");
+    assert!(engine.take_fatal_error().is_none(), "第一轮不应有致命错误");
+
+    // 第二轮：不得因 RegisterClassExW “类已存在”而报 WindowCreation
+    let mut engine2 = match Engine::new(config) {
+        Ok(e) => e,
+        Err(e) => {
+            if e.kind() == ErrorKind::MonitorEnumeration {
+                eprintln!("无显示器，跳过集成测试");
+                return;
+            }
+            panic!("第二轮 Engine::new 失败: {e}");
+        }
+    };
+    match engine2.start() {
+        Ok(()) => {}
+        Err(e) => {
+            assert_ne!(
+                e.kind(),
+                ErrorKind::WindowCreation,
+                "第二轮不得因 RegisterClassExW “类已存在”而报 WindowCreation: {e}"
+            );
+            if e.kind() == ErrorKind::MonitorEnumeration {
+                eprintln!("无显示器，跳过集成测试");
+                return;
+            }
+            panic!("第二轮 start 失败: {e}");
+        }
+    };
+    engine2.shutdown();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!engine2.is_running());
+    assert!(engine2.take_fatal_error().is_none(), "第二轮不应有致命错误");
+}

@@ -170,6 +170,73 @@ pub(crate) fn occlusion_step(streak: i8, hit: bool) -> (bool, i8) {
     (next >= OCCLUSION_CONFIRM_POLLS, next)
 }
 
+/// 归屏 / DPI 重估用的块几何（纯数据）。字段语义与 Block 对应字段一致。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockGeom {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// 块**当前所在屏**的 DPI 比例 —— 新旧换算的基准。
+    /// rebuild 时不得强清成 1.0（2026-10-27 宿主「2x 膨胀」前科，见 `rehome_block`）。
+    pub scale: f32,
+    /// 块当前所在显示器下标。
+    pub monitor: usize,
+}
+
+/// clamp 纯算术（自 Block::clamp 抽取，两处共用，单一来源）。
+fn clamp_geom(g: &mut BlockGeom) {
+    g.width = g.width.clamp(MIN_SIZE, MAX_SIZE);
+    g.height = g.height.clamp(MIN_SIZE, MAX_SIZE);
+    g.x = clamp_finite_pos(g.x, -g.width * 0.5);
+    g.y = clamp_finite_pos(g.y, -g.height * 0.5);
+}
+
+/// 把块重新归屏：中心归属 → DPI 换算（保持逻辑尺寸）→ 中心不出屏钳制。
+///
+/// 纯函数、0 unsafe、0 分配（`rects` 直接借用 `App::monitor_rects` 缓存；
+/// `scale_of` 由调用方提供，口径与 `App::scale_of` 一致）。
+/// 触发条件、换算顺序、越界提前返回均与 0.5.0 的 sync_block_monitor **逐位一致**；
+/// 抽出来的目的：#4 的回归（200%→100% 不许尺寸膨胀）必须能在 core 层单测钉死，
+/// 不依赖真实显示器枚举。
+///
+/// - g.scale 是新旧换算基准。**强清成 1.0 会摧毁它**：k=new/1.0 会把物理尺寸
+///   重乘新缩放 —— 200% 屏上块宽度直接翻倍（宿主 2026-10-27 上午实测现场）。
+/// - 除零保护 g.scale.max(1e-3)；新屏 scale 下限 0.05 由 scale_of 调用方保证
+///   （App::scale_of 内置）。
+#[must_use]
+pub(crate) fn rehome_block(
+    g: BlockGeom,
+    rects: &[([i32; 2], [i32; 2])],
+    scale_of: impl Fn(usize) -> f32,
+) -> BlockGeom {
+    if rects.is_empty() {
+        return g;
+    }
+    let (cx, cy) = (g.x + g.width * 0.5, g.y + g.height * 0.5);
+    let target = crate::core::geometry::index_at(rects, cx, cy).min(rects.len() - 1);
+    let new_scale = scale_of(target);
+    let mut r = g;
+    if target != g.monitor || (new_scale - g.scale).abs() > 1e-4 {
+        // 逻辑尺寸不变，物理像素尺寸按两屏 DPI 比例换算，观感保持一致。
+        let k = new_scale / g.scale.max(1e-3);
+        r.width = g.width * k;
+        r.height = g.height * k;
+        r.scale = new_scale;
+        r.monitor = target;
+    }
+    // 钳制：块中心必须留在本屏内（默认不做跨屏大玻璃，方案 12.10 策略 ①）。
+    // 屏取不到（下标越界 / 空表）时与 0.5.0 一致：提前返回，不做 clamp。
+    let Some(&(origin, size)) = rects.get(r.monitor) else {
+        return r;
+    };
+    let (ox, oy) = (origin[0] as f32, origin[1] as f32);
+    let (sw, sh) = (size[0] as f32, size[1] as f32);
+    r.x = r.x.clamp(ox - r.width * 0.5, ox + sw - r.width * 0.5);
+    r.y = r.y.clamp(oy - r.height * 0.5, oy + sh - r.height * 0.5);
+    clamp_geom(&mut r);
+    r
+}
 #[cfg(test)]
 mod tests {
     use super::{occlusion_step, Block, MAX_SIZE, MIN_SIZE, OCCLUSION_CONFIRM_POLLS};
@@ -313,5 +380,120 @@ mod tests {
             GlassStyle::transparent(16.0, 0.5, [1.0; 4]).shadow_margin(),
             0.0
         );
+    }
+
+    // ---- rehome_block ----
+
+    fn two_rects() -> [([i32; 2], [i32; 2]); 2] {
+        [([0, 0], [1920, 1080]), ([1920, 0], [1920, 1080])]
+    }
+    fn scales_mixed(i: usize) -> f32 {
+        if i == 1 {
+            2.0
+        } else {
+            1.0
+        }
+    }
+    fn geom(x: f32, y: f32, w: f32, h: f32, scale: f32, monitor: usize) -> super::BlockGeom {
+        super::BlockGeom {
+            x,
+            y,
+            width: w,
+            height: h,
+            scale,
+            monitor,
+        }
+    }
+
+    #[test]
+    fn rehome_same_screen_same_scale_is_noop() {
+        let r = super::rehome_block(
+            geom(100.0, 100.0, 400.0, 300.0, 1.0, 0),
+            &two_rects(),
+            scales_mixed,
+        );
+        assert_eq!(
+            (r.x, r.y, r.width, r.height, r.monitor),
+            (100.0, 100.0, 400.0, 300.0, 0)
+        );
+        assert!((r.scale - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rehome_cross_screen_rescales_and_rehomes_index() {
+        let r = super::rehome_block(
+            geom(2020.0, 100.0, 400.0, 300.0, 1.0, 0),
+            &two_rects(),
+            scales_mixed,
+        );
+        assert!((r.width - 800.0).abs() < 0.01);
+        assert!((r.height - 600.0).abs() < 0.01);
+        assert_eq!(r.monitor, 1);
+        assert!((r.scale - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rehome_down_200_to_100_keeps_logical_size() {
+        // 回归钉（缺陷 #4 真根因②）：同屏 200%→100% 物理尺寸必须减半（逻辑不变）。
+        // 0.5.0 的 rebuild 把 b.scale 强清 1.0 后 k=1.0/1.0=1 ⇒ 物理保持 1000
+        // ⇒ 逻辑宽度翻倍 —— 宿主 2026-10-27「2x 膨胀」实测现场。
+        let flat = |_i: usize| 1.0_f32;
+        let r = super::rehome_block(
+            geom(2200.0, 100.0, 1000.0, 600.0, 2.0, 1),
+            &two_rects(),
+            flat,
+        );
+        assert!((r.width - 500.0).abs() < 0.01);
+        assert!((r.height - 300.0).abs() < 0.01);
+        assert!((r.scale - 1.0).abs() < 1e-6);
+        assert_eq!(r.monitor, 1);
+    }
+
+    #[test]
+    fn rehome_up_100_to_200_keeps_logical_size() {
+        let up = |_i: usize| 2.0_f32;
+        let r = super::rehome_block(geom(100.0, 100.0, 800.0, 600.0, 1.0, 0), &two_rects(), up);
+        assert!((r.width - 1600.0).abs() < 0.01);
+        assert!((r.height - 1200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn rehome_clamps_center_on_screen() {
+        let r = super::rehome_block(
+            geom(-1000.0, -1000.0, 400.0, 300.0, 1.0, 0),
+            &two_rects(),
+            scales_mixed,
+        );
+        assert!((r.x - (-200.0)).abs() < 0.01);
+        assert!((r.y - (-150.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn rehome_stale_monitor_index_rehomes_in_range() {
+        let r = super::rehome_block(
+            geom(2100.0, 100.0, 400.0, 300.0, 2.0, 5),
+            &two_rects(),
+            scales_mixed,
+        );
+        assert_eq!(r.monitor, 1);
+        assert!((r.width - 400.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn rehome_empty_rects_is_identity() {
+        let g = geom(100.0, 100.0, 400.0, 300.0, 1.0, 0);
+        let r = super::rehome_block(g, &[], scales_mixed);
+        assert_eq!((r.x, r.y, r.width, r.height), (100.0, 100.0, 400.0, 300.0));
+    }
+
+    #[test]
+    fn rehome_survives_nan_position() {
+        let r = super::rehome_block(
+            geom(f32::NAN, f32::NAN, 400.0, 300.0, 1.0, 0),
+            &two_rects(),
+            scales_mixed,
+        );
+        assert!(r.x.is_finite() && r.y.is_finite());
+        assert!(r.width.is_finite() && r.height.is_finite());
     }
 }

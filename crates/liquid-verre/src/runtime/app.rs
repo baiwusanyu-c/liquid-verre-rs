@@ -104,7 +104,11 @@ pub(crate) struct App {
     pub quality: QualityCtrl,
     /// 采集后端偏好（`EngineConfig::capture.backend`）。重建采集时沿用。
     pub backend_pref: crate::api::config::CaptureBackend,
-    /// 各屏 (origin,size) 缓存，供 `monitor_index_at` 零分配查询。
+    /// 各屏 (origin,size) 缓存，供 `core::block::rehome_block` 零分配归屏查询。
+    /// 显示器数量上限（构造期从 env/cfg 读一次）。
+    /// None = 不限制；Some(n) = 只用前 n 块屏（n ≥ 1）。
+    /// boot 和 rebuild_monitors 两处都应用，口径对称。
+    pub monitor_limit: Option<usize>,
     pub monitor_rects: Vec<([i32; 2], [i32; 2])>,
     /// 样式展开缓存（避免每帧对每块重跑 `sanitize`）。
     pub style_cache: StyleCache,
@@ -218,13 +222,6 @@ impl App {
             .map_or(1.0, |m| m.info.scale.max(0.05))
     }
 
-    #[must_use]
-    pub fn monitor_index_at(&self, x: f32, y: f32) -> usize {
-        // 用缓存的 (origin,size) 而不是每帧 clone 一份 Vec<MonitorInfo>（含 String）。
-        display::index_at_rects(&self.monitor_rects, x, y)
-            .min(self.monitors.len().saturating_sub(1))
-    }
-
     /// 重新计算 `monitor_rects` 缓存（画布创建 / 重建后调用）。
     pub fn refresh_monitor_rects(&mut self) {
         self.monitor_rects.clear();
@@ -253,36 +250,33 @@ impl App {
 }
 
 /// 把块归位到它中心所在的显示器，并按 DPI 比例换算尺寸（方案 12.2.5 / 12.10 ①）。
+///
+/// 薄壳：读 Block 字段 → `core::block::rehome_block`（纯算术、单测钉死）→ 写回。
+/// 零热路径分配：`rects` 直接借用 `App::monitor_rects` 缓存，`scale_of` 是
+/// `App::scale_of` 的闭包转发 —— 拖拽跨屏每帧都走这里，禁止 collect。
 pub(crate) fn sync_block_monitor(app: &mut App, id: u32) {
     let Some(b) = app.manager.get(id) else {
         return;
     };
-    let (cx, cy) = (b.x + b.width * 0.5, b.y + b.height * 0.5);
-    let target = app.monitor_index_at(cx, cy);
-    let (old_scale, w, h) = (b.scale, b.width, b.height);
-    let new_scale = app.scale_of(target);
+    let g = crate::core::block::BlockGeom {
+        x: b.x,
+        y: b.y,
+        width: b.width,
+        height: b.height,
+        scale: b.scale,
+        monitor: b.monitor,
+    };
+    let r = crate::core::block::rehome_block(g, &app.monitor_rects, |i| app.scale_of(i));
     let Some(b) = app.manager.get_mut(id) else {
         return;
     };
-    if target != b.monitor || (new_scale - old_scale).abs() > 1e-4 {
-        // 逻辑尺寸不变，物理像素尺寸按两屏 DPI 比例换算，观感保持一致。
-        let k = new_scale / old_scale.max(1e-3);
-        b.width = w * k;
-        b.height = h * k;
-        b.scale = new_scale;
-        b.monitor = target;
-    }
-    // 钳制：块中心必须留在本屏内（默认不做跨屏大玻璃，方案 12.10 策略 ①）。
-    let Some(info) = app.monitors.get(b.monitor).map(|m| m.info.clone()) else {
-        return;
-    };
-    let (ox, oy) = (info.origin[0] as f32, info.origin[1] as f32);
-    let (sw, sh) = (info.size[0] as f32, info.size[1] as f32);
-    b.x = b.x.clamp(ox - b.width * 0.5, ox + sw - b.width * 0.5);
-    b.y = b.y.clamp(oy - b.height * 0.5, oy + sh - b.height * 0.5);
-    b.clamp();
+    b.x = r.x;
+    b.y = r.y;
+    b.width = r.width;
+    b.height = r.height;
+    b.scale = r.scale;
+    b.monitor = r.monitor;
 }
-
 /// 把块投影到某块屏的画布局部坐标，并展开每块的 DPI 缩放参数。
 ///
 /// 这里同时算出本屏的几个「取最大值」口径：阴影外扩、缩放命中带、鼠标光半径、
@@ -484,7 +478,23 @@ pub(crate) fn rebuild_monitors(app: &mut App) {
     if next.is_empty() {
         return;
     }
+    // monitor_limit 口径对称：boot 和 rebuild 两处都应用。
+    // rebuild 重枚举全部屏，再截断与 boot 一致的数量。
+    if let Some(n) = app.monitor_limit {
+        if n >= 1 && n < next.len() {
+            // 被丢弃的元素先释放资源再 drop
+            for m in next.drain(n..) {
+                unsafe {
+                    SetWindowLongPtrW(m.hwnd, GWLP_USERDATA, 0);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(m.hwnd);
+                }
+            }
+        }
+    }
     app.monitors = next;
+    // 真根因 ①：必须立即刷新 monitor_rects 缓存，否则后续
+    // sync_block_monitor 的归屏判定用的是旧屏矩形，块可能归到错误的屏。
+    app.refresh_monitor_rects();
     for hwnd in old {
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -496,10 +506,11 @@ pub(crate) fn rebuild_monitors(app: &mut App) {
     // 块重新归位到新的显示器集合
     let ids: Vec<u32> = app.manager.blocks().iter().map(|b| b.id).collect();
     for id in ids {
-        if let Some(b) = app.manager.get_mut(id) {
-            b.monitor = 0;
-            b.scale = 1.0;
-        }
+        // 真根因 ②（2026-10-27 宿主「2x 膨胀」前科）：不再强清 b.scale = 1.0。
+        // b.scale 的保留值 = 块当前呈现所在屏的比例，正是 rehome_block 的新旧
+        // 换算基准；强清成 1.0 会让 k = new/1.0 —— 200% 屏上 rebuild 后物理
+        // 尺寸被重乘 2.0（逻辑尺寸翻倍）。归屏判定由 rehome 按中心重估，
+        // 不需要把 b.monitor 预置 0。
         sync_block_monitor(app, id);
     }
     for m in app.monitors.iter_mut() {

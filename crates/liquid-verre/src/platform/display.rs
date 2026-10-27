@@ -336,36 +336,9 @@ pub(crate) fn on_battery() -> bool {
     false
 }
 
-/// 在 `(origin, size)` 列表里找最接近 `(x, y)` 的一块屏。
-///
-/// 与 [`index_at`] 同一套判据（到屏中心距离最近），但入参不含 `String`，
-/// 因此调用方可以缓存一份轻量数组，避免每帧 clone `Vec<MonitorInfo>`。
-#[must_use]
-pub fn index_at_rects(rects: &[([i32; 2], [i32; 2])], x: f32, y: f32) -> usize {
-    if rects.is_empty() {
-        return 0;
-    }
-    let mut best = 0;
-    let mut best_d = f32::MAX;
-    for (i, &(origin, size)) in rects.iter().enumerate() {
-        let w = size[0] as f32;
-        let h = size[1] as f32;
-        let cx = (x - (origin[0] as f32 + w * 0.5)).abs();
-        let cy = (y - (origin[1] as f32 + h * 0.5)).abs();
-        let d = cx * cx + cy * cy;
-        if d < best_d {
-            best_d = d;
-            best = i;
-        }
-    }
-    best
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        index_at_rects, is_fullscreen_shape, is_non_candidate_foreground, wide_len, MonitorInfo,
-    };
+    use super::{is_fullscreen_shape, is_non_candidate_foreground, wide_len};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{WS_CAPTION, WS_POPUP, WS_THICKFRAME};
 
@@ -373,48 +346,6 @@ mod tests {
     /// tools/verify_occlusion.py 的 make_fullscreen 探针用的是 WS_POPUP | WS_VISIBLE，
     /// WS_VISIBLE 不参与判据（见 irrelevant_style_bits_do_not_change_the_verdict）。
     const FS_POPUP: u32 = WS_POPUP.0;
-
-    fn infos() -> Vec<MonitorInfo> {
-        vec![
-            MonitorInfo {
-                hmonitor: windows::Win32::Graphics::Gdi::HMONITOR(std::ptr::null_mut()),
-                name: "A".into(),
-                origin: [0, 0],
-                size: [1000, 800],
-                dpi: 96.0,
-                scale: 1.0,
-                primary: true,
-            },
-            MonitorInfo {
-                hmonitor: windows::Win32::Graphics::Gdi::HMONITOR(std::ptr::null_mut()),
-                name: "B".into(),
-                origin: [1000, 0],
-                size: [1920, 1080],
-                dpi: 192.0,
-                scale: 2.0,
-                primary: false,
-            },
-        ]
-    }
-
-    #[test]
-    fn picks_the_nearest_monitor_by_center_distance() {
-        let list = infos();
-        let rects: Vec<([i32; 2], [i32; 2])> = list.iter().map(|m| (m.origin, m.size)).collect();
-        assert_eq!(index_at_rects(&rects, 0.0, 0.0), 0, "A 屏左上角");
-        assert_eq!(index_at_rects(&rects, 999.0, 799.0), 0, "A 屏右下角");
-        assert_eq!(index_at_rects(&rects, 1500.0, 500.0), 1, "B 屏内部");
-        // 屏外取最近的一块（MONITOR_DEFAULTTONEAREST 语义）
-        assert_eq!(index_at_rects(&rects, -400.0, -300.0), 0);
-        assert_eq!(index_at_rects(&rects, 5000.0, 5000.0), 1);
-        // NaN 不能 panic，落到第 0 块即可
-        assert_eq!(index_at_rects(&rects, f32::NAN, f32::NAN), 0);
-    }
-
-    #[test]
-    fn empty_list_returns_zero() {
-        assert_eq!(index_at_rects(&[], 100.0, 100.0), 0);
-    }
 
     // ---- `is_fullscreen_shape`（R-E5 / AC14）----
     // 真实 HWND 在 CI 里造不出来，所以「形状 + cloaked ⇒ 是否算独占全屏」必须是纯函数；
