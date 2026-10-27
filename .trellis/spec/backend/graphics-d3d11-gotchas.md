@@ -27,3 +27,16 @@
     A/B + 稳态窗口中位数（`tools/ab_memory.py`），单次 max/median 都不可信。
 12. **scissor 局部重算模糊链不幂等** ⇒ 下采样外扩 14/12/8/0、tent 链 32/24/16/8、首级外接框⊕48；
     改任何一级 kernel 必须重算这组数并跑 `verify_dirty` 多次。
+13. **`Error::code()` 是 HRESULT，不是 Win32 错误码。** `GetLastError()=1410
+    （ERROR_CLASS_ALREADY_EXISTS）` 进 `HRESULT_FROM_WIN32` 变成 `0x80070582`；
+    与裸 `1410` 做数值比较**恒不等**（0.5.0 前科：register_class 的"类已存在"容忍分支
+    注释写了、代码里永不命中，同进程重建第二个 Engine 必报 window-creation）。
+    要容忍就比 `HRESULT::from_win32(1410)` 全值；掩码低 16 位会与其他 facility 撞车。
+14. **`WM_DESTROY` 里无条件 `PostQuitMessage` = 把「资源销毁」混用成「引擎退出」。**
+    显示器变化重建画布对旧窗口 `DestroyWindow` 会顺手杀死渲染线程消息循环
+    （宿主实测：热插拔后玻璃永久消失）。退出意图必须显式（本项目 = `App::shutdown`
+    判定 + 销毁前清 `GWLP_USERDATA` 双保险）；取证 `tools/verify_monitors_rebuild.py`。
+15. **`Vec::truncate` 丢的是结构，不是窗口。** boot 期 `GLASS_MONITORS` 截断只 drop
+    `MonitorRt`（gfx 资源随 drop 释放），**HWND 本体留在桌面上**成孤儿（恒穿透、占
+    topmost z 带、吞发给它的消息——复现脚本第一版就被它把刺激吃掉）。丢窗口元素必须
+    显式 `DestroyWindow`，顺序 = 先 drop 绑定该 HWND 的 swapchain/采集、再毁窗。

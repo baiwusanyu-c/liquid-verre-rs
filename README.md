@@ -444,6 +444,10 @@ win.set_focus_hwnd(shell_hwnd as isize);                          // 键盘可�
 - `GlassWindow` 是 `Clone + Send + Sync`，可以在上层任意线程持有与调用。
 - `Engine` 不是 `Send`（持有 `JoinHandle`）；需要跨线程共享时自己包 `Arc<Engine>`
   （`playground` 就是这么做的：面板线程持 `Arc<Engine>`，主线程轮询事件）。
+- **显示器拓扑变化（热插拔 / 改分辨率 / 改缩放）由库内自动重建画布与采集**：销毁旧画布
+  **不等于**引擎退出（0.5.1 修复；0.5.0 的 `WM_DESTROY` 会误杀消息循环），重建期间宿主只应看到
+  `EngineEvent::MonitorsChanged`；各块的物理尺寸按新旧屏 DPI 重估（逻辑尺寸保持），中心出屏的块
+  被拉回合法区。取证钉行为：`tools/verify_monitors_rebuild.py`。
 - `EngineEvent` 回调在**渲染线程**执行：不要阻塞、不要重入引擎（会死锁），重活转到自己的线程。
 - `GlassInputSink::on_pointer` / `cursor_override` 同样在**渲染线程**（画布 wnd_proc 上下文）
   同步回调：契约与 `EventHandler` 一致，另加一条硬禁令——**回调内禁 `DoDragDrop`**
@@ -898,7 +902,7 @@ PeekMessage 泵
 | `GLASS_EXTREME_SPEC=1` | 极端高光回归：`spec_intensity = 4.0`、`spec_power = 1.0`（验证 bevel/plane 与圆角转角不断裂） |
 | `GLASS_SIM_BUSY=<ms>` | **拖拽帧**注入确定性忙等，用来确定性地驱动自适应控制器降档/回升 |
 | `GLASS_SIM_BACKDROP=<W>x<H>@<HZ>` | 确定性模拟桌面脏区（固定放主屏正中）。**不能**用于「增量==全量」像素 oracle |
-| `GLASS_MONITORS=<n>` | 只用前 n 块屏。= `EngineConfig.monitor_limit` |
+| `GLASS_MONITORS=<n>` | 只用前 n 块屏（启动与显示器变化重建后同样生效）。= `EngineConfig.monitor_limit` |
 | `GLASS_VERIFY_PASS_A=1` | 拍一张脏矩形受限帧后，同进程再渲一帧「全量 Pass A + 整屏 Pass B」，输出 `.full.bmp` 对照图 |
 | `GLASS_INTERNAL_SHOT=<path>` | 取证截图输出路径（按屏加 `.m<i>.bmp`）。未同时设 `GLASS_SHOT_EVERY_MS` 时会**强制全量重画** |
 | `GLASS_CURSOR_AT=x,y` | **全程钉死**光标（`App::pinned_cursor` → `App::read_cursor()`），不再只设初值。窗口过程与主循环都走 `read_cursor()`，因此命中测试与渲染用的是同一个光标 |

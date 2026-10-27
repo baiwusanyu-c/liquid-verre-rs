@@ -62,6 +62,8 @@ liquid-verre-rs/
 │     │  ├─ block.rs              # Block（逻辑单位）+ MIN_SIZE=24 / MAX_SIZE=8000 + clamp + effective_radius
 │     │  │                        #   occluded / occl_streak + occlusion_step（遮挡迟滞状态机：置位需连续
 │     │  │                        #     OCCLUSION_CONFIRM_POLLS=2 轮命中、**解除只需 1 轮**；streak 到阈值即饱和，不许溢出 i8）
+│     │  │                        #   rehome_block（归屏 / DPI 重估的**单一来源**纯算术；runtime 的
+│     │  │                        #     sync_block_monitor 只是薄壳。2026-10-27 缺陷 #4 沉淀）
 │     │  ├─ manager.rs            # 块集合 / z 序（Front/Back/Absolute/Relative）/ hit_test / hit_resize / 跨屏归属
 │     │  ├─ routing.rs            # 输入按压仲裁状态机（把手带恒优先 → sink 决策 → PressOwner 粘滞），
 │     │  │                        #   route() 纯函数，转移矩阵 31 单测（P0-2）
@@ -263,7 +265,8 @@ liquid-verre-rs/
    库里只保留 `tools/` 取证脚本依赖的**确定性布局**（`seed_diagnostic_blocks`：
    `GLASS_MANY` / `GLASS_FAR_GRID` / `GLASS_SPREAD` / `GLASS_DEFAULT_BLOCK`），
    且正常路径下一块都不建。
-8. **单一来源，禁止两处手写同一常量。** 矩形与影响盒运算只在 `core/geometry.rs`；
+8. **单一来源，禁止两处手写同一常量。** 矩形与影响盒运算只在 `core/geometry.rs`；归屏与 DPI 重估算术只在 `core/block.rs::rehome_block`；
+   8 方向把手判定只在 `core/handle.rs`；圆角有效半径只在 `core/block.rs::effective_radius`；
    8 方向把手判定只在 `core/handle.rs`；圆角有效半径只在 `core/block.rs::effective_radius`；
    面板字段表只在 `playground/src/schema.rs`。历史上「`gfx/compositor.rs` 与 `main.rs` 各写一遍
    影响盒外扩」直接导致过拼接缝（BASELINE 不变量 5）。

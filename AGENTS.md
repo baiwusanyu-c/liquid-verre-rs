@@ -55,6 +55,14 @@ python tools/gate_perf.py                                         # 性能阀门
 `verify_focus_drop`（拖入命中稳定性 + FocusHint 端到端 + 连击 100 + 按压后心跳防冻结断言）。
 三件都带**判别力设计**（反向对照/无证据=FAIL），改断言前先想「删实现它还红吗」。
 
+0.5.1 宿主四缺陷修复另立两件**行为取证**（同样不进 CI，触碰重建/穿透路径必复跑）：
+`verify_monitors_rebuild`（WM_DISPLAYCHANGE 广播 → 旧画布销毁、引擎存活、metrics/心跳继续、
+块 rect 逐位不变——#1/#4/#5 的红绿对照；判别力=基线实测 3 红）与
+`verify_clickthrough_recovery`（盖块→停产→移开→进块 ≤300ms 摘 WS_EX_TRANSPARENT +
+块外反向对照 + 物理拖拽终局；#3 本地不复现、补丁为宿主 wake_canvas_idle 的库侧内建化，
+脚本是常驻回归位）。两脚本枚举画布**必须按 pid 过滤**（truncate 泄漏前科：孤儿画布恒穿透，
+打中错窗口会把活测成死）。
+
 ## 发版与 CI（本地助手 + GitHub Actions）
 
 ```powershell
