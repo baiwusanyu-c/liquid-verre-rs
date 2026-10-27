@@ -8,7 +8,7 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
-## [0.5.1-unreleased]
+## [0.5.1] - 2026-10-27
 
 ### Fixed
 - **#1 画布重建误杀渲染线程**: WM_DESTROY 无条件 PostQuitMessage 导致显示器变化时的
