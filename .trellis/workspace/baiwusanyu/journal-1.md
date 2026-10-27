@@ -278,3 +278,45 @@ Trellis 任务树 10-23-glass-window-host-capabilities 全部完成并归档（m
 ### Status
 
 [OK] **Completed**
+
+
+## Session 7: 宿主实测四缺陷修复：#1 重建杀线程 / #2 HRESULT 容忍 / #3 穿透兜底 / #4 DPI 重估 + 顺带 #5 孤儿画布
+<!-- trellis-session: v=2 fp=52c655865ba794e1 -->
+
+**Date**: 2026-10-27
+**Task**: 宿主实测四缺陷修复：#1 重建杀线程 / #2 HRESULT 容忍 / #3 穿透兜底 / #4 DPI 重估 + 顺带 #5 孤儿画布
+**Branch**: `codex/host-p0-fixes`
+
+### Summary
+
+依据宿主实测定界附件完成 0.5.0 四缺陷修复：附件与本地代码有三处出入（#1 复用既有 App::shutdown 而非新 AtomicBool；#3 本地基线 21ms 自愈不复现，补丁定位为 wake_canvas_idle 库侧内建化；#4 附件补丁已存在，真根因是 b.scale 强清+monitor_rects 刷新时序），另顺带修复 GLASS_MONITORS truncate 孤儿画布与 rebuild 不应用 limit。全闸门通过：244+2 测试、clippy、check.mjs、BASELINE 8 项、新取证两件 3 连；gate_perf 白天噪声窗两次不可信后，重启健康窗 REPS=5 正式 PASS（-0.4%/+0.9%/+2.0%/-4.0%）。
+
+### Main Changes
+
+- platform/window.rs：WM_DESTROY 判 App::shutdown 才 PostQuit；is_class_already_exists 严格 0x80070582；create_canvas 装 100ms TIMER_ID_WAKEUP，WM_TIMER 过滤 id→request_render
+- runtime/app.rs：rebuild_monitors 删 b.scale=1.0 强清、refresh_monitor_rects 提前到块重估前；sync_block_monitor 变薄壳
+- core/block.rs 新增 rehome_block+clamp_geom 纯函数（零分配，scale 携带与 0.5.0 逐位一致）；core/geometry.rs 下沉 index_at；platform/display.rs 去重
+- runtime/mod.rs：truncate 前先毁被丢画布（#5 孤儿），App 新增 monitor_limit 供 rebuild 对称截断（#5b）
+- spec：gotchas #13 HRESULT≠Win32 码 / #14 WM_DESTROY 混用退出信号 / #15 truncate≠毁窗；directory-structure 登记 rehome_block 单一来源；README 重建语义；AGENTS 两件取证登记
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6c45c4f` | fix(host): 宿主实测四缺陷修复 #1~#4 + 顺带 #5/#5b——WM_DESTROY 只在 App::shutdown 时 PostQuit（重建画布不再杀渲染线程，基线复现 0.2s 死）；is_class_already_exists 严格相等 0x80070582（HRESULT≠裸 1410，#2）；画布 100ms 兜底定时器 WM_TIMER→request_render（遮挡停产期穿透状态机的库侧自包含驱动，#3）；rebuild 删 b.scale=1.0 强清+refresh_monitor_rects 提前（200% 屏 2x 膨胀真根因，算术抽成 core::block::rehome_block 零分配纯函数+8 单测，#4）；GLASS_MONITORS truncate/rebuild 两处显式毁窗+limit 口径对称（#5/#5b）。tests/api_surface.rs 加 #[ignore] 两轮 Engine 集成测试 |
+| `d81ecd7` | test+docs: 两件行为取证 verify_monitors_rebuild（#1/#4/#5 红绿对照，基线实测 3 红）/ verify_clickthrough_recovery（盖块→停产→移开→进块 ≤300ms 摘穿透+反向对照）；gotchas #13 HRESULT≠Win32 码 #14 WM_DESTROY 混用退出 #15 truncate≠毁窗；directory-structure 登记 rehome_block 单一来源；README 重建语义+GLASS_MONITORS 口径；AGENTS 登记两脚本（含 pid 过滤前科） |
+
+### Testing
+
+- [OK] cargo test --workspace 244+2 全绿；--ignored 两轮 Engine 集成（#2 行为面）PASS；新脚本 verify_monitors_rebuild（基线 3 红对照）与 verify_clickthrough_recovery 各 3 连绿；BASELINE 8 项全绿（gate_perf 重启后 REPS=5 正式签字：四场景 -0.4%~+2.0% 全低于 3% 线，dirty×3 复跑逐位一致）
+- [OK] verify_focus_drop FR1 两项红经 stash 基线 A/B 实锤为无 console 环境漂移、非回归（debug.md 留证）
+- [OK] 过程事故：trellis-check 子代理破坏实验被中断留下 12 份重复测试块+调用位回滚+拼音化注释，主代理定点恢复并全链复验；教训入 debug.md（破坏实验必须原子化，中断后第一步 cargo build 探伤）
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- 发版 0.5.1：release.mjs --bump patch --ship（CHANGELOG 0.5.1-unreleased 已就位）；宿主升级库后按附件对照表清理止血代码（revive_if_dead 的 UnregisterClass 绕开可移除，wake_canvas_idle 建议保留低频保险丝）
+- 后续候选：playground 壳窗口 fallback 在无 console 环境创建失败排查（恢复 FR1 取证能力）；WindowSnapshot.rect 文档口径（逻辑像素注释 vs 物理实测）与宿主对齐评估

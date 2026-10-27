@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 6
-- **Last Active**: 2026-10-26
+- **Total Sessions**: 7
+- **Last Active**: 2026-10-27
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~280 | Active |
+| `journal-1.md` | ~322 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 7 | 2026-10-27 | 宿主实测四缺陷修复：#1 重建杀线程 / #2 HRESULT 容忍 / #3 穿透兜底 / #4 DPI 重估 + 顺带 #5 孤儿画布 | `6c45c4f`, `d81ecd7` | `codex/host-p0-fixes` |
 | 6 | 2026-10-26 | 库窗口即本体能力补齐：P0-1 内容层 + P0-2 输入路由 + P1 焦点路由(FocusHint) | `d4ea46b` | `master` |
 | 5 | 2026-10-23 | 遮挡优化 A+B1：隐藏屏停产与逐块摘触发源（含 Progman 误判修复、性能阀门两档化） | `6e88cfb`, `7219a6c`, `31aea6f` | `master` |
 | 4 | 2026-10-21 | 优化轮 2 收尾：border 实芯修复取证 + 全阀门绿 + 提交归档 | `64768b1` | `codex/liquid-verre-rs-refactor` |
