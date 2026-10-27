@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/graphics-d3d11-gotchas.md", "reason": "D3D11/Win32 静默陷阱清单，本次新增 HRESULT 与 WM_DESTROY 两条的落点"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "分层边界：core 纯函数下沉与 platform unsafe 纪律"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Error/ErrorKind 与 warn-once 纪律（register_class 报错路径）"}
+{"file": ".trellis/spec/backend/measurement-and-gates.md", "reason": "取证脚本与阀门方法论（新脚本 oracle 选择）"}
+{"file": ".trellis/tasks/10-27-host-p0-fixes/research/defect-fix-plan-host.md", "reason": "宿主实测定界报告（缺陷现象/补丁/验证的原始来源）"}
