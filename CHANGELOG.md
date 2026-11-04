@@ -8,7 +8,7 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
-## [0.5.3-unreleased]
+## [0.5.3] - 2026-11-04
 
 来源：宿主 `ikun_organizer` 对 0.5.2 的复验（`liquid-verre-rs-0.5.3-库侧修复清单-下层框hover命中未让位上层块.md`）。
 一句话：**0.5.2 #1 修对了 border 的「绘制层序」，没修「触发判据」**。宿主本轮不需要改代码（无新增公共项）。
