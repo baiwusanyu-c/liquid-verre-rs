@@ -125,10 +125,21 @@ python tools/ab_memory.py               # 常驻内存受控 A/B（level 0 vs le
 ## 不变量增补（在原 9 条之上）
 
 10. **缩放反馈掩码源头互斥**：`ResizeEdges::to_shader_edges()` 在对角时全 0、
-    `to_shader_corners()` 在单边时全 0；border 由独立 pass（`border_ps.hlsl`）绘制，
-    只作用于 hover 块，其余块零状态切换。
+    `to_shader_corners()` 在单边时全 0；border 用独立着色器 `border_ps.hlsl` + 独立 `BorderCb`，
+    但**在第 i 块玻璃之后、任何更高块之前**发射（0.5.2 #1 起随 `draw_blocks` 逐块内联，
+    不再是「全部玻璃之后的独立叠加 pass」）；判据本体 `core::draw::border_emit_plan`，
+    只作用于 hover 块，无 feedback 时零状态切换。取证 `tools/verify_border_zorder.py`。
 11. **影响盒单一出口**：`MonitorRt::influence_px() = max(3R+32, 2*grip+16) + ceil(shadow_margin)`，
     脏区推导 / verify_validity / mouse_relevant 三处共用，禁止手写外扩。
 12. **默认参数即视觉基线**：`LiquidParams::default()` 的 `blur_min` 必须写成表达式 `20.0 * 0.12`
     （f32 下 = 2.3999999，字面量 2.4 差 1 ULP ≈ 2400 个 ±1 LSB 像素）；改默认值 = 改基线，
     必须同步取证图与本节。
+13. **绘制的层序与命中的层序必须共用同一套 z 判据**（0.5.3 新增，#9 的直接教训）：
+    「谁在上面」这件事在三处必须同口径 —— 绘制
+    （`core::draw::border_emit_plan`：border 在第 i 块玻璃之后、任何更高块之前）、
+    本体命中（`core::manager::hit_test`：`max_by_key(z_order)`）、
+    把手命中（`core::manager::hit_resize`：先 `topmost_body_z_at` 过滤再比 z）。
+    三者的矩形口径一律用**精确本体**（`x..x+width`，不含阴影外扩、不含 grip 外扩）。
+    ⚠ 只修其中一处 = 半修：0.5.2 #1 修对了绘制层序（白边不再盖到上层框身上），却没修命中判据，
+    于是「下层框被压住的那条边缘照样亮、手型照样变缩放箭头、点下去没反应」——
+    宿主复验直接判失败。改任一处前先问「另外两处同不同意」。

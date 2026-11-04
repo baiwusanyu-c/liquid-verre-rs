@@ -66,6 +66,18 @@ pub(crate) struct App {
     /// 逐像素取证必须与「跑测试时鼠标碰巧停在哪」无关，否则同一份二进制
     /// 两次运行会得到不同的图（hover / 缩放把手反馈都是光标驱动的）。
     pub pinned_cursor: Option<[f32; 2]>,
+    /// 光标所在像素**此刻**是否归自家画布（0.5.3 #10 的缓存判定）。
+    ///
+    /// 只在 `cursor_moved` 为真时向系统问一次 `WindowFromPoint`（O(1)，但仍是每帧
+    /// 一次的跨进程查询，静止时没必要重复）；静止帧沿用上一次结论 ⇒ 「别的窗口刚盖上来、
+    /// 鼠标还没动」这一帧仍可能亮着，下一次鼠标一动就纠正。取这个方向是因为它
+    /// 与 hover 本身一样是「每帧重算的观度量」，不是正确性门槛。
+    /// 初值必须是 `true`：否则首帧（光标还没动过）会永远不亮边。
+    ///
+    /// ⚠ **时效语义**（`tools/verify_grip_occlusion.py` 断言 4 实测过）：盖上来 / 撤走
+    /// 都要等**下一次光标移动**才生效 —— 静止时沿用上一次结论。宿主复验请按
+    /// 「动一下鼠标」为基准，别拿静止鼠标当反例。
+    pub cursor_on_canvas: bool,
     pub press: f32,
     pub route_state: crate::core::routing::RouteState,
     pub drag_velocity: [f32; 2],
@@ -578,9 +590,13 @@ pub(crate) fn render_monitor(app: &mut App, mi: usize, ctx: &FrameCtx, full_redr
 /// （16 ms tick 跟随 / 不重挂 OLE 目标）。把会话位接进键里，翻转就会在下一次发布
 /// 门（dirty 或 4 Hz 兜底）被推出去。
 ///
-/// 4 位仍远小于 i32 的宽度，将来再加布尔位往后接即可。
+/// 5 位仍远小于 i32 的宽度，将来再加布尔位往后接即可。
+///
+/// 0.5.3 #9 又补了 `hovered`：宿主的「哪块被 hover」诊断通路（`debug_log_blocks()` 每秒打
+/// `hovered=`）与 `tools/verify_grip_occlusion.py` 的 oracle 都读这个位。它翻转而几何不动
+/// 是**常态**（光标移到另一块上，两块都没动），少了这一位就等于让宿主与取证都读到陈旧值。
 #[must_use]
-pub(crate) fn window_key(b: &crate::core::block::Block, dragged: bool) -> [i32; 6] {
+pub(crate) fn window_key(b: &crate::core::block::Block, dragged: bool, hovered: bool) -> [i32; 6] {
     let s = b.scale.max(1e-3);
     [
         b.x.round() as i32,
@@ -588,10 +604,11 @@ pub(crate) fn window_key(b: &crate::core::block::Block, dragged: bool) -> [i32; 
         (b.width / s).round() as i32,
         (b.height / s).round() as i32,
         b.z_order,
-        i32::from(b.visible) * 8
-            + i32::from(b.interactive) * 4
-            + i32::from(b.occluded) * 2
-            + i32::from(dragged),
+        i32::from(b.visible) * 16
+            + i32::from(b.interactive) * 8
+            + i32::from(b.occluded) * 4
+            + i32::from(dragged) * 2
+            + i32::from(hovered),
     ]
 }
 
@@ -610,7 +627,9 @@ pub(crate) fn publish_snapshot(app: &mut App, fps: f32, hz: f32, battery: bool) 
         let style = *b.effective_style(&app.default_style);
         let dragged = app.drag.as_ref().map(|d| d.id()) == Some(b.id);
         let resizing_now = app.drag.as_ref().is_some_and(|d| d.is_resize());
-        app.snapshot_key_next.push((b.id, window_key(b, dragged)));
+        let hovered = app.hover == Some(b.id);
+        app.snapshot_key_next
+            .push((b.id, window_key(b, dragged, hovered)));
         app.snapshot.windows.push(WindowSnapshot {
             id: b.id,
             rect: [b.x, b.y, b.width / s, b.height / s],
@@ -796,11 +815,18 @@ mod tests {
     #[test]
     fn session_flag_flip_changes_the_snapshot_key() {
         let b = block();
-        let idle = window_key(&b, false);
-        let dragging = window_key(&b, true);
+        let idle = window_key(&b, false, false);
+        let dragging = window_key(&b, true, false);
         assert_ne!(
             idle, dragging,
             "会话开始/结束必须让快照重发（几何没动也要发）"
+        );
+        // 0.5.3 #9：hovered 翻转而几何不动是**常态**（光标移到另一块上，两块都没动），
+        // 同样必须重发 —— 宿主的 debug_log_blocks() 与 verify_grip_occlusion.py 都读这个位。
+        assert_ne!(
+            window_key(&b, false, false),
+            window_key(&b, false, true),
+            "hovered 翻转必须让快照重发"
         );
         // 除会话位外，其余五项必须逐位相同：不许因为加了位就动几何口径。
         assert_eq!(&idle[..5], &dragging[..5]);
@@ -809,20 +835,22 @@ mod tests {
     /// 其余布尔位同样必须各占一位，且互不遮蔽。
     #[test]
     fn every_mutable_bool_has_its_own_key_bit() {
-        let base = window_key(&block(), false);
+        let base = window_key(&block(), false, false);
         let mut b = block();
         b.visible = false;
-        assert_ne!(base, window_key(&b, false), "visible");
+        assert_ne!(base, window_key(&b, false, false), "visible");
         b.visible = true;
         b.interactive = false;
-        assert_ne!(base, window_key(&b, false), "interactive");
+        assert_ne!(base, window_key(&b, false, false), "interactive");
         b.interactive = true;
         b.occluded = true;
-        assert_ne!(base, window_key(&b, false), "occluded");
+        assert_ne!(base, window_key(&b, false, false), "occluded");
         b.occluded = false;
+        assert_ne!(base, window_key(&b, true, false), "dragged");
+        assert_ne!(base, window_key(&b, false, true), "hovered");
         assert_eq!(
             base,
-            window_key(&b, false),
+            window_key(&b, false, false),
             "全部还原后键必须回到原值（位不重叠）"
         );
     }
@@ -833,8 +861,8 @@ mod tests {
         let mut a = block();
         let b2 = block();
         a.x = 100.4;
-        assert_eq!(window_key(&a, false), window_key(&b2, false));
+        assert_eq!(window_key(&a, false, false), window_key(&b2, false, false));
         a.x = 100.6;
-        assert_ne!(window_key(&a, false), window_key(&b2, false));
+        assert_ne!(window_key(&a, false, false), window_key(&b2, false, false));
     }
 }

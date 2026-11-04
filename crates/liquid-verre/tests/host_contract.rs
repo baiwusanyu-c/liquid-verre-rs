@@ -172,6 +172,36 @@ fn setting_the_same_level_twice_is_accepted_and_idempotent() {
     );
 }
 
+/// 0.5.3 #9：hover **归属**是宿主可读的公共面（`WindowSnapshot::hovered`），
+/// 而且 #9/#10 都**不新增公共 API** —— 宿主本轮不需要改代码这条承诺的前提就是它。
+///
+/// 判据本体（`topmost_body_z_at` / `grip_reachable` / `hover_gate_blocks`）是 `pub(crate)`，
+/// 在 `core/manager.rs` 与 `runtime::mod` 里各有单测；这里只钉「宿主读得到结果」。
+#[test]
+fn hover_attribution_is_observable_and_needs_no_new_api() {
+    let e = engine();
+    let w = e
+        .create_window(WindowConfig {
+            rect: [100.0, 100.0, 400.0, 300.0],
+            ..Default::default()
+        })
+        .expect("合法配置");
+    // 未启动 ⇒ 没有任何权威状态，也就**不该**有虚假的 hover（宿主的「当前操作框」UI
+    // 若读到 hovered=true 会亮出一个根本不存在的悬停态）。
+    assert!(w.snapshot().is_none(), "引擎未启动时不该有快照");
+    let s = e.snapshot();
+    assert!(
+        s.windows.iter().all(|win| !win.hovered),
+        "未启动时 hovered 必须全 false"
+    );
+    // 编译期契约：宿主诊断通路（debug_log_blocks 每秒打 hovered=）依赖这个字段。
+    fn hover_field_is_public(win: &WindowSnapshot) -> bool {
+        win.hovered
+    }
+    let reads: Vec<bool> = s.windows.iter().map(hover_field_is_public).collect();
+    assert!(reads.is_empty() || reads.iter().all(|v| !*v));
+}
+
 /// #4：宿主跟随窗口位置/尺寸靠的是 `WindowSnapshot::rect` + `moving`/`resizing`
 /// 三个字段。它们必须一直在（缺字段时宿主的 16 ms tick 绕行无处可写）。
 #[test]

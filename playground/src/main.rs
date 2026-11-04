@@ -42,6 +42,7 @@ impl SinkDemo {
 // playground 不是库，这里直接绑 user32 而不引入 windows crate（取证专用的唯一 unsafe 点）。
 extern "system" {
     fn GetCapture() -> isize;
+    fn SetCursorPos(x: i32, y: i32) -> i32;
     fn GetConsoleWindow() -> isize;
     fn SetFocus(hwnd: isize) -> isize;
     fn GetCurrentThreadId() -> u32;
@@ -300,6 +301,12 @@ fn main() -> ExitCode {
     // 那段白边」的确定性场景，tools/verify_border_zorder.py 读稳态帧像素断言层序。
     if let Some(demo) = std::env::var_os("GLASS_BORDER_DEMO") {
         run_border_demo(&engine, &demo.to_string_lossy().to_lowercase());
+    }
+
+    // 0.5.3 #9/#10 取证入口：`GLASS_GRIP_DEMO=1` 造「上层块机身压住下层块左边缘带中段」
+    // 的场景，再用物理光标在 covered / free 两点之间来回，逐点打 `[verify] grip_probe`。
+    if std::env::var_os("GLASS_GRIP_DEMO").is_some() {
+        run_grip_demo(&engine);
     }
 
     // 0.5.2 #4 取证入口：`GLASS_SESSION_DEMO=1` 起一条 4 ms 快照采样线程，
@@ -719,6 +726,126 @@ fn run_border_demo(engine: &Arc<Engine>, mode: &str) {
             w.set_visible(true);
             std::thread::sleep(Duration::from_millis(150));
         }
+    });
+}
+
+/// 0.5.3 #9 / #10：把手命中的遮挡让位取证场景。
+///
+/// oracle 用**状态**不用像素（清单 §5）：`WindowSnapshot::hovered` 就是本条缺陷的直接判据，
+/// 比像素稳定，也不与 `verify_border_zorder.py`（管绘制）重叠。
+///
+/// 布局（物理像素，取证 hermetic：`GLASS_MONITORS=1` + 主屏原点 (0,0)）：
+///
+/// ```text
+///   A（下层，默认块）  左边缘带 = x ∈ [A.x-grip, A.x+grip]
+///   B（上层，不透明）  机身盖住这条边缘带的**中段**
+///
+///   p_covered = 边缘带 ∩ B 机身   ⇒ 期望 A.hovered == false（#9 主判据）
+///   p_free    = 边缘带 ∩ B 之外   ⇒ 期望 A.hovered == true （反向对照，防修过头）
+///   再把外部窗口盖到 p_free 上     ⇒ 期望 A.hovered == false（#10 外来窗口门控）
+/// ```
+///
+/// ⚠ 本 demo **不设** `GLASS_CURSOR_AT`：#10 的门控查的是真实光标，钉死模式按设计绕过它
+/// （见 `runtime::mod` 里那条注释），一钉死就把 #10 测成空转。
+fn run_grip_demo(engine: &Arc<Engine>) {
+    const GRIP: f32 = 24.0;
+    wait_for_monitors(engine);
+    let wins = engine.windows();
+    if wins.len() != 1 {
+        log::warn!(
+            "[playground] GLASS_GRIP_DEMO 需要单块布局（GLASS_DEFAULT_BLOCK=1），当前 wins={}",
+            wins.len()
+        );
+        return;
+    }
+    let lower = wins[0].clone();
+    let Some(s) = lower.snapshot() else {
+        log::warn!("[playground] GLASS_GRIP_DEMO: 默认块 snapshot 不可用");
+        return;
+    };
+    let resize = ResizeOptions {
+        grip_px: GRIP,
+        ..Default::default()
+    };
+    lower.set_resize_options(resize);
+
+    let sc = s.scale.max(0.05);
+    let (ax, ay) = (s.rect[0], s.rect[1]);
+    let (aw, ah) = (s.rect[2] * sc, s.rect[3] * sc);
+    let p_covered = [ax + 3.0, ay + ah * 0.55];
+    let p_free = [ax + 3.0, ay + ah - GRIP - 24.0];
+    let (b_top, b_bottom) = (ay + ah * 0.45, ay + ah * 0.70);
+    // B：不透明纯色，只盖住 A 左边缘的中段（既不碰 p_free，也不碰两点之外的东西）。
+    let _ = engine.create_window(WindowConfig {
+        rect: [
+            ax - 40.0,
+            b_top,
+            (120.0 / sc).max(1.0),
+            ((b_bottom - b_top) / sc).max(1.0),
+        ],
+        style: Some(GlassStyle::transparent(0.0, 1.0, [0.05, 0.15, 0.85, 1.0])),
+        // ⚠ 必须保持**可交互**（默认 true）：宿主场景里的上层框就是普通块。
+        // 设成 false 会让 `hit_test` 跳过 B 落到 A，`hovered` 判据就测不到真实形状
+        // （0.5.3 首跑就是这么把断言 1 测成假红的）。不可交互块参与遮挡的那条语义
+        // 由单测 `non_interactive_higher_block_still_occludes_grip` 覆盖，不需要 GUI。
+        ..Default::default()
+    });
+    log::info!(
+        target: "verify",
+        "grip_scene a=[{:.0},{:.0},{:.0},{:.0}] b=[{:.0},{:.0},{:.0},{:.0}] grip={:.0} p_covered={:.0},{:.0} p_free={:.0},{:.0}",
+        ax,
+        ay,
+        ax + aw,
+        ay + ah,
+        ax - 40.0,
+        b_top,
+        ax + 80.0,
+        b_bottom,
+        GRIP,
+        p_covered[0],
+        p_covered[1],
+        p_free[0],
+        p_free[1],
+    );
+
+    let a_id = lower.id();
+    let engine = Arc::clone(engine);
+    std::thread::spawn(move || {
+        // 采样序列：covered → free → covered（第 3 步专测「来回切换无粘滞」），
+        // **重复多轮**：外部窗口遮挡那一步（#10）由脚本在后续轮次里盖窗/撤窗，
+        // 库侧不需要知道它的存在 —— 脚本只需要读到「同一个 pt=free 在不同轮次里
+        // 先 true 后 false 再 true」，那就是带撤除对照的判据。
+        let plan = [
+            ("covered", p_covered),
+            ("free", p_free),
+            ("covered2", p_covered),
+        ];
+        std::thread::sleep(Duration::from_millis(800));
+        for round in 0..8u32 {
+            for (tag, pt) in plan {
+                unsafe { SetCursorPos(pt[0] as i32, pt[1] as i32) };
+                // 400 ms ≈ 50 帧：足够 hover 重算 + 快照发布（hovered 位已进比对键）。
+                std::thread::sleep(Duration::from_millis(400));
+                // 每轮**现查**「此刻被 hover 的 id 集合」，不缓存派生量。
+                // 0.5.3 首跑前科：把上层块 id 在创建后一次性缓存下来，那时渲染线程
+                // 还没发布过它 ⇒ 缓存是空表，`b_hovered` 恒 false，把「归属已上移到 B」
+                // 这条最关键的证据整个测丢了。
+                let hovered_ids: Vec<u32> = engine
+                    .windows()
+                    .iter()
+                    .filter_map(|w| w.snapshot())
+                    .filter(|sn| sn.hovered)
+                    .map(|sn| sn.id)
+                    .collect();
+                let a_hovered = engine.window(a_id).snapshot().is_some_and(|sn| sn.hovered);
+                log::info!(
+                    target: "verify",
+                    "grip_probe round={round} pt={tag} a_id={a_id} a_hovered={a_hovered} hovered_ids={:?}",
+                    hovered_ids
+                );
+            }
+        }
+        log::info!(target: "verify", "grip_probe done");
     });
 }
 

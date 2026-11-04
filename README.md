@@ -740,6 +740,12 @@ HTTP 接口：`GET /`、`GET /api/schema`、`GET /api/state`、`GET /api/events`
 - `GLASS_SESSION_DEMO=1`：起一条 4 ms 的快照采样线程，只在 `moving == true` 的采样点计数，
   会话结束后打 `[verify] session_snap ticks=.. rect_changes=..`；`armed` 行带块中心物理坐标，
   供脚本发 `SendInput` 物理拖拽。消费方：`tools/verify_session_snapshot.py`。
+- `GLASS_GRIP_DEMO=1`（0.5.3 #9/#10）：造「上层块机身压住下层块左边缘带中段」的场景，
+  用**物理**光标在 `p_covered` / `p_free` 之间来回多轮，每轮打
+  `[verify] grip_probe round=.. pt=.. a_id=.. a_hovered=.. hovered_ids=[..]`；外部窗口
+  那一步由脚本自己盖/撤（`Static` 类顶层窗口），库侧不感知。消费方：
+  `tools/verify_grip_occlusion.py`。⚠ 这条**不设** `GLASS_CURSOR_AT` —— 钉死模式按设计
+  绕过 #10 的门控，一钉死 #10 就测成空转。
 - 双击取证复用 `GLASS_INPUT_SINK_DEMO=1`（SinkDemo 本来就打每个相位的 `[verify]` 日志），
   另加一行 `[verify] sink_mount id=.. center=x,y rect=[..]` 作为点击坐标锚点。
   消费方：`tools/verify_double_click.py`。
@@ -857,6 +863,27 @@ PeekMessage 泵
 
 ### 边缘 / 对角缩放（8 个把手）
 
+- ⚠ **把手命中必须让位更上层块的本体**（0.5.3 #9）：`hit_resize` 先算
+  `core::manager::topmost_body_z_at`（该点被哪一层**本体**压着，矩形口径与 `hit_test`
+  逐字一致：精确本体，不含阴影外扩、不含 grip 外扩），再用 `grip_reachable(candidate_z,
+  top_body_z)` 过滤候选 —— **严格小于才抑制**（相等放行，否则块自己边缘内侧 1px 会把自己
+  判死）。`visible=false` 的块不参与遮挡（没有像素）；`interactive=false` 但可见的块
+  **参与**（玻璃确实盖在上面，遮挡是视觉事实）。被抑制的候选直接丢弃、不降级，该点的归属
+  交给 `hit_test` ⇒ 「Move 归上层块、亮边归下层块」的自相矛盾被消掉。四个调用点
+  （每帧 hover / `WM_NCHITTEST` / `dispatch_pointer` / `forward_move_to_sink`）共用这一处判据。
+- ⚠ **外来窗口压在光标上时不亮边**（0.5.3 #10）：每帧重算 hover 前查一次
+  `platform::window::cursor_over_canvas`（`WindowFromPoint` → `GetAncestor(GA_ROOT)` →
+  自家类名），不在画布上就清空 hover / 手型。只在**光标移动过**的帧查（静止时沿用上次结论），
+  所以盖上来 / 撤走都要等下一次光标移动才生效 —— 这是已知设计，宿主复验别拿静止鼠标当反例。
+  `GLASS_CURSOR_AT` 钉死模式**必须绕过**这条门控（取证时真实光标被刻意停在远处，
+  查了就会让所有 border / hover 取证集体空转）。这条绕行是**跨子系统**隐含契约
+  （`diag/env` ↔ 主循环 ↔ `tools/`），判据本体是纯函数 `runtime::hover_gate_blocks`，
+  离线真值表两条单测钉住（e2e 不进 CI，靠它兜不住）；`WindowFromPoint` 的入参换算
+  同样抽成纯函数 `platform::window::point_i32`（NaN / ±inf / 溢出必须饱和，
+  不许带着未定义位模式跨 FFI 边界）。
+- **不变量**：绘制的层序与命中的层序必须共用同一套 z 判据（BASELINE 不变量 13）。
+  0.5.2 #1 只修了绘制那一半，命中判据缺遮挡项 ⇒ 「下层框被压住的边缘照样亮」，
+  这就是 0.5.3 #9 的根因。
 - 判定唯一入口 `core/handle.rs::hit_handle(rect, cursor, grip)`：**先角后边**
   （同时落在左边带与上边带内 ⇒ 判为对角 `TOP_LEFT`，不是单边）。命中带伸出块外 `grip/2`，
   窗口区域同步外扩 `max_grip + 2`，否则那部分鼠标消息根本到不了我们窗口。
@@ -1030,6 +1057,7 @@ python tools/ab_memory.py                # 常驻内存受控 A/B（level 0 vs l
 python tools/verify_border_zorder.py      # #1 border 受块 z 序遮挡（像素 oracle + 反向对照）
 python tools/verify_session_snapshot.py   # #4 会话期快照跟随 + moving 位翻转可见
 python tools/verify_double_click.py       # #5 CS_DBLCLKS：物理双击必须到达 DoubleClick 相位
+python tools/verify_grip_occlusion.py     # 0.5.3 #9/#10 把手命中让位上层块本体 + 外来窗口门控
 ```
 
 行为取证（0.5.0 输入路由新增；改消息路由 / 会话收尾时必跑）：

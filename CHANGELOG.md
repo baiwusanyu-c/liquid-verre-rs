@@ -8,6 +8,99 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
+## [0.5.3-unreleased]
+
+来源：宿主 `ikun_organizer` 对 0.5.2 的复验（`liquid-verre-rs-0.5.3-库侧修复清单-下层框hover命中未让位上层块.md`）。
+一句话：**0.5.2 #1 修对了 border 的「绘制层序」，没修「触发判据」**。宿主本轮不需要改代码（无新增公共项）。
+
+### Fixed
+- **#9 [P0] 下层框的边缘在被上层框机身压住时照样亮**（`core/manager.rs`）：`hit_resize` 只在
+  **把手候选之间**比 z 序，而上层块 B 在该点根本不是候选（光标在 B 机身内部、不在 B 的边缘带）
+  ⇒ B 连参与比较的机会都没有，A 作为唯一候选当选：hover / 反馈 border / 手型光标全落在被 B
+  盖住的 A 边缘上（被盖住那段看不见，**两头露出来**），点下去又拉不动。现补上遮挡项：
+  先 `topmost_body_z_at(blocks, x, y)` 求「该点被哪一层本体压着」（矩形口径与 `hit_test`
+  逐字一致），再 `grip_reachable(candidate_z, top_body_z)` 过滤候选。**两趟 O(2n) 无分配**
+  —— 不写成「收集候选再排序」（那正是 0.5.2 里每帧新建 Vec 把 own_us 从 14 抬到 142 的同款坑）。
+  六条语义细则全部落地：严格小于才抑制（相等放行，否则边缘内侧 1px 抓不动）/ `visible=false`
+  不参与遮挡 / `interactive=false` 但可见**参与** / 会话中不改判 / 被抑制的候选直接丢弃不降级 /
+  **不用** 8 Hz 的 `Block::occluded` 当这个判据（粒度与时效都不对）。四个调用点
+  （每帧 hover、`WM_NCHITTEST`、`dispatch_pointer`、`forward_move_to_sink`）共用这一处判据，
+  「Move 归上层块、亮边归下层块」的自相矛盾随之消掉。
+- **#10 [P1] 外来窗口压在光标上时同样亮边**（`platform/window.rs` + `runtime/mod.rs`）：
+  库每帧轮询的是**全局光标**，纯几何判据不知道「这个像素此刻归谁」。现每帧重算 hover 前查一次
+  `cursor_over_canvas`（`WindowFromPoint` → `GetAncestor(GA_ROOT)` → 自家类名），不在画布上
+  就清空 hover / 手型。只在 `cursor_moved` 的帧查（静止沿用上次结论）⇒ **盖上来与撤走都要等
+  下一次光标移动才生效**，这是已知时效语义（`App::cursor_on_canvas` 注释 + 取证脚本断言 4
+  都写明了），宿主复验别拿静止鼠标当反例。`GLASS_CURSOR_AT` 钉死模式**必须绕过**本门控
+  （取证时真实光标被刻意停在远处，查了会让所有 border / hover 取证集体空转）。
+- **#11 [P2] 三处旧口径**（不跟着改就是给下一个改库的人埋雷）：
+  `runtime/occlusion.rs` 模块头那句「块被盖住时鼠标本来也落在上面那个窗口上」对**兄弟块不成立**
+  （同一画布 HWND，没有别的窗口吸收鼠标），现改成三层判据的明确分工；
+  `BASELINE.md` 不变量 10 里「border 由独立 pass 绘制」在 0.5.2 #1 后已是错的，现改写并
+  **新增不变量 13：绘制的层序与命中的层序必须共用同一套 z 判据**；
+  `core/draw.rs` / `gfx/glass_renderer.rs` 里「宿主 raise_box 修不了 hover 阶段」的归因更正为
+  「修不了的原因是把手命中判据缺遮挡项（#9），不是抬层能力缺」—— 别让它被读成「抬层仍可绕」。
+
+### Added
+- `WindowSnapshot::hovered` 进快照比对键 `runtime::app::window_key`（同 0.5.2 #4 那一族）：
+  hover 翻转而几何不动是**常态**（光标移到另一块上，两块都没动），少这一位就等于让宿主
+  （`debug_log_blocks()` 每秒打 `hovered=`）与 `verify_grip_occlusion.py` 读到陈旧值。
+
+### Tests
+- 库单测 248 → **257**（+9）。`core/manager.rs` 新增 6 条（`grip_under_higher_body_does_not_hover` /
+  `grip_outside_higher_body_still_hovers` / `grip_inside_own_body_is_not_self_occluded` /
+  `hidden_higher_block_does_not_occlude_grip` / `non_interactive_higher_block_still_occludes_grip` /
+  `topmost_body_z_at_is_single_source_of_truth`）；`runtime::mod` 新增 2 条门控真值表
+  （`hover_gate_blocks_only_when_not_pinned_and_off_canvas` /
+  `hover_gate_is_a_conjunction_not_a_disjunction`）—— 钉死光标必须绕行 #10 这条约定是
+  **跨子系统**隐含契约，e2e 不进 CI，所以必须离线钉住；`platform/window.rs` 新增 1 条
+  FFI 边界饱和性（`point_i32_is_saturating_at_the_ffi_boundary`）；`runtime/app.rs`
+  的键测试补 hovered 位断言。
+- 集成测试 `tests/host_contract.rs` 8 → **9**：新增 `hover_attribution_is_observable_and_needs_no_new_api`
+  （宿主可读 hover 归属 + 本轮确实没有新增公共 API）。
+- 新增取证 `tools/verify_grip_occlusion.py`（登记进 `verify_all.py` 第 9 项）：oracle 用**状态**
+  （`WindowSnapshot::hovered` + `hovered_ids`）不用像素，与 `verify_border_zorder.py`（管绘制）不重叠。
+  断言 4 用 ctypes 造一个 `Static` 类顶层窗口盖在 `p_free` 上再撤掉，带撤除对照。
+- 判别力实测：把 `if !grip_reachable(..) { continue; }` 关掉 ⇒ 单测 2 红 4 绿（反向对照那条仍绿），
+  `verify_grip_occlusion.py` 2/4 红，且复现出宿主原话症状（`pt=covered → a_hovered=true`）。
+
+### 取证过程中修掉的两个探针缺陷（诚实记录，都属「测量装置本身」）
+- 上层块 B 一开始被设成 `interactive: false` ⇒ `hit_test` 跳过 B 落到 A，把断言 1 测成假红。
+  宿主场景里 B 是普通可交互块；不可交互块参与遮挡那条语义由单测覆盖，不需要 GUI。
+- demo 线程一次性缓存了 B 的 id 列表，而那一刻渲染线程还没发布过 B ⇒ 缓存是空表，
+  「归属已上移到 B」这条最关键的证据整个测丢。现改成每轮现查 `hovered_ids`。
+
+### 性能与回归证据（2026-11-04，本机 DISPLAY1 3120x2080@120Hz dpi=192）
+
+`hit_resize` 每帧多一趟 O(n) 浮点比较（20 块 ≈ 100 次比较，几十纳秒量级），
+`WindowFromPoint` 只在**光标移动过**的帧查一次。`gate_perf.py` 连跑两轮（绝对门槛档）：
+
+| 场景 | 0.5.2 参考 | 0.5.3 第 1 轮 | 0.5.3 第 2 轮 |
+|---|---|---|---|
+| single-drag fps / p50 / own_us | 114.8 / 8.33 / 14 | 112.8 / 8.34 / 24 | 114.7 / 8.32 / 43 |
+| many-drag lat=1 fps / p50 / own_us | 69.9 / 14.79 / 30 | 58.7 / 16.66 / 54 | 60.2 / 16.65 / 50 |
+| many-drag lat=2 fps / p50 | 112.4 / 8.35 | 103.7 / 8.37 | 97.4 / 9.52 |
+| transparent-drag fps / p50 / own_us | 95.2 / 8.33 / 14 | 96.5 / 8.33 / **24** | 97.0 / 8.33 / **14** |
+| DDA 次/秒（many-drag） | 47 | **114** | **110** |
+
+**结论：两轮均 PASS**（绝对门槛），但**本轮不给「零代价」的结论** —— 诚实记录如下：
+这两轮机器明显比 0.5.2 那轮忙（同场景 DDA 重绘 110~114 次/秒 vs 47 次/秒，
+Private 149~158 MB vs 129 MB），而 `own_us` 的 run-to-run 散布本来就有 ±25 µs
+（0.5.2 同一份代码两次实测 38 → 14）。要按 spec 下「无劣化」的结论，需要
+**轮转 A/B + ≥3 重复 + 中位数**（`.trellis/spec/backend/measurement-and-gates.md` §2），
+本轮没做，别把上面这组数当 A/B 用。
+
+两条**结构性**旁证说明代价不可能在几十 µs 量级：
+1. `transparent-drag` 是单块、每帧光标都在动（所以每帧都查 `WindowFromPoint`），
+   own_us 第二轮回到 **14 µs** = 0.5.2 的最好值；
+2. 新增的那趟扫描是 `blocks.iter()` 上的纯标量比较，没有分配、没有系统调用。
+
+同轮复跑的既有取证（全部 PASS）：`verify_border_zorder`（钉死光标绕行有效，白边仍在）、
+`verify_mouse_isolation`（闭包外 0 差异）、`verify_content`（5/5）、
+`verify_session_snapshot`（37/40 步可见）、`verify_double_click`（3/3）。
+新取证 `verify_grip_occlusion` 的判别力实测：关掉遮挡过滤 ⇒ 单测 2 红 4 绿
+（反向对照那条仍绿）、e2e 2/4 红且复现出宿主原话症状（`pt=covered → a_hovered=true`）。
+
 ## [0.5.2] - 2026-11-04
 
 来源：分类框宿主 `ikun_organizer`（依赖 crates.io `liquid-verre-rs 0.5.1`）的实测取证清单。

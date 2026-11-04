@@ -10,7 +10,7 @@
 //!    做到「块内可交互、块外完全穿透」。
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
 use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, GDI_REGION_TYPE, RGN_OR,
@@ -737,6 +737,46 @@ pub(crate) fn is_own_window(hwnd: HWND) -> bool {
     class_name_is_canvas(&buf, n)
 }
 
+/// 该**虚拟屏绝对坐标**此刻是不是落在自家画布上（0.5.3 #10）。
+///
+/// 为什么需要它：库每帧轮询的是**全局光标**，hover / 反馈 border / 手型光标全是纯几何
+/// 判据，不知道「这个像素此刻归谁」。于是 Chrome/IDE/宿主自己的别的窗口盖住玻璃边缘时，
+/// 白边照样亮、光标照样变缩放箭头，点下去却什么都没发生（消息根本进不了画布）——
+/// 观感与行为割裂。#9 修的是**同一画布内**兄弟块之间的遮挡（纯 z 序，可离线单测）；
+/// 跨进程的**外来窗口**只有系统知道，所以这里问系统一次。
+///
+/// 口径与宿主一致：`WindowFromPoint` 天然尊重 `WS_EX_TRANSPARENT` 与 `SetWindowRgn`
+/// 的命中区域，宿主的 alpha=1 命中带靠的正是同一套语义。三条已知细节：
+/// 1. 先 `GetAncestor(GA_ROOT)` 再比类名：命中的可能是别人的子窗口，类名比较必须在根窗口上做。
+/// 2. 画布自己正处于 `WS_EX_TRANSPARENT`（采集停产 / 全屏让路 / 光标本来就在块外）时
+///    `WindowFromPoint` 不会返回画布 ⇒ 结论同样是「不该亮」，方向一致，**不需要特例**。
+/// 3. **不要**用 8 Hz 的 `Block::occluded` 替代本判据：粒度（整块 vs 逐像素）与时效
+///    （最坏 250 ms vs 每帧）都不对，见清单 §3.3 细则 6 与 `runtime::occlusion` 模块头。
+#[must_use]
+pub(crate) fn cursor_over_canvas(x: f32, y: f32) -> bool {
+    let (px, py) = point_i32(x, y);
+    let pt = POINT { x: px, y: py };
+    unsafe {
+        let hit = WindowFromPoint(pt);
+        if hit.0.is_null() {
+            return false;
+        }
+        is_own_window(GetAncestor(hit, GA_ROOT))
+    }
+}
+
+/// f32 物理坐标 → Win32 整数坐标（纯函数，0.5.3 #10 的 FFI 边界）。
+///
+/// `f32 as i32` 自 Rust 1.45 起是 **saturating**：NaN → 0、±inf → `i32::MIN/MAX`，
+/// 不 panic 也不产生 UB。这不是洁癖：`cursor_over_canvas` 的入参来自
+/// `App::read_cursor()`，而钉死模式（`GLASS_CURSOR_AT`）允许上层喂进任意字符串解析
+/// 出来的值 —— 一个 NaN 若以别的方式进 FFI 结构体，就是带着未定义位模式跨进程边界。
+/// 判据本体抽出来，由单测 `point_i32_is_saturating_at_the_ffi_boundary` 钉住。
+#[must_use]
+pub(crate) fn point_i32(x: f32, y: f32) -> (i32, i32) {
+    (x as i32, y as i32)
+}
+
 /// 类名比较的纯逻辑：`GetClassNameW` 写进 `buf` 的前 `n` 个宽字符，是否恰好是我们的画布类名。
 ///
 /// **零分配**：直接比宽字符常量，不再 `String::from_utf16_lossy`（那是一次堆分配，
@@ -759,7 +799,7 @@ fn class_name_is_canvas(buf: &[u16], n: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        class_name_is_canvas, show_request, CANVAS_CLASS_NAME, CANVAS_CLASS_NAME_W,
+        class_name_is_canvas, point_i32, show_request, CANVAS_CLASS_NAME, CANVAS_CLASS_NAME_W,
         CANVAS_CLASS_STYLE, CS_CLASSDC, CS_DBLCLKS,
     };
     use crate::api::config::WindowLevel;
@@ -785,6 +825,25 @@ mod tests {
         // 判别力护栏：把 register_class 里的 `style` 改回 `CS_CLASSDC` 就该红 ——
         // 常量本身必须真的是注册时用的那个（见 register_class 的 `style: CANVAS_CLASS_STYLE`）。
         assert_eq!(CANVAS_CLASS_STYLE.0, CS_CLASSDC.0 | CS_DBLCLKS.0);
+    }
+
+    /// 0.5.3 #10：`WindowFromPoint` 的入参必须**有定义** —— 任何浮点异常值都不许
+    /// 带着未定义位模式跨 FFI 边界，也不许 panic（钉死光标模式允许上层喂任意值）。
+    #[test]
+    fn point_i32_is_saturating_at_the_ffi_boundary() {
+        assert_eq!(point_i32(104.7, 250.2), (104, 250), "截断口径：向零取整");
+        assert_eq!(point_i32(-3.9, -0.5), (-3, 0));
+        assert_eq!(point_i32(f32::NAN, f32::NAN), (0, 0), "NaN 必须落 0");
+        assert_eq!(
+            point_i32(f32::INFINITY, f32::NEG_INFINITY),
+            (i32::MAX, i32::MIN)
+        );
+        // 远超 i32 的量级也要夹住而不是回绕（回绕会查到一个完全无关的屏幕点）。
+        assert_eq!(
+            point_i32(1e12, 0.0),
+            (i32::MAX, 0),
+            "溢出必须饱和，不许回绕"
+        );
     }
 
     /// 0.5.2 #2：显示决策必须把层级一起带出去（裸 ShowWindow 会把画布抬进普通带顶）。

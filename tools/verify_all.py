@@ -8,6 +8,7 @@
 6. 0.5.2 #1 border 层序（像素 oracle，调 verify_border_zorder.py）
 7. 0.5.2 #4 会话期快照跟随（调 verify_session_snapshot.py）
 8. 0.5.2 #5 CS_DBLCLKS 双击相位（调 verify_double_click.py）
+9. 0.5.3 #9/#10 把手命中让位上层块本体 + 外来窗口门控（调 verify_grip_occlusion.py）
 
 任何一项 FAIL 都会让整体返回非 0。
 """
@@ -161,6 +162,8 @@ def main():
          "[7] 0.5.2 #4 会话期快照跟随 + moving 位翻转可见"),
         ("double-click", "verify_double_click.py",
          "[8] 0.5.2 #5 CS_DBLCLKS：物理双击必须到达 DoubleClick 相位"),
+        ("grip-occlusion", "verify_grip_occlusion.py",
+         "[9] 0.5.3 #9/#10 把手命中让位上层块本体 + 外来窗口门控"),
     ]:
         print(title)
         r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", script)],

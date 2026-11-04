@@ -54,6 +54,22 @@ use monitor::MonitorRt;
 /// 保证鼠标悬停反馈延迟不超过半帧，同时静止桌面 CPU 趋近 0。
 const IDLE_WAIT_MS: u32 = 8;
 
+/// 外来窗口门控是否**拦下**这一帧的 hover（0.5.3 #10 的判据本体，纯函数）。
+///
+/// `pinned` = 钉死光标模式（`GLASS_CURSOR_AT`）在跑。钉死时**一律不拦**：
+/// 取证时真实光标被刻意物理停放在离玻璃 `> 3*mouse_radius` 的地方（不变量 5 的 `gate`
+/// 判据依赖这一点），此时 `WindowFromPoint` 必然回答「不在画布上」⇒ 若照拦，
+/// **所有** border / hover 取证集体空转（`verify_border_zorder.py` 断言 1 直接红）。
+/// 这与历史坑 3 同一个理由：钉死的必须是**全部**光标驱动的判据，不能只钉一半。
+///
+/// 抽成纯函数的第二个理由：这条「钉死必须绕行」是**跨子系统**的隐含约定
+/// （`diag/env` ↔ 主循环 ↔ `tools/`），只靠 e2e 间接证明；而 e2e 不在 CI 跑
+/// （依赖 DDA 与可交互桌面）⇒ 一旦有人删掉 `pinned` 判断，CI 全绿、发版后才炸。
+#[must_use]
+pub(crate) fn hover_gate_blocks(pinned: bool, cursor_on_canvas: bool) -> bool {
+    !pinned && !cursor_on_canvas
+}
+
 /// 渲染线程入口。返回 `Err` 表示不可恢复的初始化失败。
 pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
     let cfg: EngineConfig = shared.config().clone();
@@ -234,6 +250,7 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         hover_handle: ResizeEdges::NONE,
         cursor: [0.0, 0.0],
         pinned_cursor: env.cursor_at,
+        cursor_on_canvas: true,
         press: 0.0,
         route_state: crate::core::routing::RouteState::Idle,
         drag_velocity: [0.0, 0.0],
@@ -649,10 +666,23 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         app.cursor = app.read_cursor();
         let cursor_moved = (app.cursor[0] - previous_cursor[0]).abs() > 0.01
             || (app.cursor[1] - previous_cursor[1]).abs() > 0.01;
+        // 0.5.3 #10：外来窗口压在光标上时，hover / 反馈 border / 手型光标都不该亮。
+        // ⚠ 钉死光标模式（`GLASS_CURSOR_AT`）**必须绕过**这条门控：取证时真实光标
+        // 被物理停放在离玻璃 > 3*mouse_radius 的地方（不变量 5 的 gate 判据依赖这一点），
+        // 若照查 `WindowFromPoint` 就会得到「不在画布上」⇒ 所有 border / hover 取证
+        // 集体空转（`verify_border_zorder.py` 的断言 1 会直接红）。与历史坑 3 同一个理由：
+        // 钉死的必须是**全部**光标驱动的判据，不能只钉一半。
+        if cursor_moved && app.pinned_cursor.is_none() {
+            app.cursor_on_canvas = window::cursor_over_canvas(app.cursor[0], app.cursor[1]);
+        }
         // hover 与「缩放把手」一起判定：把手命中盒伸出块外，因此必须先查把手，
         // 否则块外一点点的边缘反馈会晚一帧才出现。
         let (new_hover, new_handle) = match app.drag.as_ref() {
             Some(d) => (Some(d.id()), d.edges().unwrap_or(ResizeEdges::NONE)),
+            // 会话中不改判（清单 §3.3 细则 4）：上面这条分支保持原样。
+            None if hover_gate_blocks(app.pinned_cursor.is_some(), app.cursor_on_canvas) => {
+                (None, ResizeEdges::NONE)
+            }
             None => match app.manager.hit_resize(app.cursor[0], app.cursor[1]) {
                 Some((id, e)) => (Some(id), e),
                 None => (
@@ -1134,7 +1164,49 @@ fn seed_diagnostic_blocks(app: &mut App, env: &EnvOverrides, cfg: &EngineConfig)
 
 #[cfg(test)]
 mod tests {
-    use super::IDLE_WAIT_MS;
+    use super::{hover_gate_blocks, IDLE_WAIT_MS};
+
+    /// 0.5.3 #10 门控真值表。**关键不是「外来窗口能拦住」，而是「钉死模式绝不拦」** ——
+    /// 后者断了就是全部取证空转，而 e2e 不进 CI，所以这条必须离线钉住。
+    #[test]
+    fn hover_gate_blocks_only_when_not_pinned_and_off_canvas() {
+        assert!(
+            hover_gate_blocks(false, false),
+            "外来窗口压在光标上时必须拦下 hover"
+        );
+        assert!(
+            !hover_gate_blocks(false, true),
+            "光标在自家画布上 ⇒ 不许拦（否则 hover / 亮边整个失效）"
+        );
+        // 钉死模式：无论系统怎么回答都不拦。写成 ∀ 而不是只测 pinned=true,on_canvas=true，
+        // 因为「钉死时 WindowFromPoint 的答案不可信」正是这条要防的东西。
+        for on_canvas in [true, false] {
+            assert!(
+                !hover_gate_blocks(true, on_canvas),
+                "GLASS_CURSOR_AT 钉死模式必须绕过门控（on_canvas={on_canvas}）"
+            );
+        }
+    }
+
+    /// 判别力护栏：门控只在「两个条件同时成立」时生效（合取，不是析取）。
+    /// 把实现写成 `!cursor_on_canvas`（漏掉 pinned）或 `!pinned || !on_canvas`（析取）
+    /// 都会在这里红，而不是等取证集体空转才发现。
+    #[test]
+    fn hover_gate_is_a_conjunction_not_a_disjunction() {
+        let tt = [
+            (false, false, true),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+        ];
+        for (pinned, on_canvas, blocks) in tt {
+            assert_eq!(
+                hover_gate_blocks(pinned, on_canvas),
+                blocks,
+                "pinned={pinned} on_canvas={on_canvas}"
+            );
+        }
+    }
 
     #[test]
     fn idle_wait_matches_the_documented_tradeoff() {
