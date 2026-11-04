@@ -135,7 +135,7 @@ engine.shutdown();
 
 | 类型 | 字段 |
 |---|---|
-| `EngineConfig` | `default_style`、`window_level`、`default_resize`、`capture`、`adaptive_quality`(默认 `true`)、`occlusion_culling`(默认 `true`)、`fullscreen_hide`(默认 `true`)、`fps_cap: Option<u32>`、`monitor_limit: Option<usize>`、`log_level`、`diagnostics` |
+| `EngineConfig` | `default_style`、`window_level`、`default_resize`、`capture`、`adaptive_quality`(默认 `true`)、`occlusion_culling`(默认 `true`)、`fullscreen_hide`(默认 `true`)、`fps_cap: Option<u32>`、`frame_latency: Option<u32>`（0.5.2 #8，`1..=8`，`None` = 默认 1）、`monitor_limit: Option<usize>`、`log_level`、`diagnostics` |
 | `WindowConfig` | `rect: Rect`、`style: Option<GlassStyle>`(`None` = 继承默认)、`resize`、`z_order: Option<ZOrder>`、`interactive`(默认 `true`)、`movable`(默认 `true`)、`visible`(默认 `true`)；默认 rect = `[64, 64, 600, 400]` |
 | `GlassStyle` | 枚举：`Liquid(LiquidParams)` / `Transparent(TransparentParams)`；方法 `mode()` / `needs_backdrop()` / `corner_radius()` / `shadow_margin()` / `sanitize()` / `scaled(dpi)` / `to_params()` / `liquid(p)` / `transparent(r, a, rgba)` |
 | `TransparentParams` | `corner_radius`(默认 32)、`opacity`(默认 0.35)、`color`(默认 `[1,1,1,1]`) |
@@ -414,6 +414,14 @@ win.set_focus_hwnd(shell_hwnd as isize);                          // 键盘可�
 
 ## 层级语义（两个不同的东西，别混）
 
+> **0.5.2 #2 / #3 两条宿主可以直接依赖的行为**：
+> ① 画布**显示**与**层级**是同一次 `SetWindowPos`（`SWP_SHOWWINDOW` + 目标 Z 序）。
+>    旧实现首帧就绪时走裸 `ShowWindow(SW_SHOWNOACTIVATE)`，会把画布抬进**普通带顶部**
+>    —— 启动瞬间全屏玻璃压在 Chrome/IDE 上（宿主 4 ms 采样实测 t+0.6s）。
+> ② `Engine::set_window_level(lvl)` **等值调用也会重发层级**，因此宿主可以随时用它
+>    「把画布按回底部」，不需要再自己拿 `canvas_handle` 发 `SetWindowPos`。
+>    等值调用**不**发 `LevelApplied`、**不**重建模糊金字塔（4 ms 压底守护下那是 DoS）。
+
 - **画布层级 `WindowLevel`**：作用于**画布窗口**（每块显示器一个全屏 `WS_EX_NOREDIRECTIONBITMAP`
   popup），即「整层玻璃」相对**其它应用窗口**的位置。
   - `AlwaysOnTop` → `WS_EX_TOPMOST` + `HWND_TOPMOST`（**默认**，与重构前一致）
@@ -440,6 +448,17 @@ win.set_focus_hwnd(shell_hwnd as isize);                          // 键盘可�
   不会渲染 100 次。
 - **读**：渲染线程在状态真的变化时发布 `Snapshot`（否则 4 Hz 兜底），getter 从快照读，
   因此是**最终一致**（≤1 帧）。换来的是读路径不与渲染线程抢锁。
+- **块几何变化 ⇒ 同帧快照可见**（0.5.2 #4 的硬契约）：移动 / 缩放会话里每帧写回块矩形，
+  只要矩形**真的**变了就置快照脏位，宿主在同一帧就能读到新 `WindowSnapshot::rect`。
+  此前会话期只能等 250 ms 兜底档（~4 Hz），表现为「图标/按钮比玻璃背景慢半拍」，
+  宿主被迫用 `set_default_resize` 催发布 + 16 ms tick 跟随。取证：
+  `tools/verify_session_snapshot.py`。
+- **会话标志也会翻转可见**（0.5.2 #4 连带修正）：`moving` / `resizing` 已接进快照比对键。
+  拖拽结束后几何不再变化，若这两位不进键，共享快照会**永远停在** `moving = true`
+  —— 宿主据此判断「会话期」就会永久停在绕行分支。
+- **`MonitorSnapshot::canvas_handle` 恒可用且不会过期**（0.5.2 #3）：显示器重建后屏数
+  可能不变但 HWND 变了，快照现在按 `hwnd / origin / size / dpi` 逐项比对，宿主拿它做
+  压底与 OLE 放置目标重挂时不会再打到已销毁的窗口。
 - **不允许**从上层线程直接触碰 GPU 资源或内部 `Manager`；一律走命令队列 + 快照。
 - `GlassWindow` 是 `Clone + Send + Sync`，可以在上层任意线程持有与调用。
 - `Engine` 不是 `Send`（持有 `JoinHandle`）；需要跨线程共享时自己包 `Arc<Engine>`
@@ -472,6 +491,27 @@ win.set_focus_hwnd(shell_hwnd as isize);                          // 键盘可�
 ## 坐标系与量纲
 
 - `Rect` / 一切长度参数 = **逻辑像素 = 主屏物理像素**，坐标是**虚拟屏绝对坐标**（多屏通用）。
+- **0.5.2 #7 逐量口径表**（宿主实测踩过坑，`api/config.rs` 模块头有同一份）：
+
+  | 量 | 口径 | 库里怎么用 |
+  |---|---|---|
+  | `WindowConfig.rect` 的 `w/h` | 逻辑像素（= 主屏物理像素） | 归屏时 `× scale` 变成**该屏物理像素** |
+  | `WindowConfig.rect` 的 `x/y` | **虚拟屏绝对物理像素** | `x - monitor.origin` 直接当画布局部物理像素，**不**按 DPI 折算 |
+  | `ResizeOptions::min_width/min_height` | 逻辑像素 | **硬下限**，无相对上限（见下） |
+  | `ResizeOptions::grip_px` | 逻辑像素 | 投影时 `× scale` |
+  | `ResizeFeedbackOptions::border_width` | 逻辑像素 | 投影时 `× scale` |
+  | `LiquidParams` 半径 / 边距等 | 逻辑像素 | 样式派生时 `× scale`（`GlassStyle::scaled`） |
+
+- ⚠ **`min_width/min_height` 是硬下限**：`input/drag.rs` 用 `w.max(min_w)`，
+  `WM_GETMINMAXINFO` 取的是 `b.resize.min_width/min_height`（**不是** `runtime` 的
+  `min_drag_size`）。把它调到比窗口还大 ⇒ 框被钉死在该尺寸、边缘拖不小（宿主现场：
+  滑条拉到 605×1150）。库里**故意不做**「相对块尺寸的上限」——语义必须是
+  「上层说什么就是什么」；`sanitize()` 只在越过 `MIN_FLOOR_SUSPICIOUS`（1024 逻辑像素）
+  时打一条 warn-once `[warn]`。**宿主应在下发前自己夹一道。**
+- ⚠ **主屏 DPI ≠ 100% 时 `grip_px` 不会自动放大**：`scale = 该屏DPI / 主屏DPI` ⇒ 主屏恒
+  1.0，所以 200% 主屏上 `grip_px = 10` 就是 10 个物理像素的把手带。宿主若按 Win32 习惯
+  用 `scale_for_dpi(8, dpi) = 16` 物理像素做自己的边沿命中，两套口径差一倍
+  （用户读作「边缘很难抓」）。对齐二选一：宿主放大后下发，或宿主不放大——**别各自为政**。
 - 进程声明 Per-Monitor V2；块落到 `scale = dpi / 主屏 dpi` 的屏上时，库按该比例换算
   「像素量纲」的字段（`corner_radius` / `bevel_width` / `thickness` / `blur_max` / `blur_min` /
   `mouse_radius` / `mouse_spread` / `rim_width` / `shadow_margin`），**逻辑尺寸不变**、
@@ -690,6 +730,23 @@ HTTP 接口：`GET /`、`GET /api/schema`、`GET /api/state`、`GET /api/events`
 `GLASS_CONTENT_DEMO=<场景>`（checker/solid/dirty/clear_seq/stack/resize_* 等 6+ 场景）让默认块
 推确定性图案内容并打 `[verify]` 日志，供 `tools/verify_content.py` 驱动；默认不开，不影响任何基线取证。
 
+### 0.5.2 取证 demo（三条新脚本的入口）
+
+- `GLASS_BORDER_DEMO=on|off`：在默认块（下层）之上造一块**完全不透明**的上层块，
+  只盖住下层块左边缘 border 的**中段**；几何、采样点、光标位置全部由 playground 算好后
+  打进 `[verify] border_demo fb=... a=[..] b=[..] cursor=.. p_out=.. p_in=.. color_b=..`，
+  脚本**跟着日志走**（不在脚本里第二处手写布局）。`off` 是反向对照（关掉 feedback）。
+  消费方：`tools/verify_border_zorder.py`。
+- `GLASS_SESSION_DEMO=1`：起一条 4 ms 的快照采样线程，只在 `moving == true` 的采样点计数，
+  会话结束后打 `[verify] session_snap ticks=.. rect_changes=..`；`armed` 行带块中心物理坐标，
+  供脚本发 `SendInput` 物理拖拽。消费方：`tools/verify_session_snapshot.py`。
+- 双击取证复用 `GLASS_INPUT_SINK_DEMO=1`（SinkDemo 本来就打每个相位的 `[verify]` 日志），
+  另加一行 `[verify] sink_mount id=.. center=x,y rect=[..]` 作为点击坐标锚点。
+  消费方：`tools/verify_double_click.py`。
+
+三者都要求 `GLASS_DEFAULT_BLOCK=1` 的单块布局（多窗口会拒绝挂载并打 `[warn]`），
+默认全不开 ⇒ 不影响任何既有基线取证。
+
 ## 目录结构
 
 ```
@@ -745,7 +802,7 @@ liquid-verre-rs/                     # Cargo workspace（根 Cargo.toml 只有 [
 │     │  ├─ compositor.rs            # 每屏画布：脏区账本、金字塔有效性、Clear→PassA→PassB→Present→Commit、取证落盘
 │     │  ├─ pyramid.rs               # Pass A：下采样×4 + env EMA + frost tent×4（scissor 幂等）
 │     │  ├─ glass_renderer.rs        # Pass B：per-block cbuffer(c0..c18) + 逐块 LUT 缓存 + z 序绘制
-│  │                            #   + border 叠加 pass（draw_borders，独立 BorderCb）
+│  │                            #   + border 逐块内联发射（draw_border，独立 BorderCb；0.5.2 #1）
 │     │  └─ gpu_timer.rs             # D3D11 timestamp（只用于离线归因，禁止进闭环判据）
 │     ├─ capture/                    # mod.rs(后端选择 + 合成源) / dda.rs(脏矩形 + 局部拷贝) / wgc.rs(帧池)
 │     ├─ input/                      # cursor.rs(GetCursorPos 轮询，零 hook) / drag.rs(拖拽 + 8 方向缩放状态机)
@@ -814,8 +871,18 @@ PeekMessage 泵
   - 两种掩码在**源头互斥**：`to_shader_edges()` 在对角时返回全 0，`to_shader_corners()`
     在单边时返回全 0（否则切点附近会叠出一个亮斑）；
   - 返回值再乘 `coverage`，保证 border 不漏到玻璃形状之外。
-  实现在独立的 `shaders/border_ps.hlsl`（`GlassRenderer::draw_borders` 在 Pass B 之后叠加绘制），
-  与液态着色完全解耦；直边到圆角切点为止、对角沿弧拐弯，两种掩码在 Rust 侧源头互斥。
+  实现在独立的 `shaders/border_ps.hlsl` + 独立 `BorderCb`，与液态着色完全解耦；
+  直边到圆角切点为止、对角沿弧拐弯，两种掩码在 Rust 侧源头互斥。
+- ⚠ **border 属于这一块视觉的一部分，受块间 z 序遮挡**（0.5.2 #1，别再退成叠加 pass）：
+  `GlassRenderer::draw_blocks` 在逐块循环里**画完第 i 块玻璃（及其内容）立刻画第 i 块
+  border**，所以比它高的块的玻璃会把它盖住。历史上它是 Pass B 之后的独立 pass
+  （`draw_borders`），对所有块的玻璃都是「后画 = 压在上面」⇒ 两块重叠时**下层**框的白边
+  画到**上层**框身上（宿主实测；`raise_box` 只修正在拖的那块，修不了 hover 阶段）。
+  发射顺序的判据本体是纯函数 `core::draw::border_emit_plan`（有 4 条无 GPU 单测），
+  像素级验收是 `tools/verify_border_zorder.py`（含「删实现它还红吗」的反向对照）。
+  配套纪律：`draw_blocks` **每块开头无条件重设全套玻璃管线状态**，border / 内容两个
+  子 pass 都不写还原代码 —— 「谁改了什么就还原什么」这张清单前科是漏还原 t0..t8
+  导致下一块玻璃整块消失（gotchas #3）。
 - 缩放时**锚定不动边**：夹到最小尺寸时固定边纹丝不动（否则会出现「左边滑走」）。
 - 事件：`ResizeStarted{id, handle}` / `ResizeEnded{id, rect}`；系统光标由 `ResizeEdges::cursor_id()`
   经 `WM_SETCURSOR` 设置。
@@ -955,6 +1022,14 @@ python tools/repro_tremble.py many       # 密集 20 块同上
 python tools/verify_adaptive.py          # 自适应控制器：降档 / 回升 / 显存回收闭环
 python tools/ab_latency.py               # GLASS_FRAME_LATENCY 1 vs 2 轮转 A/B（吞吐档依据）
 python tools/ab_memory.py                # 常驻内存受控 A/B（level 0 vs level 1）
+```
+
+行为取证（0.5.2 宿主四缺陷新增；改对应路径必跑，同样不进 CI）：
+
+```powershell
+python tools/verify_border_zorder.py      # #1 border 受块 z 序遮挡（像素 oracle + 反向对照）
+python tools/verify_session_snapshot.py   # #4 会话期快照跟随 + moving 位翻转可见
+python tools/verify_double_click.py       # #5 CS_DBLCLKS：物理双击必须到达 DoubleClick 相位
 ```
 
 行为取证（0.5.0 输入路由新增；改消息路由 / 会话收尾时必跑）：

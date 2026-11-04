@@ -112,9 +112,49 @@ impl DrawBlock {
     }
 }
 
+/// border 的发射计划：(块下标, 该块玻璃在 order 里的序号)，按玻璃序号升序。
+///
+/// 这是 0.5.2 #1「border 属于块本身，受块 z 序遮挡」这条语义的**单一判据**：
+/// border 必须紧跟自己那块玻璃，且早于任何比它高的块的玻璃。历史上 border 是
+/// draw_blocks 之后的独立叠加 pass（对所有块都是「后画 = 压在上面」），两块
+/// 重叠时下层框的白边会画到上层框身上 —— 宿主 raise_box 只修正在拖的那块，
+/// 修不了 hover 阶段的层间关系（用户复验：修复失败）。
+///
+/// 计划本身不含 GPU 状态，因此可以脱离渲染线程单测；gfx::glass_renderer 在
+/// 逐块循环里按序号消费它，两者共用这一份定义（不再有两处手写同一规则）。
+///
+/// has_feedback(block_index) 由调用方提供（投影层决定哪块被 hover、把手是否
+/// 命中），这里只回答「哪些块要发 border、发在第几次玻璃之后」。
+pub(crate) fn border_emit_plan(
+    order: &[usize],
+    has_feedback: impl Fn(usize) -> bool,
+    plan: &mut Vec<(usize, usize)>,
+) {
+    debug_assert!(
+        plan.is_empty(),
+        "调用方必须先 clear()：本函数只追加，不重置（避免两处各有一套清空语义）"
+    );
+    for (seq, &index) in order.iter().enumerate() {
+        if has_feedback(index) {
+            plan.push((index, seq));
+        }
+    }
+}
+
+/// 测试专用包装：把 [`border_emit_plan`] 收进一个新 Vec，方便逐条断言。
+#[cfg(test)]
+pub(crate) fn border_emit_plan_vec(
+    order: &[usize],
+    has_feedback: impl Fn(usize) -> bool,
+) -> Vec<(usize, usize)> {
+    let mut plan = Vec::new();
+    border_emit_plan(order, has_feedback, &mut plan);
+    plan
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DrawBlock, ResizeFeedback};
+    use super::{border_emit_plan_vec, DrawBlock, ResizeFeedback};
     use crate::api::config::{GlassMode, GlassStyle};
     use crate::core::params::LiquidParams;
 
@@ -208,5 +248,69 @@ mod tests {
         let p = LiquidParams::default();
         let q = p;
         assert_eq!(p, q);
+    }
+
+    // ---- 0.5.2 #1：border 层序语义（无 GPU 纯函数判据）----
+
+    /// 断言 1：只有带 feedback 的块进计划。
+    #[test]
+    fn plan_only_includes_blocks_with_feedback() {
+        // order = 玻璃绘制序（升序 = 从低到高）；块 1、3 有 feedback。
+        let order = [0usize, 1, 2, 3, 4];
+        let plan = border_emit_plan_vec(&order, |idx| idx == 1 || idx == 3);
+        assert_eq!(plan, vec![(1, 1), (3, 3)], "计划必须只含带 feedback 的块");
+    }
+
+    /// 断言 2：border 紧跟自己块的玻璃序号，且早于任何更高块的玻璃序号。
+    ///
+    /// 这条就是本次主诉的数学表述：旧实现把 border 放在全部玻璃之后，
+    /// 于是下层块的 border 序号永远大于上层块的玻璃序号 = 压在上面。
+    #[test]
+    fn border_follows_its_own_glass_and_precedes_higher_blocks() {
+        let order = [7usize, 2, 9]; // 玻璃序：块7 最低、块9 最高
+        let plan = border_emit_plan_vec(&order, |idx| idx == 7);
+        assert_eq!(plan, vec![(7, 0)]);
+        let own_seq = plan[0].1;
+        // 自己块的玻璃之后、任何更高块的玻璃之前
+        for (seq, &idx) in order.iter().enumerate() {
+            if idx != 7 {
+                assert!(
+                    own_seq < seq,
+                    "block {idx} 的玻璃(seq={seq}) 必须晚于块 7 的 border(seq={own_seq})"
+                );
+            }
+        }
+    }
+
+    /// 断言 3：两块同时有 feedback 时，顺序跟随 order（painter's order）。
+    #[test]
+    fn plan_order_follows_block_order_with_multiple_feedbacks() {
+        let order = [3usize, 1, 2];
+        let plan = border_emit_plan_vec(&order, |idx| idx == 1 || idx == 3);
+        // order = [3,1,2] ⇒ 块 3 是第 0 次玻璃、块 1 是第 1 次、块 2 是第 2 次。
+        assert_eq!(
+            plan,
+            vec![(3, 0), (1, 1)],
+            "border 序必须跟随玻璃序（order 的位置），而不是块号或插入序"
+        );
+        assert!(
+            plan.as_slice().windows(2).all(|w| w[0].1 < w[1].1),
+            "计划必须按玻璃序号严格升序，渲染侧才能用游标消费"
+        );
+    }
+
+    /// 断言 4（判别力护栏）：无 feedback 时计划为空 = 渲染侧零状态切换。
+    #[test]
+    fn plan_is_empty_when_no_block_has_feedback() {
+        let order = [0usize, 1, 2];
+        assert!(
+            border_emit_plan_vec(&order, |_| false).is_empty(),
+            "没有反馈块时计划必须为空（这是「零切换」承诺的前提）"
+        );
+        // 越界下标不参与：order 只能引用真实存在的块，这里用「回调说 false」表达
+        assert!(
+            border_emit_plan_vec(&[], |_| true).is_empty(),
+            "空 order 不产生计划"
+        );
     }
 }

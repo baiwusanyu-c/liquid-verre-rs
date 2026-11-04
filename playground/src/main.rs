@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use liquid_verre::{
     DiagnosticsConfig, Engine, EngineConfig, EngineEvent, GlassInputSink, GlassStyle,
-    InputDecision, PointerEvent, PointerPhase, ResizeOptions, WindowConfig, WindowLevel,
+    InputDecision, PointerEvent, PointerPhase, ResizeFeedbackOptions, ResizeOptions, WindowConfig,
+    WindowLevel,
 };
 
 /// 输入路由 demo sink：记录事件日志 + 块左半返回 Consumed、右半返回 DragMove。
@@ -165,6 +166,20 @@ fn main() -> ExitCode {
         } else if let Some(s) = wins[0].snapshot() {
             let half = s.rect[2] * s.scale * 0.5;
             wins[0].set_input_sink(Some(Arc::new(SinkDemo::new(half))));
+            // 取证锚点：块中心的**物理**坐标（虚拟屏绝对）。tools/verify_double_click.py
+            // 据此发 SendInput，不在脚本里第二处手写布局。
+            let sc = s.scale.max(0.05);
+            log::info!(
+                target: "verify",
+                "sink_mount id={} center={:.0},{:.0} rect=[{:.0},{:.0},{:.0},{:.0}]",
+                wins[0].id(),
+                s.rect[0] + s.rect[2] * sc * 0.5,
+                s.rect[1] + s.rect[3] * sc * 0.5,
+                s.rect[0],
+                s.rect[1],
+                s.rect[0] + s.rect[2] * sc,
+                s.rect[1] + s.rect[3] * sc,
+            );
 
             // FR1 焦点 demo：GLASS_FOCUS_DEMO=1 时，Consumed 区按压后 SetFocus 到宿主代表 hwnd。
             // 优先用 GetConsoleWindow()；若不可靠退化到最小壳窗口（见 verify_focus_drop.py 焦点取证段）。
@@ -279,6 +294,19 @@ fn main() -> ExitCode {
         if mode != "off" && mode != "0" && !mode.is_empty() {
             run_content_demo(&engine, &mode);
         }
+    }
+
+    // 0.5.2 #1 取证入口：`GLASS_BORDER_DEMO=on|off` 造「下层框带白边 + 上层框压住
+    // 那段白边」的确定性场景，tools/verify_border_zorder.py 读稳态帧像素断言层序。
+    if let Some(demo) = std::env::var_os("GLASS_BORDER_DEMO") {
+        run_border_demo(&engine, &demo.to_string_lossy().to_lowercase());
+    }
+
+    // 0.5.2 #4 取证入口：`GLASS_SESSION_DEMO=1` 起一条 4 ms 快照采样线程，
+    // 宿主（tools/verify_session_snapshot.py）物理拖拽时用；拖完打
+    // `[verify] session_snap ticks= rect_changes=`。
+    if std::env::var_os("GLASS_SESSION_DEMO").is_some() {
+        run_session_snapshot_demo(&engine);
     }
 
     let panel = match panel::start(Arc::clone(&engine), opts.port, opts.no_browser) {
@@ -585,6 +613,183 @@ fn make_checker_dirty(w: u32, h: u32) -> Vec<u8> {
         }
     }
     buf
+}
+
+/// 0.5.2 #1：border 层序取证场景。
+///
+/// 布局（全部用公共 API，坐标 = 虚拟屏**物理像素**，取证脚本设
+/// `GLASS_MONITORS=1` + 主屏原点恒 (0,0)，所以画布局部 == 绝对坐标）：
+///
+/// ```text
+///   A（下层，默认块，liquid）  ← 悬停它的左边缘 ⇒ 左边缘一圈白色 border
+///   B（上层，不透明纯色）      ← 只盖住 A 左边缘的**中段**
+///
+///   p_out = A 左边缘 border 上、B 之外的点  ⇒ 必须是白（feedback 开）
+///   p_in  = A 左边缘 border 上、B 之内的点  ⇒ 必须是 B 的颜色，绝不能是白
+/// ```
+///
+/// 旧实现（border 是全部玻璃之后的独立叠加 pass）会把 `p_in` 也画成白 ——
+/// 这正是用户报的「拖下层框的边缘缩放，白框画到上层框身上」。
+/// `off` 模式关掉 feedback 做反向对照：那时 `p_out` 也不该是白。
+fn run_border_demo(engine: &Arc<Engine>, mode: &str) {
+    const GRIP: f32 = 24.0;
+    const B_COLOR: [f32; 4] = [0.05, 0.15, 0.85, 1.0];
+    let feedback_on = !(mode == "off" || mode == "0" || mode.is_empty());
+    wait_for_monitors(engine);
+    let wins = engine.windows();
+    if wins.len() != 1 {
+        log::warn!(
+            "[playground] GLASS_BORDER_DEMO 需要单块布局（GLASS_DEFAULT_BLOCK=1），当前 wins={}",
+            wins.len()
+        );
+        return;
+    }
+    let lower = wins[0].clone();
+    let Some(s) = lower.snapshot() else {
+        log::warn!("[playground] GLASS_BORDER_DEMO: 默认块 snapshot 不可用");
+        return;
+    };
+    // 把手带钉到 24 逻辑像素：命中不依赖亚像素，钉死 cursor 与 grip 的口径。
+    let resize = ResizeOptions {
+        grip_px: GRIP,
+        feedback: ResizeFeedbackOptions {
+            enabled: feedback_on,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    lower.set_resize_options(resize);
+
+    let sc = s.scale.max(0.05);
+    let (ax, ay) = (s.rect[0], s.rect[1]);
+    let (aw, ah) = (s.rect[2] * sc, s.rect[3] * sc);
+    // 光标：左边缘命中带内（x ∈ [ax-grip, ax+grip]）、且离上下边 > grip（否则变对角）。
+    let cursor = [ax + GRIP * 0.4, ay + GRIP + 16.0];
+    // 采样点都取在「直边段」内（圆角切点之间），并离光标 > 3*mouse_radius。
+    // 采样列钉在 border 的**纯白芯**正中。实测（overlay 原图逐列）：bw=5 时
+    // 白芯落在 x ∈ [ax+1, ax+3]，ax+0 与 ax+4 是 AA 过渡列 —— 取 ax+2 配 3×3
+    // 窗（覆盖 ax+1..ax+3）刚好整窗全白；取 ax+3 会把 ax+4 的 AA 列卷进来，
+    // 把 (255,255,255) 平均成 (228,235,249) 这种「看得见但判不过」的值。
+    let edge_x = ax + 2.0;
+    let p_out = [edge_x, ay + ah - GRIP - 24.0];
+    let p_in = [edge_x, ay + ah * 0.55];
+    // B：盖住 A 左边缘的中段（含 p_in），但不碰光标，也不碰 p_out。
+    let b_top = ay + ah * 0.45;
+    let b_bottom = ay + ah * 0.70;
+    let _ = engine.create_window(WindowConfig {
+        // B 的逻辑尺寸 = 物理尺寸 / scale（主屏 scale=1 ⇒ 同一口径）
+        rect: [
+            ax - 40.0,
+            b_top,
+            (120.0 / sc).max(1.0),
+            ((b_bottom - b_top) / sc).max(1.0),
+        ],
+        // 完全**不透明**的纯色：重叠区像素 == B 的颜色，判据不依赖桌面内容。
+        style: Some(GlassStyle::transparent(0.0, 1.0, B_COLOR)),
+        interactive: false,
+        ..Default::default()
+    });
+    log::info!(
+        target: "verify",
+        "border_demo fb={} a=[{:.0},{:.0},{:.0},{:.0}] b=[{:.0},{:.0},{:.0},{:.0}] cursor={:.0},{:.0} p_out={:.0},{:.0} p_in={:.0},{:.0} color_b={:.0},{:.0},{:.0}",
+        feedback_on,
+        ax,
+        ay,
+        ax + aw,
+        ay + ah,
+        ax - 40.0,
+        b_top,
+        ax + 80.0,
+        b_bottom,
+        cursor[0],
+        cursor[1],
+        p_out[0],
+        p_out[1],
+        p_in[0],
+        p_in[1],
+        B_COLOR[0] * 255.0,
+        B_COLOR[1] * 255.0,
+        B_COLOR[2] * 255.0,
+    );
+    // 心跳：静态桌面下渲染门控会跳过 shot 之后的帧（verify_content 同款前科），
+    // 每 150ms 推一条 no-op 命令，保证 2500ms 的稳态帧一定落在「border 已生效」之后。
+    let w = lower.clone();
+    std::thread::spawn(move || {
+        for _ in 0..40 {
+            w.set_visible(true);
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    });
+}
+
+/// 0.5.2 #4：会话期快照跟随取证。
+///
+/// 4 ms 轮询 `GlassWindow::snapshot()`，只在 `moving == true`（= 库里正在跑移动会话）
+/// 的采样点上计数：`ticks` = 会话内采样数，`rect_changes` = 其中 rect **变过**的次数。
+/// 修好之前 `rect_changes / ticks` ≈ 4Hz/250Hz ≈ 0.02（宿主只能靠 250ms 兜底档
+/// 看到新矩形）；修好后应当接近 1（几何变化 ⇒ 同帧快照可见）。
+fn run_session_snapshot_demo(engine: &Arc<Engine>) {
+    wait_for_monitors(engine);
+    let wins = engine.windows();
+    if wins.len() != 1 {
+        log::warn!(
+            "[playground] GLASS_SESSION_DEMO 需要单块布局（GLASS_DEFAULT_BLOCK=1），当前 wins={}",
+            wins.len()
+        );
+        return;
+    }
+    let id = wins[0].id();
+    // 拖拽起点 = 块中心的物理坐标（虚拟屏绝对；取证脚本据此发 SendInput）。
+    // 取证锚点用「x,y」裸格式（`{:?}` 的 Option/数组括号会让脚本的正则多背一层）。
+    let center = wins[0].snapshot().map(|s| {
+        let sc = s.scale.max(0.05);
+        [
+            (s.rect[0] + s.rect[2] * sc * 0.5).round() as i32,
+            (s.rect[1] + s.rect[3] * sc * 0.5).round() as i32,
+        ]
+    });
+    match center {
+        Some([cx, cy]) => log::info!(
+            target: "verify",
+            "session_demo armed id={id} center={cx},{cy} poll_ms=4"
+        ),
+        None => log::warn!(target: "verify", "session_demo armed id={id} center=none"),
+    }
+    let engine = Arc::clone(engine);
+    std::thread::spawn(move || {
+        let mut ticks = 0u32;
+        let mut changes = 0u32;
+        let mut last: Option<[f32; 4]> = None;
+        let mut in_session = false;
+        let mut reported = false;
+        for _ in 0..4000 {
+            let snap = engine.window(id).snapshot();
+            let moving = snap.is_some_and(|s| s.moving);
+            if moving {
+                in_session = true;
+                ticks += 1;
+                let rect = snap.map(|s| s.rect);
+                if rect != last {
+                    changes += 1;
+                    last = rect;
+                }
+            } else if in_session && !reported {
+                log::info!(
+                    target: "verify",
+                    "session_snap ticks={ticks} rect_changes={changes}"
+                );
+                reported = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        if !reported {
+            log::info!(
+                target: "verify",
+                "session_snap ticks={ticks} rect_changes={changes} (no session observed)"
+            );
+        }
+    });
 }
 
 /// 脚本是否已经通过 GLASS_* 指定了确定性布局。

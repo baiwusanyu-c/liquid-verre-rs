@@ -21,8 +21,11 @@ const TOPO_TRIANGLE: D3D_PRIMITIVE_TOPOLOGY = D3D_PRIMITIVE_TOPOLOGY(4);
 ///
 /// c0..c17 = 重构前的液态玻璃语义（**不可改动**，改了就和历史取证图不可比）；
 /// c18 = (mode, opacity, -, -)                    透明玻璃模式（需求 F3）
-/// 缩放反馈 border **不**占用这里的槽位：它是独立的一次叠加绘制
-/// （`border_vs.hlsl` / `border_ps.hlsl` + 独立的 BorderCb），见 `draw_borders`。
+/// 缩放反馈 border **不**占用这里的槽位：它用自己的 `BorderCb`
+/// （`border_vs.hlsl` / `border_ps.hlsl`），见 `draw_border`。
+/// 0.5.2 #1 起 border **内联**在 `draw_blocks` 的逐块循环里（画完第 i 块玻璃
+/// 立刻画第 i 块 border），因此它受块间 z 序遮挡 —— 语义是「border 属于这一块
+/// 视觉的一部分」，不是「盖在全部玻璃之上的叠加层」。
 const CB_FLOATS: usize = 19 * 4;
 
 /// BorderCb 的槽位数（b0..b6）。
@@ -108,6 +111,12 @@ pub struct GlassRenderer {
     pub env_ema: [f32; 3],
     /// 本帧真正执行了 Draw 的块数（metrics 用）
     drawn: std::cell::Cell<usize>,
+    /// border 发射计划的**复用缓冲**（每帧 clear + fill）。
+    ///
+    /// 为什么不是每帧 `Vec::new()`：`draw_blocks` 在热路径上，spec 明令
+    /// 「热路径零堆分配」（20 块 × 120 Hz = 2400 次/秒的 malloc 就是回归）。
+    /// 判据本体仍是同一个纯函数 `core::draw::border_emit_plan`，只是写进这里复用的缓冲。
+    border_plan: std::cell::RefCell<Vec<(usize, usize)>>,
 }
 
 impl GlassRenderer {
@@ -256,6 +265,7 @@ impl GlassRenderer {
             bound_lut: std::cell::Cell::new(default_key),
             env_ema: [0.35, 0.42, 0.5],
             drawn: std::cell::Cell::new(0),
+            border_plan: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -371,6 +381,7 @@ impl GlassRenderer {
         press: f32,
         hover_id: Option<u32>,
         contents: Option<&crate::gfx::content_layer::ContentStore>,
+        border: Option<&BorderTarget<'_>>,
     ) {
         self.drawn.set(0);
         // t4 在下面的 PSSetShaderResources(0..9) 里被重置成默认 LUT，
@@ -405,44 +416,69 @@ impl GlassRenderer {
             Some(blur2.srv.clone()),
             Some(blur3.srv.clone()),
         ];
-        unsafe {
-            ctx.IASetInputLayout(None);
-            ctx.IASetPrimitiveTopology(TOPO_TRIANGLE);
-            ctx.OMSetRenderTargets(Some(&[Some(out_rtv.clone())]), None);
-            let vp = D3D11_VIEWPORT {
-                TopLeftX: 0.0,
-                TopLeftY: 0.0,
-                Width: out_w as f32,
-                Height: out_h as f32,
-                MinDepth: 0.0,
-                MaxDepth: 1.0,
-            };
-            ctx.RSSetViewports(Some(&[vp]));
-            ctx.RSSetState(&self.raster);
-            ctx.OMSetBlendState(&self.blend, Some(&[0.0; 4]), 0xffff_ffff);
-            ctx.OMSetDepthStencilState(&self.depth, 0);
-            ctx.VSSetShader(&self.vs, None);
-            ctx.PSSetShader(&self.ps, None);
-            ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-            ctx.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
-            ctx.VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
-            ctx.PSSetShaderResources(0, Some(&srvs));
-        }
         // 内容层（P0-1）：只有 store 里真的有层时才多绑一个 CB 槽位（b1）；
         // 空 store => 本帧与重构前逐位一致，零新增 API 调用（FR5 / 第一门禁前提）。
         let store = contents.filter(|s| !s.is_empty());
-
-        if store.is_some() {
-            unsafe {
-                ctx.VSSetConstantBuffers(1, Some(&[Some(self.ccb.clone())]));
-                ctx.PSSetConstantBuffers(1, Some(&[Some(self.ccb.clone())]));
+        let full_vp = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: out_w as f32,
+            Height: out_h as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let default_lut_key = lut_key(&LiquidParams::default());
+        // 0.5.2 #1：border 的发射计划。判据本体是纯函数
+        // `core::draw::border_emit_plan`（无 GPU 单测覆盖），这里只负责问「哪块有
+        // feedback」。没有 feedback 块 => 空计划 => 本帧一次 border 状态切换都不发生。
+        // 写进复用缓冲（`self.border_plan`）而不是每帧新建 Vec：热路径零堆分配。
+        {
+            let mut plan = self.border_plan.borrow_mut();
+            plan.clear();
+            if border.is_some() {
+                crate::core::draw::border_emit_plan(
+                    order,
+                    |idx| blocks.get(idx).is_some_and(|b| !b.feedback.is_empty()),
+                    &mut plan,
+                );
             }
         }
+        let plan = self.border_plan.borrow();
 
-        for &index in order {
+        for (seq, &index) in order.iter().enumerate() {
             let Some(block) = blocks.get(index) else {
                 continue;
             };
+            // ---- 每块开头无条件重设全套玻璃管线状态（0.5.2 #1 的结构性护栏）----
+            // 为什么不再「循环外设一次」：border 现在内联在循环里，上一块可能把管线
+            // 留在 border（bvs/bps/bcb）或内容（cvs/cps/ccb + t9）上。「谁改了什么
+            // 就还原什么」这张清单历史上正是漏了一处（content pass 后不整体重绑
+            // t0..t8）导致下一块玻璃整块消失（gotchas #3，2026-10-26 bring-up 实测）。
+            // 逐块钉死状态把这一整类错误变成不可能，代价是每帧多 ~13 次 Set* 调用
+            // × 块数；D3D11 的同值 Set* 早退很快，实测 20 块 Pass B 仍在 0.1 ms 量级
+            // （性能阀门 tools/gate_perf.py 会盯住它）。
+            unsafe {
+                ctx.IASetInputLayout(None);
+                ctx.IASetPrimitiveTopology(TOPO_TRIANGLE);
+                ctx.OMSetRenderTargets(Some(&[Some(out_rtv.clone())]), None);
+                ctx.RSSetViewports(Some(&[full_vp]));
+                ctx.RSSetState(&self.raster);
+                ctx.OMSetBlendState(&self.blend, Some(&[0.0; 4]), 0xffff_ffff);
+                ctx.OMSetDepthStencilState(&self.depth, 0);
+                ctx.VSSetShader(&self.vs, None);
+                ctx.PSSetShader(&self.ps, None);
+                ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+                ctx.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+                ctx.VSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+                // t4 跟着整体重绑成默认 LUT，所以 bound_lut 必须同步复位，
+                // 否则 bind_lut 会拿上一块的键跳过重绑、采到错的 LUT。
+                ctx.PSSetShaderResources(0, Some(&srvs));
+                if store.is_some() {
+                    ctx.VSSetConstantBuffers(1, Some(&[Some(self.ccb.clone())]));
+                    ctx.PSSetConstantBuffers(1, Some(&[Some(self.ccb.clone())]));
+                }
+            }
+            self.bound_lut.set(default_lut_key);
             let mut p = block.params;
             clamp_for_block(&mut p, block.width, block.height);
             p.corner_radius = block
@@ -482,16 +518,8 @@ impl GlassRenderer {
                 bottom: fy1,
             };
             unsafe {
+                // viewport 已由本块开头的统一重置给出（整画布），这里只切 scissor。
                 ctx.RSSetScissorRects(Some(&[scissor]));
-                let block_vp = D3D11_VIEWPORT {
-                    TopLeftX: 0.0,
-                    TopLeftY: 0.0,
-                    Width: out_w as f32,
-                    Height: out_h as f32,
-                    MinDepth: 0.0,
-                    MaxDepth: 1.0,
-                };
-                ctx.RSSetViewports(Some(&[block_vp]));
             }
 
             let lod3 = if is_lod3(block.width, block.height) {
@@ -647,6 +675,15 @@ impl GlassRenderer {
                     );
                 }
             }
+            // ---- 0.5.2 #1：本块的 border 紧跟本块玻璃（及本块内容）之后 ----
+            // 于是「比它高的块的玻璃」一定画在它之后 = 把它盖住。border 是这一块
+            // 视觉的一部分，不是全局叠加层。`seq` 用玻璃序而不是块下标：order 允许
+            // 是 blocks 的任意排列（z 序排序在投影层做）。
+            if let Some(out) = border {
+                if plan.iter().any(|&(_, s)| s == seq) {
+                    self.draw_border(ctx, out, block);
+                }
+            }
         }
 
         unsafe {
@@ -733,10 +770,15 @@ impl GlassRenderer {
             let null9: [Option<ID3D11ShaderResourceView>; 1] = [None];
             ctx.PSSetShaderResources(9, Some(&null9));
         }
+        // 0.5.2 附带修正（与 border 内联同一处结构性风险）：上面整体重绑 t0..t8
+        // 时，t4 被打回**默认** LUT，而 `bound_lut` 还记着上一块的自定义键 ——
+        // 于是下一块若同键就跳过重绑，采到默认 LUT（折射曲线错、不报错）。
+        // 账本必须跟着实际绑定走。
+        self.bound_lut.set(lut_key(&LiquidParams::default()));
     }
 }
 
-/// `draw_borders` 的渲染目标描述。
+/// `draw_border` 的渲染目标描述（0.5.2 #1：border 由 `draw_blocks` 逐块内联发射）。
 pub(crate) struct BorderTarget<'a> {
     /// 画布后备缓冲 RTV。
     pub(crate) rtv: &'a ID3D11RenderTargetView,
@@ -762,26 +804,47 @@ struct ContentCb {
 }
 
 impl GlassRenderer {
-    /// 在玻璃之上叠加缩放反馈 border（需求 F2）。
+    /// 画**单块**缩放反馈 border（需求 F2；0.5.2 #1 起由 `draw_blocks` 逐块内联调用）。
     ///
-    /// 只画 `feedback` 非零的块（通常 0~1 块），一次 `Draw(6)` 一块；
-    /// 与玻璃共用 premultiplied blend / scissor 光栅化状态，因此叠上去的语义
-    /// 和「玻璃自己画出来的白色」完全一致。
-    pub(crate) fn draw_borders(
+    /// 返回 `false` = 该块没有 feedback（或画布内无有效像素），调用方零成本跳过，
+    /// 一个状态切换都不发。
+    ///
+    /// 与玻璃共用 premultiplied blend / scissor 光栅化状态，因此叠上去的语义和
+    /// 「玻璃自己画出来的白色」完全一致。但它**必须**紧跟自己那块的玻璃画完：
+    /// 比它高的块的玻璃随后会把它盖住 —— 这就是 0.5.2 #1 的修复点（旧实现是
+    /// 「全部玻璃画完后的独立叠加 pass」，两块分类框重叠时下层框的白边会画到
+    /// 上层框身上，宿主 raise_box 修不了 hover 阶段的层间关系）。
+    ///
+    /// ⚠ 三条不能回退的实现要点（清单里逐条点名的「决定成败」项）：
+    /// 1. **绝对不要在尾部 `OMSetRenderTargets(None, None)`** —— 旧 `draw_borders`
+    ///    尾部那两行是「独立 pass 收尾」，内联版之后还要往同一张 RT 画更高块的
+    ///    玻璃，解绑 = 下一块整块画不出来 = 闪黑。
+    /// 2. scissor 口径保持不变：CB 用**未 clamp** 的 `draw_rect()`（玻璃 c0/c16
+    ///    同样不 clamp，两个 pass 的 local 原点必须同源，否则块半出屏时白框整体
+    ///    错位 —— 独立审查 P1-2），clamp 只属于 scissor。
+    /// 3. 这里重设**全套** border 管线状态，而不是「只改差异项」：`draw_blocks`
+    ///    每块开头同样无条件重设玻璃状态，两边都不需要还原代码，也就不存在
+    ///    「漏还原某一项」这类错误（gotchas #3 的前科正是漏还原 t0..t8）。
+    pub(crate) fn draw_border(
         &self,
         ctx: &ID3D11DeviceContext,
         out: &BorderTarget<'_>,
-        blocks: &[DrawBlock],
-        order: &[usize],
-    ) {
-        if !order
-            .iter()
-            .any(|&i| blocks.get(i).is_some_and(|b| !b.feedback.is_empty()))
-        {
-            return;
+        block: &DrawBlock,
+    ) -> bool {
+        let fb = block.feedback;
+        if fb.is_empty() {
+            return false;
         }
         let (out_rtv, out_w, out_h, canvas_w, canvas_h) =
             (out.rtv, out.w, out.h, out.canvas[0], out.canvas[1]);
+        let [rx0, ry0, rx1, ry1] = block.draw_rect();
+        let sx = rx0.max(0).min(out_w);
+        let sy = ry0.max(0).min(out_h);
+        let ex = rx1.max(0).min(out_w);
+        let ey = ry1.max(0).min(out_h);
+        if ex <= sx || ey <= sy {
+            return false;
+        }
         unsafe {
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(TOPO_TRIANGLE);
@@ -802,87 +865,63 @@ impl GlassRenderer {
             ctx.VSSetConstantBuffers(0, Some(&[Some(self.bcb.clone())]));
             ctx.PSSetConstantBuffers(0, Some(&[Some(self.bcb.clone())]));
         }
-        for &index in order {
-            let Some(block) = blocks.get(index) else {
-                continue;
-            };
-            let fb = block.feedback;
-            if fb.is_empty() {
-                continue;
-            }
-            // b0 必须用**未 clamp** 的 draw_rect：玻璃 pass 的 c0/c16 也不 clamp
-            // （块允许半出屏），两个 pass 的 local 原点一旦相差 |rt_x|，border 的
-            // SDF 中心就整体错位（独立审查 P1-2：拖到屏幕边缘时白框画在离玻璃
-            // 几十像素处）。clamp 只属于 scissor。
-            let [rx0, ry0, rx1, ry1] = block.draw_rect();
-            let sx = rx0.max(0).min(out_w);
-            let sy = ry0.max(0).min(out_h);
-            let ex = rx1.max(0).min(out_w);
-            let ey = ry1.max(0).min(out_h);
-            if ex <= sx || ey <= sy {
-                continue;
-            }
-            let mut cb = BorderCb {
-                v: [0.0; BORDER_CB_FLOATS],
-            };
-            let set4 = |cb: &mut BorderCb, slot: usize, a: f32, b: f32, c: f32, d: f32| {
-                let i = slot * 4;
-                cb.v[i] = a;
-                cb.v[i + 1] = b;
-                cb.v[i + 2] = c;
-                cb.v[i + 3] = d;
-            };
-            set4(
-                &mut cb,
-                0,
-                rx0 as f32,
-                ry0 as f32,
-                (rx1 - rx0) as f32,
-                (ry1 - ry0) as f32,
-            );
-            set4(
-                &mut cb,
-                1,
-                block.width * 0.5,
-                block.height * 0.5,
-                block.radius,
-                1.25,
-            );
-            set4(
-                &mut cb,
-                2,
-                fb.edges[0],
-                fb.edges[1],
-                fb.edges[2],
-                fb.edges[3],
-            );
-            set4(
-                &mut cb,
-                3,
-                fb.corners[0],
-                fb.corners[1],
-                fb.corners[2],
-                fb.corners[3],
-            );
-            set4(&mut cb, 4, fb.width, fb.alpha, 0.0, 0.0);
-            set4(&mut cb, 5, fb.color[0], fb.color[1], fb.color[2], 0.0);
-            set4(&mut cb, 6, canvas_w, canvas_h, 0.0, 0.0);
-            if update_cbuffer(ctx, &self.bcb, &cb).is_err() {
-                continue;
-            }
-            unsafe {
-                ctx.RSSetScissorRects(Some(&[WinRect {
-                    left: sx,
-                    top: sy,
-                    right: ex,
-                    bottom: ey,
-                }]));
-                ctx.Draw(6, 0);
-            }
+        let mut cb = BorderCb {
+            v: [0.0; BORDER_CB_FLOATS],
+        };
+        let set4 = |cb: &mut BorderCb, slot: usize, a: f32, b: f32, c: f32, d: f32| {
+            let i = slot * 4;
+            cb.v[i] = a;
+            cb.v[i + 1] = b;
+            cb.v[i + 2] = c;
+            cb.v[i + 3] = d;
+        };
+        set4(
+            &mut cb,
+            0,
+            rx0 as f32,
+            ry0 as f32,
+            (rx1 - rx0) as f32,
+            (ry1 - ry0) as f32,
+        );
+        set4(
+            &mut cb,
+            1,
+            block.width * 0.5,
+            block.height * 0.5,
+            block.radius,
+            1.25,
+        );
+        set4(
+            &mut cb,
+            2,
+            fb.edges[0],
+            fb.edges[1],
+            fb.edges[2],
+            fb.edges[3],
+        );
+        set4(
+            &mut cb,
+            3,
+            fb.corners[0],
+            fb.corners[1],
+            fb.corners[2],
+            fb.corners[3],
+        );
+        set4(&mut cb, 4, fb.width, fb.alpha, 0.0, 0.0);
+        set4(&mut cb, 5, fb.color[0], fb.color[1], fb.color[2], 0.0);
+        set4(&mut cb, 6, canvas_w, canvas_h, 0.0, 0.0);
+        if update_cbuffer(ctx, &self.bcb, &cb).is_err() {
+            return false;
         }
         unsafe {
-            ctx.RSSetScissorRects(None);
-            ctx.OMSetRenderTargets(None, None);
+            ctx.RSSetScissorRects(Some(&[WinRect {
+                left: sx,
+                top: sy,
+                right: ex,
+                bottom: ey,
+            }]));
+            ctx.Draw(6, 0);
         }
+        true
     }
 }

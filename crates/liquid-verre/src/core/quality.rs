@@ -74,6 +74,46 @@ pub(crate) struct QualityCtrl {
     level_changed: bool,
 }
 
+/// 连击计数的上限（0.5.2 #6）。
+///
+/// 判据最多用到 4（连续 4 个干净窗口才升档、连续 2 个脏窗口才降档），16 已经是
+/// 4 倍余量；再往上计数没有任何判据读得到，只是让计数器有机会溢出。
+/// 显式夹紧（而不是只靠 `saturating_add` 停在 `u8::MAX`）还有一层意思：
+/// 传入值若因别的原因超过上限，也会被拉回来，不会一路涨下去。
+const STREAK_CAP: u8 = 16;
+
+/// 一个评估窗口后的连击计数更新（纯函数，0.5.2 #6 的判据本体）。
+///
+/// 返回 `(good_streak, bad_streak)`。
+///
+/// 前科：`good_streak/bad_streak` 是 `u8`，旧实现用裸 `+ 1`。debug 构建开着
+/// overflow 检查 ⇒ 连续 256 个同向窗口后 `attempt to add with overflow` **panic**，
+/// 而 panic 发生在渲染线程的帧循环里 ⇒ 线程直接死掉，用户侧表现为
+/// 「玻璃全灭 / 多操作几次分类框就消失」（约 256 s ≈ 4 分钟必现）。
+/// release 构建不 panic 但会 wrap 回 0，同样把「连续 4 个干净窗口才升档」
+/// 这条判据毁掉。两个方向都是**静默失效**，所以判据必须写成纯函数 + 顶到
+/// 上限再跑一轮的单测（`streak_overflow_does_not_panic`）。
+///
+/// 现在：`saturating_add` 并夹到 [`STREAK_CAP`] —— 到顶就停在顶上，不增也不回绕。
+#[must_use]
+pub(crate) fn bump_streaks(
+    miss_rate: f64,
+    good: u8,
+    bad: u8,
+    bad_th: f64,
+    good_th: f64,
+) -> (u8, u8) {
+    if miss_rate > bad_th {
+        (0, bad.saturating_add(1).min(STREAK_CAP))
+    } else if miss_rate < good_th {
+        (good.saturating_add(1).min(STREAK_CAP), 0)
+    } else {
+        // 落在两个阈值之间：两边都清零（与旧实现一致 —— 只有「明确干净」
+        // 或「明确脏」才累计，模棱两可的窗口不投票）。
+        (0, 0)
+    }
+}
+
 /// 「很久以前」的时间点。
 ///
 /// `Instant - Duration` 在越界时会 **panic**（spec 明令禁止裸 `Instant - Duration`），
@@ -218,16 +258,17 @@ impl QualityCtrl {
         } else {
             (0.25, 0.05)
         };
-        if miss_rate > bad_th {
-            self.bad_streak += 1;
-            self.good_streak = 0;
-        } else if miss_rate < good_th {
-            self.good_streak += 1;
-            self.bad_streak = 0;
-        } else {
-            self.good_streak = 0;
-            self.bad_streak = 0;
-        }
+        // 0.5.2 #6：连击计数走纯函数 + saturating（裸 `+1` 在 debug 构建里
+        // 256 个同向窗口后 panic 杀渲染线程）。判据本体见 [`bump_streaks`]。
+        let (good, bad) = bump_streaks(
+            miss_rate,
+            self.good_streak,
+            self.bad_streak,
+            bad_th,
+            good_th,
+        );
+        self.good_streak = good;
+        self.bad_streak = bad;
         if self.bad_streak >= 2 && frames >= 30 && self.level < 4 {
             self.set_level(self.level + 1, miss_rate, frames);
         } else if self.good_streak >= 4
@@ -338,7 +379,54 @@ fn fps_cap_and_adaptive_level_take_the_stricter_one() {
 
 #[cfg(test)]
 mod tests {
-    use super::QualityCtrl;
+    use super::{bump_streaks, far_past, QualityCtrl, STREAK_CAP};
+
+    /// 0.5.2 #6 主判据：计数器顶到上限后再跑一轮评估，不许 panic、不许回绕。
+    ///
+    /// 判别力：把实现改回裸 `self.good_streak += 1`，本测试在 **debug** 构建里
+    /// 立刻 `attempt to add with overflow` panic（这正是宿主线上「约 256 s 必崩」
+    /// 的那条路径）；改回 `wrapping_add` 则断言 2 的「停在顶上」会红。
+    #[test]
+    fn streak_overflow_does_not_panic() {
+        // 1) 纯函数：顶到上限再 +1，值必须夹紧而不是回绕。
+        let (g, b) = bump_streaks(0.0, u8::MAX, 0, 0.25, 0.05);
+        assert_eq!((g, b), (STREAK_CAP, 0), "干净窗口到顶后必须夹在上限");
+        let (g, b) = bump_streaks(1.0, 0, u8::MAX, 0.25, 0.05);
+        assert_eq!((g, b), (0, STREAK_CAP), "脏窗口到顶后必须夹在上限");
+        // 上限之上的传入值也要被拉回来（不只是「不再涨」）。
+        assert_eq!(bump_streaks(0.0, 200, 0, 0.25, 0.05).0, STREAK_CAP);
+        // NaN 不进任何分支（两个比较都是 false）⇒ 归到「模棱两可」清零，绝不 panic。
+        assert_eq!(bump_streaks(f64::NAN, 7, 7, 0.25, 0.05), (0, 0));
+
+        // 2) 端到端：把控制器顶到上限，再连跑 300 轮评估（旧实现第 1 轮就炸）。
+        let mut q = QualityCtrl::new(60.0);
+        q.level = 0; // level 0 时「连续 4 个干净窗口」不会触发升档，计数得以留在顶上
+        q.good_streak = u8::MAX;
+        for _ in 0..300 {
+            q.epoch = far_past();
+            q.cooldown_until = far_past();
+            q.frames = 30;
+            q.missed = 0;
+            assert!(!q.tick(1_000, true), "level 0 且干净：不该改档位");
+        }
+        assert_eq!(
+            q.good_streak, STREAK_CAP,
+            "300 轮干净评估后必须夹在上限（既没回绕也没继续涨）"
+        );
+        assert_eq!(q.level, 0);
+
+        // 3) 脏方向同样不许炸（level 4 = 最低档，`level < 4` 为假 ⇒ 不再降档）。
+        q.level = 4;
+        q.bad_streak = u8::MAX;
+        for _ in 0..300 {
+            q.epoch = far_past();
+            q.cooldown_until = far_past();
+            q.frames = 30;
+            q.missed = 30;
+            q.tick(10_000, true);
+        }
+        assert_eq!(q.bad_streak, STREAK_CAP, "300 轮脏评估后必须夹在上限");
+    }
 
     #[test]
     fn miss_threshold_is_125_percent_of_target() {

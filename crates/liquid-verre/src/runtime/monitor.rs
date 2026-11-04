@@ -154,13 +154,8 @@ impl MonitorRt {
         })
     }
 
-    pub fn show(&self) {
-        unsafe {
-            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                self.hwnd,
-                windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
-            );
-            let _ = windows::Win32::Graphics::Gdi::UpdateWindow(self.hwnd);
-        }
-    }
+    // 0.5.2 #2：这里**不再有** `show()`。裸 `ShowWindow(SW_SHOWNOACTIVATE)` 会把画布
+    // 抬进普通带顶部（首帧就绪那一刻从底部弹到 Chrome/IDE 之上，宿主实测 t+0.6s）。
+    // 显示必须与层级同一次 `SetWindowPos` 完成 —— 见 `platform::window::apply_visibility`
+    // 与 `show_request`。留着这个方法就是留一个可回退的坑。
 }

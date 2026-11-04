@@ -34,6 +34,17 @@ use crate::runtime::{app::App, monitor::MonitorRt};
 /// 画布窗口类名（窄字符）。
 pub(crate) const CANVAS_CLASS_NAME: &str = "LiquidVerreCanvas";
 
+/// 画布窗口类样式 —— **必须含 `CS_DBLCLKS`**（0.5.2 #5）。
+///
+/// 少了这一位，Windows 根本不给画布发 `WM_LBUTTONDBLCLK`，`wnd_proc` 里那条
+/// `PointerPhase::DoubleClick` 分支就是**永不执行的死路径**：宿主日志实锤，
+/// 用户双击标题只得到两组独立 Down/Up，只能在自家 sink 里按
+/// `GetDoubleClickTime()` + `SM_CX/CYDOUBLECLK` 合成双击。库补上后那段可退役。
+///
+/// `CS_CLASSDC` 是重构前就有的（与历史基线逐位一致），不要动。
+/// 判据本体见单测 `class_style_enables_double_clicks`。
+pub(crate) const CANVAS_CLASS_STYLE: WNDCLASS_STYLES = WNDCLASS_STYLES(CS_CLASSDC.0 | CS_DBLCLKS.0);
+
 /// 画布窗口类名（宽字符，含结尾 0）。
 ///
 /// 由 [`CANVAS_CLASS_NAME`] 在**编译期**展开，保证「注册用的名字」与
@@ -76,7 +87,7 @@ pub(crate) fn register_class(hinst: HINSTANCE) -> Result<PCWSTR> {
     let name = class_name_w();
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style: CS_CLASSDC,
+        style: CANVAS_CLASS_STYLE,
         lpfnWndProc: Some(wnd_proc),
         hInstance: hinst,
         lpszClassName: name,
@@ -640,14 +651,46 @@ pub(crate) fn set_region_full(mon: &MonitorRt) {
     }
 }
 
-/// 画布可见性 = 采集就绪 且 未被独占全屏压制 且 本屏非空。
-pub(crate) fn apply_visibility(mon: &MonitorRt) {
-    unsafe {
-        if mon.ready && !mon.hidden_fs && !mon.hidden_capture && !mon.hidden_empty {
-            mon.show();
-        } else {
+/// 可见性决策（纯函数，0.5.2 #2 的判据本体）。
+///
+/// `Some(lvl)` = 显示，且**必须**与层级走同一次 `SetWindowPos`；`None` = `SW_HIDE`。
+///
+/// 为什么「显示」不能是裸 `ShowWindow`：`ShowWindow(SW_SHOWNOACTIVATE)` 会把窗口
+/// 抬进**普通带顶部**。`create_canvas` 的时序是「创建时置底 → 首帧就绪才显示」，
+/// 于是显示那一刻画布从底部被抬到普通带顶 —— 全屏玻璃压在 Chrome/IDE 上。
+/// 宿主 `EnumWindows` 4ms 采样实测：0.5.1 启动后 t+0.6s 画布出现在 Chrome 之上
+/// （用户报「启动时分类框盖住其他窗口，点一下才下沉」）。
+/// `level::apply` 本来就带 `SWP_SHOWWINDOW`，显示 + 层级一步到位，不留中间态。
+#[must_use]
+pub(crate) fn show_request(
+    ready: bool,
+    hidden_fs: bool,
+    hidden_capture: bool,
+    hidden_empty: bool,
+    lvl: WindowLevel,
+) -> Option<WindowLevel> {
+    let visible = ready && !hidden_fs && !hidden_capture && !hidden_empty;
+    visible.then_some(lvl)
+}
+
+/// 画布可见性 = 采集就绪 且 未被独占全屏压制 且 采集未失效 且 本屏非空。
+///
+/// ⚠ 显示分支**不许**退回裸 `ShowWindow`（会把画布抬进普通带顶部，见
+/// [`show_request`]）；也**不许**加「上次已经显示过」的幂等短路 —— `level.rs`
+/// 里同一条结论：扩展样式没变不等于 Z 序没变，宿主压过底之后库再显示必须
+/// 重新按回底部。
+pub(crate) fn apply_visibility(mon: &MonitorRt, lvl: WindowLevel) {
+    match show_request(
+        mon.ready,
+        mon.hidden_fs,
+        mon.hidden_capture,
+        mon.hidden_empty,
+        lvl,
+    ) {
+        Some(lvl) => level::apply(mon.hwnd, lvl, true),
+        None => unsafe {
             let _ = ShowWindow(mon.hwnd, SW_HIDE);
-        }
+        },
     }
 }
 
@@ -715,7 +758,79 @@ fn class_name_is_canvas(buf: &[u16], n: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{class_name_is_canvas, CANVAS_CLASS_NAME, CANVAS_CLASS_NAME_W};
+    use super::{
+        class_name_is_canvas, show_request, CANVAS_CLASS_NAME, CANVAS_CLASS_NAME_W,
+        CANVAS_CLASS_STYLE, CS_CLASSDC, CS_DBLCLKS,
+    };
+    use crate::api::config::WindowLevel;
+
+    /// 0.5.2 #5：画布窗口类**必须**带 `CS_DBLCLKS`。
+    ///
+    /// 少了这一位，Windows 不给画布发 `WM_LBUTTONDBLCLK`，`wnd_proc` 里那条
+    /// `PointerPhase::DoubleClick` 分支就是永不执行的死路径（宿主实测：双击标题
+    /// 只得到两组独立 Down/Up）。这条断言把「注册类时的样式」钉死在源码里，
+    /// 而不是等运行时才发现。
+    #[test]
+    fn class_style_enables_double_clicks() {
+        assert_ne!(
+            CANVAS_CLASS_STYLE.0 & CS_DBLCLKS.0,
+            0,
+            "缺 CS_DBLCLKS ⇒ DoubleClick 相位永不到来（0.5.2 #5）"
+        );
+        assert_ne!(
+            CANVAS_CLASS_STYLE.0 & CS_CLASSDC.0,
+            0,
+            "CS_CLASSDC 是基线样式"
+        );
+        // 判别力护栏：把 register_class 里的 `style` 改回 `CS_CLASSDC` 就该红 ——
+        // 常量本身必须真的是注册时用的那个（见 register_class 的 `style: CANVAS_CLASS_STYLE`）。
+        assert_eq!(CANVAS_CLASS_STYLE.0, CS_CLASSDC.0 | CS_DBLCLKS.0);
+    }
+
+    /// 0.5.2 #2：显示决策必须把层级一起带出去（裸 ShowWindow 会把画布抬进普通带顶）。
+    #[test]
+    fn visible_canvas_show_request_carries_the_level() {
+        for lvl in [
+            WindowLevel::AlwaysOnBottom,
+            WindowLevel::Normal,
+            WindowLevel::AlwaysOnTop,
+            WindowLevel::ClickToFront,
+        ] {
+            assert_eq!(
+                show_request(true, false, false, false, lvl),
+                Some(lvl),
+                "就绪且无任何隐藏门 ⇒ 显示，且必须带层级（{lvl:?}）"
+            );
+        }
+    }
+
+    /// 四道隐藏门各自都能单独把画布压回 `SW_HIDE`（少一位就是回归）。
+    #[test]
+    fn any_hide_gate_falls_back_to_hide() {
+        let lvl = WindowLevel::AlwaysOnBottom;
+        assert_eq!(
+            show_request(false, false, false, false, lvl),
+            None,
+            "未就绪"
+        );
+        assert_eq!(
+            show_request(true, true, false, false, lvl),
+            None,
+            "独占全屏压制"
+        );
+        assert_eq!(
+            show_request(true, false, true, false, lvl),
+            None,
+            "采集失效"
+        );
+        assert_eq!(
+            show_request(true, false, false, true, lvl),
+            None,
+            "本屏无块"
+        );
+        // 判别力：三门全 false 才显示 —— 把实现写成 `ready` 单条件时这四条会红三条。
+        assert_eq!(show_request(true, false, false, false, lvl), Some(lvl));
+    }
 
     #[test]
     fn class_name_is_canvas_accepts_only_the_exact_name() {

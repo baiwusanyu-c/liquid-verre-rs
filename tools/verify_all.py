@@ -5,6 +5,9 @@
 3. 跨屏拖拽 + DPI 换算（调 verify_crossscreen.py）
 4. 环境色 EMA 开/关 首帧等价
 5. DDA 局部拷贝 vs 整屏参考拷贝
+6. 0.5.2 #1 border 层序（像素 oracle，调 verify_border_zorder.py）
+7. 0.5.2 #4 会话期快照跟随（调 verify_session_snapshot.py）
+8. 0.5.2 #5 CS_DBLCLKS 双击相位（调 verify_double_click.py）
 
 任何一项 FAIL 都会让整体返回非 0。
 """
@@ -149,6 +152,23 @@ def main():
             if "verify-copy" in line:
                 print("    " + line.strip())
     RESULTS.append(("partial-copy", fails == 0 and passes > 0))
+
+    # ---- 0.5.2 三件行为 / 像素取证（宿主实测缺陷的回归位）----
+    for tag, script, title in [
+        ("border-zorder", "verify_border_zorder.py",
+         "[6] 0.5.2 #1 border 受块 z 序遮挡（像素 oracle）"),
+        ("session-snap", "verify_session_snapshot.py",
+         "[7] 0.5.2 #4 会话期快照跟随 + moving 位翻转可见"),
+        ("double-click", "verify_double_click.py",
+         "[8] 0.5.2 #5 CS_DBLCLKS：物理双击必须到达 DoubleClick 相位"),
+    ]:
+        print(title)
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", script)],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        for line in (r.stdout or "").splitlines():
+            if line.strip():
+                print("  " + line.strip())
+        RESULTS.append((tag, r.returncode == 0))
 
     print("=" * 60)
     bad = [t for t, ok in RESULTS if not ok]

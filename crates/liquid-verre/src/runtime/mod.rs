@@ -114,7 +114,8 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
     // 没有这些打点就无法判断卡在哪一步。
     let t_boot = Instant::now();
     log::info!(target: "boot", "创建 D3D11 设备...");
-    let gfx = Device::create().map_err(|e| e.with_kind(ErrorKind::GraphicsInit))?;
+    let gfx =
+        Device::create(cfg.frame_latency).map_err(|e| e.with_kind(ErrorKind::GraphicsInit))?;
     log::info!(
         target: "boot",
         "D3D11 设备就绪 (+{:.0} ms)",
@@ -323,7 +324,7 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         app.monitors[mi].ready = !needs || app.monitors[mi].compositor.capture_ready();
     }
     for mon in app.monitors.iter() {
-        window::apply_visibility(mon);
+        window::apply_visibility(mon, app.level);
         if mon.ready {
             log::info!(
                 "{} 画布已显示 ({}x{})",
@@ -528,7 +529,7 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                         if !mon.ready && mon.compositor.capture_ready() {
                             mon.ready = true;
                             mon.hidden_capture = false;
-                            window::apply_visibility(mon);
+                            window::apply_visibility(mon, app.level);
                         }
                     }
                     Ok(None) => {}
@@ -553,7 +554,7 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                         if mon.ready {
                             // 画面会冻结在最后一帧，因此采集一失效就隐藏画布，恢复后再显示。
                             mon.hidden_capture = true;
-                            window::apply_visibility(mon);
+                            window::apply_visibility(mon, app.level);
                         }
                         mon.ready = false;
                     }
@@ -671,6 +672,8 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
             app.scale_of(app.manager.get(id).map_or(0, |b| b.monitor))
         });
         let min_size = app.min_drag_size;
+        // 0.5.2 #4：本帧会话是否**真的**改了块几何（不是「在会话里」）。
+        let mut session_geometry_moved = false;
         let drag_monitor = match app.drag.as_mut() {
             Some(session) => {
                 let now = app.t0.elapsed().as_secs_f64();
@@ -680,6 +683,11 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                 let scale = drag_scale;
                 let r = session.apply(app.cursor, now, scale, min_size);
                 app.drag_velocity = session.velocity();
+                // 写回前先抄一份几何，末尾比对（跨屏换算也算几何变化）。
+                let before = app
+                    .manager
+                    .get(id)
+                    .map(|b| (b.x.round(), b.y.round(), b.width.round(), b.height.round()));
                 if let Some(b) = app.manager.get_mut(id) {
                     b.x = r[0];
                     b.y = r[1];
@@ -693,6 +701,12 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                 }
                 // 跨屏：中心越过边界就换屏，并按两屏 DPI 比例换算尺寸。
                 sync_block_monitor(&mut app, id);
+                session_geometry_moved = app.manager.get(id).is_some_and(|b| {
+                    before.is_some_and(|(x, y, w, h)| {
+                        (b.x.round(), b.y.round(), b.width.round(), b.height.round())
+                            != (x, y, w, h)
+                    })
+                });
                 Some(app.manager.get(id).map_or(0, |b| b.monitor))
             }
             None => {
@@ -704,6 +718,16 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         let dragging = drag_monitor.is_some();
         if dragging {
             geometry_changed = true;
+        }
+        // 0.5.2 #4：**块几何变化 ⇒ 同帧快照可见**（写进 README 的契约）。
+        // 快照发布门是 `snapshot_dirty || monitors_changed || key_changed`，而
+        // `publish_snapshot` 本身又被 `snapshot_dirty || 250ms` 兜底门挡着 ——
+        // 会话里每帧写 b.x/y/width/height 却不标 dirty，宿主就只能按 ~4 Hz 兜底档
+        // 看到新矩形（表现为「图标/按钮比玻璃背景慢半拍」，宿主只能靠
+        // `set_default_resize` 催发布 + 16 ms tick 跟随绕行）。
+        // 判据用「真的变了」而不是「在会话里」：光标停在块上不动时不该白发布。
+        if session_geometry_moved {
+            app.snapshot_dirty = true;
         }
 
         // ---- 每屏：投影块 + 窗口区域 + 点击穿透 ----
@@ -719,7 +743,7 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                         Some(t) if t.elapsed() >= std::time::Duration::from_secs(1) => {
                             if !mon.hidden_empty {
                                 mon.hidden_empty = true;
-                                window::apply_visibility(mon);
+                                window::apply_visibility(mon, app.level);
                             }
                         }
                         Some(_) => {}
@@ -729,7 +753,7 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                     mon.empty_since = None;
                     if mon.hidden_empty {
                         mon.hidden_empty = false;
-                        window::apply_visibility(mon);
+                        window::apply_visibility(mon, app.level);
                     }
                 }
             }
@@ -839,7 +863,7 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                             mon.ready = false;
                         }
                     }
-                    window::apply_visibility(mon);
+                    window::apply_visibility(mon, app.level);
                     // 翻转沿日志。`matched` 是**真正触发判定的那个前台窗口**（不是「打日志这
                     // 一刻恰好在前台的窗口」—— 4 Hz 轮询与翻转沿之间前台可以变，记错了比不记更误导）。
                     // `hit == matched.is_some()` 且此刻正处于翻转沿，所以两个分支恰好各对应一次跃迁。

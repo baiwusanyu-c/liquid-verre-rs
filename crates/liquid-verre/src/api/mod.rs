@@ -15,7 +15,7 @@ pub mod input;
 pub use config::{
     CaptureBackend, CaptureConfig, DiagnosticsConfig, EngineConfig, GlassMode, GlassStyle,
     LogLevel, Rect, ResizeFeedbackOptions, ResizeOptions, TransparentParams, WindowConfig,
-    WindowLevel, ZOrder,
+    WindowLevel, ZOrder, FRAME_LATENCY_MAX, FRAME_LATENCY_MIN, MIN_FLOOR_SUSPICIOUS,
 };
 pub use engine::Engine;
 pub use event::{EngineEvent, EventHandler, ResizeHandle, EVENT_QUEUE_CAP};

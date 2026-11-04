@@ -567,6 +567,34 @@ pub(crate) fn render_monitor(app: &mut App, mi: usize, ctx: &FrameCtx, full_redr
     mon.compositor.last_dirty_px > 0
 }
 
+/// 单块快照比对键（纯函数，0.5.2 #4 的连带修正）。
+///
+/// 位掩码必须**覆盖所有会变的布尔位**：少一位就意味着「只有那一位变了」不会触发
+/// 快照发布，上层永远读不到翻转（加 `occluded` 时正是这个坑，`moving` 是同族第二次）。
+///
+/// 前科（2026-11-03 由 `tools/verify_session_snapshot.py` 抓到）：拖拽结束后块停在
+/// 新位置，几何位不再变化 ⇒ 键不变 ⇒ `publish_snapshot` 直接 return，共享快照里
+/// 那份 `moving = true` **永远留着**。宿主据此判断「会话期」就会永久停在绕行分支
+/// （16 ms tick 跟随 / 不重挂 OLE 目标）。把会话位接进键里，翻转就会在下一次发布
+/// 门（dirty 或 4 Hz 兜底）被推出去。
+///
+/// 4 位仍远小于 i32 的宽度，将来再加布尔位往后接即可。
+#[must_use]
+pub(crate) fn window_key(b: &crate::core::block::Block, dragged: bool) -> [i32; 6] {
+    let s = b.scale.max(1e-3);
+    [
+        b.x.round() as i32,
+        b.y.round() as i32,
+        (b.width / s).round() as i32,
+        (b.height / s).round() as i32,
+        b.z_order,
+        i32::from(b.visible) * 8
+            + i32::from(b.interactive) * 4
+            + i32::from(b.occluded) * 2
+            + i32::from(dragged),
+    ]
+}
+
 /// 把当前状态发布到快照，供上层 getter 读取。
 ///
 /// 只在**真的变了**时才写（比对 `snapshot_key`）。
@@ -580,20 +608,9 @@ pub(crate) fn publish_snapshot(app: &mut App, fps: f32, hz: f32, battery: bool) 
     for b in app.manager.blocks() {
         let s = b.scale.max(1e-3);
         let style = *b.effective_style(&app.default_style);
-        let q = [
-            b.x.round() as i32,
-            b.y.round() as i32,
-            (b.width / s).round() as i32,
-            (b.height / s).round() as i32,
-            b.z_order,
-            // 位掩码必须**覆盖所有会变的布尔位**：少一位就意味着「只有那一位变了」
-            // 不会触发快照发布，上层永远读不到翻转（加 `occluded` 时正是这个坑）。
-            // 3 位仍远小于 i32 的宽度，将来再加布尔位往后接即可。
-            i32::from(b.visible) * 4 + i32::from(b.interactive) * 2 + i32::from(b.occluded),
-        ];
-        app.snapshot_key_next.push((b.id, q));
         let dragged = app.drag.as_ref().map(|d| d.id()) == Some(b.id);
         let resizing_now = app.drag.as_ref().is_some_and(|d| d.is_resize());
+        app.snapshot_key_next.push((b.id, window_key(b, dragged)));
         app.snapshot.windows.push(WindowSnapshot {
             id: b.id,
             rect: [b.x, b.y, b.width / s, b.height / s],
@@ -613,7 +630,23 @@ pub(crate) fn publish_snapshot(app: &mut App, fps: f32, hz: f32, battery: bool) 
             occluded: b.occluded,
         });
     }
-    let monitors_changed = app.snapshot.monitors.len() != app.monitors.len();
+    // 0.5.2 #3：只比「数量」不够。显示器热插拔 / 分辨率变化会**重建画布**
+    // （0.5.1 的 WM_DISPLAYCHANGE 路径），屏数不变但 HWND 变了。快照里的
+    // `canvas_handle` 一过期，宿主靠它做的压底与 OLE 放置目标重挂就会打向
+    // 已销毁的窗口（前科同 `truncate` 泄漏：孤儿画布恒穿透）。
+    // 比对成本 O(屏数)，且只在「dirty 或 4 Hz 兜底」这条门上跑，不进热路径。
+    let monitors_changed = app.snapshot.monitors.len() != app.monitors.len()
+        || app
+            .snapshot
+            .monitors
+            .iter()
+            .zip(app.monitors.iter())
+            .any(|(s, m)| {
+                s.canvas_handle != m.hwnd.0 as isize
+                    || s.origin != m.info.origin
+                    || s.size != m.info.size
+                    || s.dpi != m.info.dpi
+            });
     if monitors_changed {
         app.snapshot.monitors = app
             .monitors
@@ -741,4 +774,67 @@ pub(crate) fn spawn_block(app: &mut App, spec: SpawnSpec) {
     app.snapshot_dirty = true;
     app.shared
         .emit(crate::api::event::EngineEvent::WindowCreated { id });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_key;
+    use crate::api::config::GlassStyle;
+    use crate::core::block::Block;
+
+    fn block() -> Block {
+        let mut b = Block::new(1, 100.0, 100.0, 400.0, 300.0);
+        b.style = GlassStyle::default();
+        b
+    }
+
+    /// 0.5.2 #4 连带修正的主判据：**会话位翻转必须改变比对键**。
+    ///
+    /// 判别力：把 `+ i32::from(dragged)` 那一项删掉（= 修正前的键），本测试立刻红 ——
+    /// 对应的线上症状是「拖完之后宿主的 snapshot.moving 永远停在 true」
+    /// （2026-11-03 由 tools/verify_session_snapshot.py 实测抓到）。
+    #[test]
+    fn session_flag_flip_changes_the_snapshot_key() {
+        let b = block();
+        let idle = window_key(&b, false);
+        let dragging = window_key(&b, true);
+        assert_ne!(
+            idle, dragging,
+            "会话开始/结束必须让快照重发（几何没动也要发）"
+        );
+        // 除会话位外，其余五项必须逐位相同：不许因为加了位就动几何口径。
+        assert_eq!(&idle[..5], &dragging[..5]);
+    }
+
+    /// 其余布尔位同样必须各占一位，且互不遮蔽。
+    #[test]
+    fn every_mutable_bool_has_its_own_key_bit() {
+        let base = window_key(&block(), false);
+        let mut b = block();
+        b.visible = false;
+        assert_ne!(base, window_key(&b, false), "visible");
+        b.visible = true;
+        b.interactive = false;
+        assert_ne!(base, window_key(&b, false), "interactive");
+        b.interactive = true;
+        b.occluded = true;
+        assert_ne!(base, window_key(&b, false), "occluded");
+        b.occluded = false;
+        assert_eq!(
+            base,
+            window_key(&b, false),
+            "全部还原后键必须回到原值（位不重叠）"
+        );
+    }
+
+    /// 几何亚像素抖动不该把键打散（取整口径与 0.5.1 一致）。
+    #[test]
+    fn key_rounds_geometry_so_it_is_not_noise_sensitive() {
+        let mut a = block();
+        let b2 = block();
+        a.x = 100.4;
+        assert_eq!(window_key(&a, false), window_key(&b2, false));
+        a.x = 100.6;
+        assert_ne!(window_key(&a, false), window_key(&b2, false));
+    }
 }

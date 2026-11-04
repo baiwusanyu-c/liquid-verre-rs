@@ -828,6 +828,16 @@ impl Compositor {
         // Pass B：逐块 scissor 绘制（只画与脏区相交的块）
         let pass_b_start = std::time::Instant::now();
         if !self.skip_pass_b {
+            // 0.5.2 #1：border 不再是「全部玻璃之后的独立叠加 pass」，而是由
+            // draw_blocks 在逐块循环内**紧跟自己那块的玻璃**发射 —— 于是下层框的
+            // 白边会被上层框的玻璃盖住（border 属于块本身，受块 z 序遮挡）。
+            // 没有 feedback 块时 plan 为空，循环里一次 border 状态切换都不发生。
+            let border_target = crate::gfx::glass_renderer::BorderTarget {
+                rtv: &self.rt.rtv,
+                w: self.rt.w,
+                h: self.rt.h,
+                canvas: [self.width as f32, self.height as f32],
+            };
             glass.draw_blocks(
                 &gfx.device,
                 &gfx.ctx,
@@ -847,19 +857,7 @@ impl Compositor {
                 press,
                 hover_id,
                 Some(content_store),
-            );
-            // 缩放反馈 border：独立叠加 pass，盖在全部玻璃之上（需求 F2）。
-            // 没有块需要反馈时 draw_borders 内部直接返回，零状态切换。
-            glass.draw_borders(
-                &gfx.ctx,
-                &crate::gfx::glass_renderer::BorderTarget {
-                    rtv: &self.rt.rtv,
-                    w: self.rt.w,
-                    h: self.rt.h,
-                    canvas: [self.width as f32, self.height as f32],
-                },
-                blocks,
-                order,
+                Some(&border_target),
             );
         }
         self.last_stage_us[1] = pass_b_start.elapsed().as_micros();

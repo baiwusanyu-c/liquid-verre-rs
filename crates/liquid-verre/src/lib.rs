@@ -78,7 +78,8 @@ pub use api::{
     EventHandler, GlassInputSink, GlassMode, GlassStyle, GlassWindow, InputDecision, LiquidParams,
     LogLevel, MonitorSnapshot, PointerButton, PointerEvent, PointerPhase, Profile, Rect,
     ResizeFeedbackOptions, ResizeHandle, ResizeOptions, Shape, TransparentParams, WindowConfig,
-    WindowLevel, WindowSnapshot, ZOrder, EVENT_QUEUE_CAP,
+    WindowLevel, WindowSnapshot, ZOrder, EVENT_QUEUE_CAP, FRAME_LATENCY_MAX, FRAME_LATENCY_MIN,
+    MIN_FLOOR_SUSPICIOUS,
 };
 pub use build_info::{BuildInfo, BUILD_INFO};
 pub use error::{Error, ErrorKind, Result};

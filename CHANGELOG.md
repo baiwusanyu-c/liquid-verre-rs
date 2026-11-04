@@ -8,6 +8,103 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
+## [0.5.2-unreleased]
+
+来源：分类框宿主 `ikun_organizer`（依赖 crates.io `liquid-verre-rs 0.5.1`）的实测取证清单。
+八条全部落地，宿主侧的临时绕行**可以退役**（逐条对照见下）。
+
+### Fixed
+- **#1 [P0] 缩放反馈 border 盖在全部玻璃之上**（`gfx/compositor.rs` + `gfx/glass_renderer.rs`）：
+  border 曾是 Pass B 之后的独立叠加 pass，对所有块的玻璃都是「后画 = 压在上面」⇒
+  两块重叠时拖**下层**框边缘，白框画到**上层**框身上（宿主复验：`raise_box` 修不了）。
+  现按清单的**改法 A** 落地：`draw_blocks` 逐块循环里画完第 i 块玻璃（及内容）立刻画
+  第 i 块 border，`draw_borders` 删除、改为单块 `draw_border`（无 feedback 时直接返回
+  false，零状态切换）。三条实现要点全部照办：每块开头**无条件重设全套玻璃管线状态**、
+  border 尾部**不再** `OMSetRenderTargets(None, None)`、scissor 口径不变（CB 用未 clamp
+  的 `draw_rect()`）。发射顺序判据沉成纯函数 `core::draw::border_emit_plan`（4 条单测）。
+  取证：`tools/verify_border_zorder.py`（反向对照实测：退回旧结构时 `p_in` 变纯白，2/4 红）。
+- **#2 [P0] 启动时画布被抬进普通带顶部**（`platform/window.rs::apply_visibility`）：
+  首帧就绪走裸 `ShowWindow(SW_SHOWNOACTIVATE)` ⇒ 显示那一刻从底部弹到 Chrome/IDE 之上
+  （宿主 EnumWindows 4ms 采样：t+0.6s 命中）。现显示与层级同一次 `SetWindowPos`
+  （`level::apply(hwnd, lvl, true)`，自带 `SWP_SHOWWINDOW`）；决策本体抽成纯函数
+  `show_request`。`MonitorRt::show()` 一并删除，防止退回。
+- **#3 [P1] `Command::SetWindowLevel` 等值早退，「重新压底」根本发不出去**
+  （`runtime/commands.rs`）：`EngineConfig.window_level` 建引擎时已是 `AlwaysOnBottom`，
+  于是宿主之后每次 `set_window_level(AlwaysOnBottom)` 都是空操作。现等值也重发一次层级
+  （幂等，成本一次 `SetWindowPos`），但**不**发 `LevelApplied` / **不**重建金字塔
+  （4 ms 压底守护下那是 DoS）。判据 `plan_set_window_level` + 2 条单测。
+  连带：`MonitorSnapshot::canvas_handle` 不再可能在屏数不变的显示器重建后过期
+  （快照现按 hwnd/origin/size/dpi 逐项比对）。
+- **#4 [P1] 移动/缩放会话改块几何不置 `snapshot_dirty`**（`runtime/mod.rs`）：宿主只能按
+  250 ms 兜底档（~4 Hz）看到新矩形，表现为「图标/按钮比玻璃背景慢半拍」。现会话里
+  几何**真的**变化就置脏位，契约写进 README：**块几何变化 ⇒ 同帧快照可见**。
+  取证时另抓到同族缺陷：`moving`/`resizing` 不在快照比对键里 ⇒ 拖拽结束后共享快照
+  **永远停在** `moving = true`（实测 ticks=3654 无收尾）。现接进 `window_key`（3 条单测）。
+  取证：`tools/verify_session_snapshot.py`。
+- **#5 [P1] 画布窗口类缺 `CS_DBLCLKS`，`PointerPhase::DoubleClick` 永不触发**
+  （`platform/window.rs`）：Windows 从不发 `WM_LBUTTONDBLCLK`，宿主只能自己合成双击。
+  现类样式 = `CS_CLASSDC | CS_DBLCLKS`（常量 `CANVAS_CLASS_STYLE` + 类级单测），
+  物理双击取证 `tools/verify_double_click.py`（含「慢速两击不许产生 DoubleClick」的
+  库侧合成排除对照）。
+- **#6 [P0 崩溃] `core/quality.rs` streak 计数溢出**：`good_streak/bad_streak` 用裸 `+ 1`，
+  debug 构建开 overflow 检查 ⇒ 约 256 个同向窗口（≈256 s）后 `attempt to add with
+  overflow` **panic 杀死渲染线程**（用户侧「玻璃全灭 / 多操作几次分类框就消失」）；
+  release 构建回绕成 0，同样毁掉升档判据。现抽成纯函数 `bump_streaks` + `saturating_add`
+  夹到 `u8::MAX`，单测 `streak_overflow_does_not_panic`（顶到上限再连跑 300 轮双向评估）。
+- **附带（同一处结构性风险）**：内容 pass 结束后整体重绑 `t0..t8` 会把 t4 打回默认 LUT，
+  而 `bound_lut` 账本没跟上 ⇒ 下一块同键时跳过重绑、采到**错的折射 LUT**（不报错）。
+  现账本跟着实际绑定走。
+
+### Added
+- **#8 [P2] `EngineConfig::frame_latency: Option<u32>`**（`gfx/device.rs`）：帧延迟队列深度
+  进配置（`1..=8`，默认 `None` = 1，跟手优先）。优先级 `GLASS_FRAME_LATENCY` >
+  本字段 > 默认，解析沉成纯函数 `resolve_frame_latency`。宿主不再需要环境变量调参。
+- **#7 [P2] DPI 量纲契约写进文档**（`api/config.rs` 模块头 + README「坐标系与量纲」）：
+  逐量表格（谁是逻辑、谁是物理、主屏基准如何影响），并明确两条宿主最容易踩的：
+  `min_width/min_height` 是**硬下限**（无相对上限）、主屏 `scale` 恒 1.0 故
+  `grip_px` **不随主屏 DPI 放大**。`sanitize()` 对越过 `MIN_FLOOR_SUSPICIOUS`（1024）
+  的下限打一条 warn-once `[warn]`（数值照原样生效，语义不改）。
+
+### 性能与回归证据（2026-11-03，本机 DISPLAY1 3120x2080@120Hz dpi=192）
+
+每块无条件重设管线状态**没有可测代价**，且顺带暴露并修掉一处热路径分配
+（`border_emit_plan` 原返回新 `Vec` ⇒ 每帧每屏一次 malloc，20 块 × 120 Hz = 2400 次/秒；
+现写进 `GlassRenderer::border_plan` 复用缓冲，判据本体不变）：
+
+| 场景 | 历史基线（2026-10-21） | 本次（修 Vec 前 → 修后） |
+|---|---|---|
+| single-drag fps / p50 / own_us | 110.2 / 8.34 / 28 | 114.2 / 8.32 / 38 → **114.8 / 8.33 / 14** |
+| many-drag lat=1 fps / p50 / own_us | 60.9 / 16.66 / 76 | 70.1 / 13.09 / 42 → **69.9 / 14.79 / 30** |
+| many-drag lat=2 fps / p50 | 97.8 / 8.98 | 113.7 / 8.35 → **112.4 / 8.35** |
+| transparent-drag fps / p50 / own_us | 93.8 / 8.34 / 20 | 94.7 / 8.33 / **142**(WARN) → **95.2 / 8.33 / 14** |
+
+`gate_perf.py` 两档判定均 **PASS**（剩余两条 WARN 是文档里既有建议项：20 块默认档
+fps < 90、拖拽 CPU ≥ 5%，历史高重绘窗口同样会超）。
+`transparent own_us=142` 的 WARN 是**测量装置自己**造成的（每帧 malloc），修掉后回到 14 ——
+与 measurement spec §1.3「归因之前先怀疑测量装置本身」同一条教训。
+
+同轮复跑的既有取证：`verify_content.py`（5 条硬断言全 PASS，交错层序未回退）、
+`verify_mouse_isolation.py`（总体 PASS，闭包外 0 差异）、`verify_dirty.py`
+（脏矩形 vs 全量逐位一致，两场景各 0 差异像素）。
+
+### Tests
+- 库单测 245 → **248**（新增 `border_emit_plan` ×4、`show_request` ×2、类样式 ×1、
+  `plan_set_window_level` ×2、`bump_streaks`/溢出 ×1、`window_key` ×3、config ×4）。
+- 新增集成测试 `crates/liquid-verre/tests/host_contract.rs`（8 条，**不启动渲染线程**）：
+  宿主据以写绕行代码的公共契约逐条钉死。
+- 新增三件取证脚本并登记进 `tools/verify_all.py`（见 #1/#4/#5）。
+
+### 宿主可以删掉的临时方案
+| 条目 | 宿主绕行 | 现状 |
+|---|---|---|
+| #2/#3 | 建引擎后对隐藏画布发 `HWND_BOTTOM` + 4ms 压底守护；拿 `canvas_handle` 自己 `SetWindowPos` | 可直接调 `Engine::set_window_level(AlwaysOnBottom)`（等值也生效） |
+| #4 | 会话期 `set_default_resize` 催发布 + 16ms tick 跟随 | 删掉；`snapshot.rect` 同帧可见，会话结束 `moving` 会翻回 false |
+| #5 | sink 里按 `GetDoubleClickTime()` 合成双击 | 删掉；直接收 `PointerPhase::DoubleClick` |
+| #7 | 下发前把 min 夹到 200×140 逻辑像素 | 建议保留（库里只 warn，不改数值） |
+
+> 另：0.5.1 已根治「显示器热插拔可能杀死渲染线程」（`WM_DESTROY` 只在 `App::shutdown`
+> 发 PostQuit），宿主的 `revive_if_dead` 兜底可以退役。
+
 ## [0.5.1] - 2026-10-27
 
 ### Fixed

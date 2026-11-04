@@ -5,7 +5,7 @@
 //!
 //! 返回 `true` 表示「本批命令改变了需要重画的东西」，主循环据此触发一帧。
 
-use crate::api::config::GlassStyle;
+use crate::api::config::{GlassStyle, WindowLevel};
 use crate::api::event::EngineEvent;
 use crate::api::handle::{Command, StylePatch};
 use crate::error::ErrorKind;
@@ -61,11 +61,16 @@ fn apply_one(app: &mut App, cmd: Command) -> bool {
         }
 
         Command::SetWindowLevel(level) => {
-            if app.level == level {
-                return false;
-            }
+            // 0.5.2 #3：等值也要重发一次层级（判据本体见 [`plan_set_window_level`]）。
+            let plan = plan_set_window_level(app.level, level);
             app.level = level;
             window::apply_level(&app.monitors, level);
+            if !plan.announce {
+                // 等值重发 = 「把画布按回它本该在的位置」，不是状态跃迁：
+                // 不发事件、不标脏、不作废金字塔（宿主 4 ms 压底守护下，
+                // 每 4 ms 重建一次模糊金字塔会把「优化」变成「DoS」）。
+                return false;
+            }
             app.shared.emit(EngineEvent::LevelApplied { level });
             app.snapshot_dirty = true;
             // 层级变化会改变遮挡关系，桌面采集内容随之变化，金字塔必须重算。
@@ -397,6 +402,35 @@ fn invalidate_all(app: &mut App) {
     }
 }
 
+/// `SetWindowLevel` 的处理计划（纯函数，0.5.2 #3 的判据本体）。
+///
+/// 旧实现在 `app.level == level` 处直接 `return false`，而 `EngineConfig.window_level`
+/// 建引擎时就已经是 `AlwaysOnBottom` —— 于是宿主之后每次
+/// `Engine::set_window_level(AlwaysOnBottom)` 都是**空操作**，`level::apply` 压根跑不到，
+/// 库内部没有任何「把画布按回底部」的能力（宿主只能拿 `canvas_handle` 自己发
+/// `SetWindowPos(HWND_BOTTOM)`）。
+///
+/// - `reapply`：**恒为 true**。重发是幂等的（同层级同 Z 序），成本一次 `SetWindowPos`。
+///   注意 `level.rs` 里已经有一条同族结论：**不能**按「扩展样式变没变」决定是否发
+///   `SetWindowPos` —— AlwaysOnBottom 与 Normal 都不带 `WS_EX_TOPMOST`，样式层面
+///   「没变」，Z 序却一个在底一个在中。这里同理，别再往里加短路。
+/// - `announce`：只有层级真的跃迁才发 `LevelApplied` + 标脏快照 + 作废金字塔。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LevelPlan {
+    /// 是否真的向系统重发层级（`level::apply`）。
+    pub(crate) reapply: bool,
+    /// 是否算「层级变了」：发事件、标脏快照、重建金字塔。
+    pub(crate) announce: bool,
+}
+
+#[must_use]
+pub(crate) fn plan_set_window_level(prev: WindowLevel, next: WindowLevel) -> LevelPlan {
+    LevelPlan {
+        reapply: true,
+        announce: prev != next,
+    }
+}
+
 /// 只作废 present 账本（整屏重画一帧），不动金字塔账本。
 fn invalidate_present_all(app: &mut App) {
     for m in app.monitors.iter_mut() {
@@ -419,8 +453,36 @@ mod tests {
     // 纯逻辑部分（z 序、命中测试、样式展开、缩放几何）分别在
     // core::manager / core::handle / core::style / input::drag 里覆盖。
     // 这里只钉住「命令枚举本身可比较、可克隆」这个契约。
+    use super::plan_set_window_level;
     use crate::api::config::{ResizeOptions, WindowLevel, ZOrder};
     use crate::api::handle::Command;
+
+    /// 0.5.2 #3 主判据：**等值也必须重发层级**，否则宿主的「重新压底」发不出去。
+    #[test]
+    fn equal_level_still_reapplies() {
+        for lvl in [
+            WindowLevel::AlwaysOnBottom,
+            WindowLevel::AlwaysOnTop,
+            WindowLevel::Normal,
+            WindowLevel::ClickToFront,
+        ] {
+            let plan = plan_set_window_level(lvl, lvl);
+            assert!(plan.reapply, "等值 {lvl:?} 仍要重发 SetWindowPos");
+            assert!(
+                !plan.announce,
+                "等值不该发 LevelApplied / 重建金字塔（4 ms 压底守护会刷屏）"
+            );
+        }
+    }
+
+    /// 反向对照：层级真的变了时，重发 + 公告两件事都要做。
+    #[test]
+    fn level_change_reapplies_and_announces() {
+        let plan = plan_set_window_level(WindowLevel::AlwaysOnBottom, WindowLevel::Normal);
+        assert!(plan.reapply && plan.announce);
+        let plan = plan_set_window_level(WindowLevel::AlwaysOnTop, WindowLevel::AlwaysOnBottom);
+        assert!(plan.reapply && plan.announce);
+    }
 
     #[test]
     fn commands_are_clone_and_comparable() {

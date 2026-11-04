@@ -73,6 +73,13 @@ cargo run --release --bin liquid-verre-playground -- --port 8787    # 手动看�
 > + `cargo test --release --workspace` + `cargo package -p liquid-verre-rs --list` 干跑；
 > `release.yml` 也只多跑 `node scripts/check.mjs` + `node scripts/package.mjs`。
 > **像素取证（`cmp_visual` / `verify_*` / `repro_tremble`）与性能阀门（`gate_perf`）一律不进 CI**：
+> （0.5.2 起另有三件宿主缺陷回归取证：`verify_border_zorder`（#1 像素 oracle，A 下 B 上
+> 重叠、回读 A∩B 与 A 未遮挡边缘，反向对照 = 关掉 feedback）/ `verify_session_snapshot`
+> （#4 物理拖拽 + 4ms 快照采样，分母用拖拽步数而不是采样数，因为库每帧才更新一次几何）/
+> `verify_double_click`（#5 物理双击必须到达 DoubleClick，且慢速两击**不许**产生 ——
+> 反向排除库侧合成）。三件都按「删实现它还红吗」设计：`verify_border_zorder` 实测把
+> border 退回独立叠加 pass 时 2/4 红。触碰层序 / 快照发布 / 输入路由必复跑，同样不进 CI。）
+>
 > （0.5.0 起 `verify_*` 含功能行为取证三件套：`verify_input_sink` / `verify_content` /
 > `verify_focus_drop`——触碰输入路由/内容层/焦点路径必复跑；三件均按「判别力」设计，
 > 断言禁止"无证据也 PASS"的逃生口。）

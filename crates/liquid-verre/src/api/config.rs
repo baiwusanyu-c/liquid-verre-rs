@@ -8,7 +8,39 @@
 //!   保持源码兼容。枚举（`ErrorKind` / `EngineEvent`）仍然 `#[non_exhaustive]`，
 //!   因为那边加变体才是常态。
 //! - **任何来自上层的数值都必须先过 `sanitize()` 才进 GPU**（NaN / 负数 / 超大值一律夹紧）。
-//! - 长度量纲统一为「逻辑像素 = 主屏物理像素」，跨屏时由库按 DPI 比例换算（方案 12.2.5）。
+//!
+//! # 长度量纲契约（0.5.2 #7，宿主实测踩过坑，逐条给代码出处）
+//!
+//! 库的「逻辑像素」= **主屏物理像素**。基准点：`platform/display.rs` 里
+//! `scale = 该屏 DPI / 主屏 DPI` ⇒ **主屏的 scale 恒为 1.0**，副屏才 ≠ 1。
+//!
+//! | 量 | 口径 | 库里怎么用它 |
+//! |---|---|---|
+//! | [`WindowConfig::rect`] 的 `w/h` | 逻辑像素（= 主屏物理像素） | 归屏时 `× scale` 变成**该屏物理像素**（`core::block::rehome_block`） |
+//! | [`WindowConfig::rect`] 的 `x/y` | **虚拟屏绝对物理像素** | 投影时 `x - monitor.origin` 直接当画布局部物理像素用，**不**按 DPI 折算 |
+//! | [`ResizeOptions::min_width`] / `min_height` | 逻辑像素（= 主屏物理像素） | **硬下限**，无相对上限（见下方警告） |
+//! | [`ResizeOptions::grip_px`] | 逻辑像素（= 主屏物理像素） | 投影时 `× scale`（`runtime::app::collect_monitor_blocks`） |
+//! | [`ResizeFeedbackOptions::border_width`] | 逻辑像素 | 同上，`× scale` |
+//! | [`LiquidParams`] 的半径 / 边距等 | 逻辑像素 | 样式派生时 `× scale`（`GlassStyle::scaled`） |
+//!
+//! ⚠ **两条最容易踩的**：
+//!
+//! 1. **主屏 DPI ≠ 100% 时，`grip_px` / `border_width` 不会自动放大**。主屏
+//!    `scale = 1.0`，所以 200% 主屏上 `grip_px = 10` 就是 10 个物理像素的把手带。
+//!    宿主若按自己的 Win32 习惯用 `scale_for_dpi(8, dpi) = 16` 物理像素做边沿命中，
+//!    两套口径就差一倍（用户读作「边缘很难抓」）。对齐方式二选一：宿主把
+//!    `grip_px` 按 DPI 放大后再下发，或者宿主的命中带不放大 —— **别两边各自为政**。
+//! 2. **`min_width/min_height` 是硬下限**：`input/drag.rs` 用
+//!    `w.max(min_w)`、`platform/window.rs` 的 `WM_GETMINMAXINFO` 也取
+//!    `b.resize.min_width/min_height`（**不是** `runtime` 的 `min_drag_size`）。
+//!    宿主把滑条拉到 605×1150 ⇒ 所有框钉死在该尺寸、边缘拖不小。
+//!    `sanitize()` 对超过 [`MIN_FLOOR_SUSPICIOUS`] 的下限打一条 warn-once
+//!    `[warn]`，但**不改数值**（改了就不是「上层说什么就是什么」了）。
+//!    推荐宿主下发前自己夹一道（本项目宿主夹到与 `WM_GETMINMAXINFO` 同源的
+//!    200×140 逻辑像素）。
+//!
+//! 跨屏时由库按 DPI 比例换算尺寸（方案 12.2.5）；位置分量 `x/y` 不参与换算，
+//! 需要宿主自己按 `ratio = 该屏DPI / 主屏DPI` 折算（主屏 ratio = 1）。
 
 use serde::{Deserialize, Serialize};
 
@@ -228,11 +260,20 @@ pub struct ResizeOptions {
     pub edges: bool,
     /// 允许对角拖拽（四个圆角）。需求 F2.3。
     pub corners: bool,
-    /// 命中带宽度（逻辑像素）。对角命中盒 = 角部 `grip × grip` 的方框。
+    /// 命中带宽度（逻辑像素 = **主屏物理像素**）。对角命中盒 = 角部 `grip × grip` 的方框。
+    ///
+    /// ⚠ 投影时 `× scale`（`scale = 该屏DPI / 主屏DPI`），因此**主屏上不会放大**：
+    /// 200% 主屏上 `grip_px = 10` 就是 10 个物理像素。宿主若按 DPI 放大自己的
+    /// 边沿命中带，两套口径会分叉（见模块头的量纲契约，0.5.2 #7）。
     pub grip_px: f32,
-    /// 缩放后的最小宽 / 高（逻辑像素）。
+    /// 缩放后的最小宽（逻辑像素 = **主屏物理像素**）。
+    ///
+    /// ⚠ **硬下限，没有相对上限**：`input/drag.rs` 的 `w.max(min_w)` 与
+    /// `WM_GETMINMAXINFO` 都直接用它。把它调到比窗口还大 = 框被钉死、边缘拖不小
+    /// （0.5.2 #7 的宿主现场：605×1150）。超过 [`MIN_FLOOR_SUSPICIOUS`] 时
+    /// `sanitize()` 会 warn-once 提示，但数值照原样生效。
     pub min_width: f32,
-    /// 最小高度（逻辑像素）。
+    /// 缩放后的最小高（逻辑像素），口径与 [`ResizeOptions::min_width`] 完全一致。
     pub min_height: f32,
     /// 悬停时的白色 border 视觉反馈配置。需求 F2.1 / F2.2。
     pub feedback: ResizeFeedbackOptions,
@@ -253,13 +294,43 @@ impl Default for ResizeOptions {
     }
 }
 
+/// 缩放下限的「可疑」阈值（逻辑像素 = 主屏物理像素，0.5.2 #7）。
+///
+/// 下限本身是硬约束（库里没有「相对块当前尺寸的上限」可以兜），一旦超过常见窗口
+/// 尺寸，用户看到的就是「边缘拖不小 / 框被钉死」。`ResizeOptions::sanitize()` 在
+/// 越过这条线时打一条 warn-once `[warn]`，让问题在日志里可见，而不是让人回去翻文档。
+/// 宿主侧的对应做法：下发前把 min 夹到与 `WM_GETMINMAXINFO` 同源的最小跟踪尺寸。
+pub const MIN_FLOOR_SUSPICIOUS: f32 = 1024.0;
+
+/// warn-once 状态位（`sanitize` 会被每次 `set_resize` 调用，不能每帧刷屏）。
+static FLOOR_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 下限是否可疑（纯判据，单测 `absurd_size_floor_is_flagged` 钉住阈值语义）。
+#[must_use]
+fn floor_is_suspicious(min_width: f32, min_height: f32) -> bool {
+    min_width > MIN_FLOOR_SUSPICIOUS || min_height > MIN_FLOOR_SUSPICIOUS
+}
+
 impl ResizeOptions {
     /// 夹紧到合法区间。
+    ///
+    /// 注意：`min_width/min_height` 的上界 4096 只是「别把 f32 精度吃光 / 别超画布」，
+    /// **不是**「这个下限合理」。合理性只警告不修改（0.5.2 #7）。
     pub fn sanitize(&mut self) {
         self.grip_px = clamp_finite(self.grip_px, 2.0, 128.0);
         self.min_width = clamp_finite(self.min_width, 8.0, 4096.0);
         self.min_height = clamp_finite(self.min_height, 8.0, 4096.0);
         self.feedback.sanitize();
+        if floor_is_suspicious(self.min_width, self.min_height)
+            && !FLOOR_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            log::warn!(
+                "缩放下限 min=[{}, {}] 逻辑像素已超过可疑阈值 {}：它是**硬下限**，                 块会被钉死在这个尺寸、边缘拖不小。量纲 = 主屏物理像素，宿主下发前                 应自行夹紧（本警告只发一次）",
+                self.min_width,
+                self.min_height,
+                MIN_FLOOR_SUSPICIOUS
+            );
+        }
     }
 
     /// 边缘拖拽是否实际生效。
@@ -507,6 +578,19 @@ pub struct EngineConfig {
     pub fullscreen_hide: bool,
     /// 帧率上限。`None` = 跟随显示器刷新率。
     pub fps_cap: Option<u32>,
+    /// DXGI 渲染队列深度（`IDXGIDevice1::SetMaximumFrameLatency`，0.5.2 #8）。
+    ///
+    /// `None` = 用库默认 **1**（跟手优先）。取值 `1..=8`，越界由 `sanitize()` 夹紧。
+    ///
+    /// 为什么宿主需要它：队列深度是「光标到光子」的滞后与「吞吐」之间的直接权衡 ——
+    /// 1 = 最低滞后（默认），2 = 吞吐优先（20 块拖拽实测 73.9 → 105.0 fps、
+    /// p50 13.0 → 8.34 ms），但 +1 帧队列 ≈ +8 ms 光标到光子，快速拖拽时用户读作
+    /// 「玻璃跟在光标后面」。分类框这类要跟手又要与桌面刷新率对齐的宿主，
+    /// 需要**按配置**稳定调参，而不是靠环境变量。
+    ///
+    /// 优先级：`GLASS_FRAME_LATENCY`（取证后门，`tools/ab_latency.py` 用它做 A/B）
+    /// 高于本字段，本字段高于默认值 1。环境变量只在**构造期**读一次（`gfx/device.rs`）。
+    pub frame_latency: Option<u32>,
     /// 是否把画布限制在前 N 块显示器（`None` = 全部）。
     pub monitor_limit: Option<usize>,
     /// 日志最低级别（仅影响 `log` 的全局过滤器；上层已装 logger 时以对方为准）。
@@ -527,6 +611,7 @@ impl Default for EngineConfig {
             occlusion_culling: true,
             fullscreen_hide: true,
             fps_cap: None,
+            frame_latency: None,
             monitor_limit: None,
             log_level: LogLevel::Info,
             diagnostics: DiagnosticsConfig::default(),
@@ -545,7 +630,26 @@ impl EngineConfig {
         if let Some(cap) = self.fps_cap {
             self.fps_cap = Some(cap.clamp(1, 1000));
         }
+        if let Some(lat) = self.frame_latency {
+            self.frame_latency = Some(lat.clamp(FRAME_LATENCY_MIN, FRAME_LATENCY_MAX));
+        }
     }
+}
+
+/// 渲染队列深度的合法区间（0.5.2 #8；与 `gfx/device.rs` 的夹紧口径同一来源）。
+pub const FRAME_LATENCY_MIN: u32 = 1;
+/// 渲染队列深度上界（DXGI 允许到 16，但更深只是把滞后叠上去，8 足够）。
+pub const FRAME_LATENCY_MAX: u32 = 8;
+
+/// 解析最终生效的队列深度（纯函数，判据本体，单测覆盖）。
+///
+/// 优先级 `env > config > 默认 1`：环境变量是取证后门，脚本要靠它做 A/B
+/// 而不去改宿主的配置文件；配置字段是产品入口；默认值偏跟手。
+#[must_use]
+pub fn resolve_frame_latency(env: Option<u32>, config: Option<u32>) -> u32 {
+    env.or(config)
+        .unwrap_or(FRAME_LATENCY_MIN)
+        .clamp(FRAME_LATENCY_MIN, FRAME_LATENCY_MAX)
 }
 
 /// 日志级别（避免把 `log::LevelFilter` 直接暴露进公共 API，保持 serde 友好）。
@@ -821,5 +925,84 @@ mod tests {
         let back: LiquidParams = serde_json::from_str(&json).unwrap();
         assert_eq!(back.shape, Shape::Squircle);
         assert_eq!(Profile::default(), Profile::Circular);
+    }
+
+    // ---- 0.5.2 #7：缩放下限口径 ----
+
+    /// 可疑下限的判据：超过阈值才报警，且**绝不改数值**。
+    #[test]
+    fn absurd_size_floor_is_flagged() {
+        assert!(!floor_is_suspicious(24.0, 24.0), "默认值不该报警");
+        assert!(
+            !floor_is_suspicious(MIN_FLOOR_SUSPICIOUS, MIN_FLOOR_SUSPICIOUS),
+            "恰好等于阈值不算可疑（判据是 >）"
+        );
+        assert!(floor_is_suspicious(MIN_FLOOR_SUSPICIOUS + 1.0, 24.0));
+        assert!(floor_is_suspicious(24.0, MIN_FLOOR_SUSPICIOUS + 1.0));
+    }
+
+    /// 宿主现场（605×1150 拉到 4096 那一类）：sanitize 夹紧但不「好心」改写语义。
+    #[test]
+    fn size_floor_clamps_to_bounds_but_keeps_value_within_them() {
+        let mut r = ResizeOptions {
+            min_width: 605.0,
+            min_height: 1150.0,
+            ..Default::default()
+        };
+        r.sanitize();
+        assert_eq!(
+            (r.min_width, r.min_height),
+            (605.0, 1150.0),
+            "区间内的下限必须原样生效（硬下限语义不许被偷偷改小）"
+        );
+        let mut over = ResizeOptions {
+            min_width: 999_999.0,
+            min_height: -3.0,
+            ..Default::default()
+        };
+        over.sanitize();
+        assert_eq!(over.min_width, 4096.0);
+        assert_eq!(over.min_height, 8.0);
+    }
+
+    // ---- 0.5.2 #8：frame_latency 进 EngineConfig ----
+
+    #[test]
+    fn frame_latency_priority_is_env_then_config_then_default() {
+        assert_eq!(resolve_frame_latency(None, None), 1, "默认必须跟手（1）");
+        assert_eq!(resolve_frame_latency(None, Some(2)), 2);
+        assert_eq!(
+            resolve_frame_latency(Some(3), Some(2)),
+            3,
+            "env 是取证后门，优先级最高"
+        );
+        assert_eq!(resolve_frame_latency(Some(0), None), 1, "0 必须夹回下限");
+        assert_eq!(resolve_frame_latency(Some(99), None), FRAME_LATENCY_MAX);
+    }
+
+    #[test]
+    fn frame_latency_sanitizes_and_round_trips_json() {
+        let mut c = EngineConfig {
+            frame_latency: Some(0),
+            ..Default::default()
+        };
+        c.sanitize();
+        assert_eq!(c.frame_latency, Some(FRAME_LATENCY_MIN));
+        c.frame_latency = Some(100);
+        c.sanitize();
+        assert_eq!(c.frame_latency, Some(FRAME_LATENCY_MAX));
+        assert_eq!(
+            EngineConfig::default().frame_latency,
+            None,
+            "默认不许改基线"
+        );
+
+        let json = serde_json::to_string(&EngineConfig::default()).unwrap();
+        assert!(
+            json.contains("\"frameLatency\""),
+            "camelCase 序列化必须带上字段，否则宿主 JSON 配不了: {json}"
+        );
+        let back: EngineConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, EngineConfig::default());
     }
 }

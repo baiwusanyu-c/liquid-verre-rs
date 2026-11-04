@@ -40,3 +40,32 @@
     `MonitorRt`（gfx 资源随 drop 释放），**HWND 本体留在桌面上**成孤儿（恒穿透、占
     topmost z 带、吞发给它的消息——复现脚本第一版就被它把刺激吃掉）。丢窗口元素必须
     显式 `DestroyWindow`，顺序 = 先 drop 绑定该 HWND 的 swapchain/采集、再毁窗。
+16. **叠加 pass 的层序是「盖在全部之上」，不是「盖在自己那块之上」。** 缩放反馈 border 曾
+    在 `draw_blocks` 之后统一发射：逐块 scissor 只对**块间**生效，对**玻璃层**永远是
+    「后画 = 压在上面」⇒ 两块重叠时拖下层框的边缘，白框画到上层框身上（宿主实测，
+    `raise_box` 只修正在拖的那块，修不了 hover 阶段）。正确结构 = **逐块内联**
+    （画完第 i 块玻璃及其内容，立刻画第 i 块 border），判据本体是纯函数
+    `core::draw::border_emit_plan`。配套纪律两条：① `draw_blocks` **每块开头无条件重设
+    全套玻璃管线状态**，子 pass 一律不写「还原」代码；② 内联版**绝对不许**在尾部
+    `OMSetRenderTargets(None, None)` —— 之后还要往同一张 RT 画更高块的玻璃，解绑 =
+    下一块整块闪黑（0.5.2 #1）。取证 `tools/verify_border_zorder.py`。
+17. **「还原清单」漏一项就整块消失，而 cbuffer/LUT 账本比管线更容易漏。** 0.5.2 同处发现
+    两处：内容 pass 结束后整体重绑 `t0..t8` 把 `t4` 打回默认 LUT，但 `bound_lut` 仍记着
+    自定义键 ⇒ 下一块同键跳过重绑、采到**错的折射 LUT**（无错误码、无告警）；旧
+    `draw_borders` 尾部 `OMSetRenderTargets(None, None)` 则会让内联后的下一块玻璃画不出来。
+    规矩：**绑定状态与「记账的键」必须同处更新**；能整体重设就不要做差异还原。
+18. **`ShowWindow` 不是「只改可见性」，它同时是一次 Z 序操作。** `SW_SHOWNOACTIVATE` 把窗口
+    抬进**普通带顶部**。「创建时置底 → 首帧就绪才显示」的时序因此必然在显示那一刻
+    把画布弹到最前（宿主 EnumWindows 4ms 采样实测 t+0.6s）。显示与层级必须同一次
+    `SetWindowPos(..., HWND_BOTTOM, SWP_SHOWWINDOW)` 完成（0.5.2 #2）；同族结论见
+    `platform/level.rs`：**不能**按「扩展样式变没变」决定是否发 `SetWindowPos`。
+19. **窗口类少了 `CS_DBLCLKS`，双击消息就根本不存在。** 不是「库没处理 `WM_LBUTTONDBLCLK`」，
+    而是 Windows 只对带该样式的类发送它 ⇒ 库里那条 `PointerPhase::DoubleClick` 分支是
+    **永不执行的死路径**，单测与代码审查都看不出来（0.5.2 #5，宿主日志实锤）。类样式
+    现集中成 `CANVAS_CLASS_STYLE` 常量 + 类级单测；物理取证 `tools/verify_double_click.py`
+    还要反向排除「库自己合成双击」。
+20. **`u8` 连击计数器 + 裸 `+1` = 定时炸弹。** `quality.rs` 的 `good_streak/bad_streak`
+    在 debug 构建约 256 个同向窗口（≈256 s）后 `attempt to add with overflow` panic
+    **杀渲染线程**，release 构建则回绕成 0 静默毁掉升档判据（0.5.2 #6，用户读作
+    「玻璃全灭」）。与第 7 条同源：**任何累计量都要 saturating + 夹紧**，并把判据抽成
+    纯函数、单测「顶到上限再跑一轮」。

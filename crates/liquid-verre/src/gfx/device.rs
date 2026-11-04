@@ -22,18 +22,26 @@ pub struct Device {
 
 impl Device {
     /// 优先硬件，失败回落 WARP（方案 8-R11）。
-    pub fn create() -> crate::error::Result<Self> {
-        match Self::create_with(D3D_DRIVER_TYPE_HARDWARE) {
+    ///
+    /// `frame_latency` = [`crate::api::EngineConfig::frame_latency`]（0.5.2 #8）。
+    /// 环境变量 `GLASS_FRAME_LATENCY` 仍然优先（取证后门，`tools/ab_latency.py` 靠它 A/B）。
+    pub fn create(frame_latency: Option<u32>) -> crate::error::Result<Self> {
+        match Self::create_with(D3D_DRIVER_TYPE_HARDWARE, frame_latency) {
             Ok(d) => Ok(d),
-            Err(hw_err) => Self::create_with(D3D_DRIVER_TYPE_WARP).map_err(|warp_err| {
-                crate::error::Error::from(format!(
-                    "硬件 D3D11 失败（{hw_err}），WARP 也失败（{warp_err}）"
-                ))
-            }),
+            Err(hw_err) => {
+                Self::create_with(D3D_DRIVER_TYPE_WARP, frame_latency).map_err(|warp_err| {
+                    crate::error::Error::from(format!(
+                        "硬件 D3D11 失败（{hw_err}），WARP 也失败（{warp_err}）"
+                    ))
+                })
+            }
         }
     }
 
-    fn create_with(driver: D3D_DRIVER_TYPE) -> crate::error::Result<Self> {
+    fn create_with(
+        driver: D3D_DRIVER_TYPE,
+        frame_latency: Option<u32>,
+    ) -> crate::error::Result<Self> {
         let levels = [D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0];
         let mut device = None;
         let mut ctx = None;
@@ -61,13 +69,22 @@ impl Device {
         // 光子）在快速拖拽时表现为「玻璃跟在光标后面」的拖尾感，比 lat=1 的
         // 偶发丢帧更像卡顿。于是默认回到 1（跟手优先），吞吐档保留为
         // GLASS_FRAME_LATENCY=2（适合静态展示/录屏/不跟手的场景）。
-        let latency: u32 = std::env::var("GLASS_FRAME_LATENCY")
+        // 0.5.2 #8：优先级 env > EngineConfig.frame_latency > 默认 1（判据本体见
+        // `api::config::resolve_frame_latency`，有单测）。env 只在构造期读一次。
+        let env_latency = std::env::var("GLASS_FRAME_LATENCY")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1)
-            .clamp(1, 8);
+            .and_then(|v| v.parse::<u32>().ok());
+        let latency = crate::api::config::resolve_frame_latency(env_latency, frame_latency);
         log::info!(
-            "渲染队列深度 = {latency}（GLASS_FRAME_LATENCY 可改；1 = 最低滞后/默认，2 = 吞吐优先）"
+            "渲染队列深度 = {latency}（来源：{}；1 = 最低滞后/默认，2 = 吞吐优先，             上限 {max}）",
+            if env_latency.is_some() {
+                "GLASS_FRAME_LATENCY"
+            } else if frame_latency.is_some() {
+                "EngineConfig.frame_latency"
+            } else {
+                "默认"
+            },
+            max = crate::api::config::FRAME_LATENCY_MAX
         );
         if let Ok(dxgi1) = dxgi.cast::<IDXGIDevice1>() {
             if let Err(e) = unsafe { dxgi1.SetMaximumFrameLatency(latency) } {
