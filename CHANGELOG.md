@@ -8,7 +8,7 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
-## [0.5.2-unreleased]
+## [0.5.2] - 2026-11-04
 
 来源：分类框宿主 `ikun_organizer`（依赖 crates.io `liquid-verre-rs 0.5.1`）的实测取证清单。
 八条全部落地，宿主侧的临时绕行**可以退役**（逐条对照见下）。
