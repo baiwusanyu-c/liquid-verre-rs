@@ -8,7 +8,7 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
-## [0.5.4-unreleased]
+## [0.5.4] - 2026-11-25
 
 来源：宿主 `chapanda-ds-organizers` 的 Win10 + Wallpaper Engine（下称 WE）定位报告
 （2026-11-04，《Win10-WallpaperEngine-分类框黑框与消失-定位修复指南.md》）。
