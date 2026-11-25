@@ -107,6 +107,11 @@ pub struct WgcCapture {
 }
 
 impl WgcCapture {
+    /// 最近一次交付的 owned 纹理（0.5.4 黑帧探针回读用；`None` = 尚未出过帧）。
+    #[must_use]
+    pub(crate) fn last_owned(&self) -> Option<ID3D11Texture2D> {
+        self.owned.clone()
+    }
     /// 为指定显示器创建采集会话（方案 4.1：每屏一个 session，不是每块一个）
     pub fn new_for_monitor(
         device: &ID3D11Device,

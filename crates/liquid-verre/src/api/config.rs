@@ -563,7 +563,8 @@ pub struct EngineConfig {
     /// 渲染全部跳过（画布已 `SW_HIDE`，那些像素进不了用户眼睛），恢复走「采集失效恢复」
     /// 同一条路径（`invalidate()` + `ready = false`）⇒ 零陈旧帧。
     ///
-    /// ⚠ **判据只看形状**（`WS_POPUP` + 无 caption/thickframe + 铺满屏 + 是**前台**窗口），
+    /// ⚠ **判据只看形状**（`WS_POPUP` + 无 caption/thickframe + 铺满**画布所在屏** +
+    /// 是**前台**窗口 —— 0.5.4 起「铺满」按画布自己那块屏量，副屏全屏不再误伤主屏），
     /// 分不出「游戏」与「无边框最大化的普通应用」（Electron / Tauri / app-mode 浏览器 /
     /// UWP 壳窗口）。0.4.2 起加了 cloaked 否决（`DWMWA_CLOAKED`），排掉「存在但一个像素
     /// 都不画」的那一类（挂起的 UWP 窗口 / 被 DWM 隐藏的窗口），但**可见的**无边框全屏应用
@@ -573,6 +574,11 @@ pub struct EngineConfig {
     /// 命中 / 退出都会打一行 `[info]`，命中那行**追加**触发窗口的
     /// `class` / `title` / `rect`（身份只在翻转沿构造，4 Hz 轮询路径零分配），
     /// 同时上抛 [`crate::EngineEvent::ExclusiveFullscreen`]。
+    ///
+    /// ⚠ **桌面壳排除**（形状全中也不判定，两轮实测误报修出来的名单）：
+    /// `Progman`（0.4.2，按 `GetShellWindow` 身份挡）与 `WorkerW`（0.5.4，按类名挡 ——
+    /// Wallpaper Engine 把壁纸挂在 WorkerW 兄弟窗口里，Win10 用户点一下桌面空白处
+    /// 前台就是它，曾造成「点桌面分类框消失、点任务栏又回来」的整屏误停产）。
     ///
     /// 取证后门：`GLASS_FS_HIDE=0`（见 `diag/env.rs`），与本字段取「与」。
     pub fullscreen_hide: bool,

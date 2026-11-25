@@ -120,6 +120,24 @@ pub(crate) fn is_class_already_exists(code: i32) -> bool {
     code as u32 == 0x8007_0582
 }
 
+/// `WDA_EXCLUDEFROMCAPTURE`（Win10 2004+）：把该窗口从一切采集输出（DDA / WGC /
+/// PrintWindow）中剔除 —— 画布自反馈的根治手段（方案 4.2 L1），也是 0.5.4 黑帧
+/// 探针唯一允许临时摘掉的门。**常量单一来源在此**，别处不许再手写 0x11。
+const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
+
+/// 设置/解除画布的采集排除。**返回 `Err` = 系统拒绝了这次亲和性切换**
+/// （旧构建、窗口已销毁等），调用方必须据此放弃后续判定 ——
+/// 「翻不动」和「翻了没变化」是两回事，把前者当后者会把探针的结论编造出来。
+///
+/// ⚠ `exclude=false`（`WDA_NONE`）只允许出现在 `runtime` 黑帧探针的裁决窗口里
+/// （≤1 s，且该窗口内的帧不进金字塔）：常态画布**必须**排除采集，
+/// 否则玻璃采到玻璃自己，递归反馈（方案 4.2 的第一条红线）。
+pub(crate) fn set_capture_exclusion(hwnd: HWND, exclude: bool) -> windows::core::Result<()> {
+    let affinity = WINDOW_DISPLAY_AFFINITY(if exclude { WDA_EXCLUDEFROMCAPTURE } else { 0 });
+    // SAFETY: `hwnd` 由调用方持有（自家画布，存活期内在用）；affinity 取两个合法常量之一。
+    unsafe { SetWindowDisplayAffinity(hwnd, affinity) }
+}
+
 /// 创建一块显示器的全屏画布窗口。
 pub(crate) fn create_canvas(
     _gfx: &crate::gfx::Device,
@@ -166,11 +184,9 @@ pub(crate) fn create_canvas(
             cyBottomHeight: -1,
         };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
-        // 自反馈根治：把该画布从所有采集（DDA / WGC / PrintWindow）中剔除。
-        const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
-        if let Err(e) =
-            SetWindowDisplayAffinity(hwnd, WINDOW_DISPLAY_AFFINITY(WDA_EXCLUDEFROMCAPTURE))
-        {
+        // 自反馈根治：把该画布从所有采集（DDA / WGC / PrintWindow）中剔除
+        // （0.5.4 起常量与调用收敛到 `set_capture_exclusion` 单一来源）。
+        if let Err(e) = set_capture_exclusion(hwnd, true) {
             log::warn!("SetWindowDisplayAffinity({}): {e:?}", info.name);
         }
     }

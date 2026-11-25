@@ -116,6 +116,14 @@ pub(crate) struct App {
     pub quality: QualityCtrl,
     /// 采集后端偏好（`EngineConfig::capture.backend`）。重建采集时沿用。
     pub backend_pref: crate::api::config::CaptureBackend,
+    /// 0.5.4 黑帧探针总开关（构造期合成一次：`!GLASS_BLACK_PROBE=0`），
+    /// 与 `occlusion_enabled` 同构 —— 建屏/重建屏时透传给 `MonitorRt::black_probe`，
+    /// 热路径绝不 `env::var`。
+    pub black_probe_enabled: bool,
+    /// `GLASS_BLACK_PROBE=force`：把 Sampling 帧一律视为全黑（取证仿真，见 prd AC3）。
+    pub black_probe_force: bool,
+    /// `GLASS_BACKEND=wgc`：后端被显式强制 ⇒ 探针确认自涂黑也**不**擅自改道。
+    pub backend_forced_wgc: bool,
     /// 各屏 (origin,size) 缓存，供 `core::block::rehome_block` 零分配归屏查询。
     /// 显示器数量上限（构造期从 env/cfg 读一次）。
     /// None = 不限制；Some(n) = 只用前 n 块屏（n ≥ 1）。
@@ -417,6 +425,8 @@ pub(crate) fn wait_for_captures(app: &mut App, primary_budget: std::time::Durati
                 ) {
                     Ok(cap) => {
                         mon.capture = Some(cap);
+                        // 0.5.4 新会话必须重新武装黑帧探针（漏贴 = 这一会话永远不判黑）。
+                        mon.arm_probe();
                         true
                     }
                     Err(e) => {
@@ -474,7 +484,13 @@ pub(crate) fn rebuild_monitors(app: &mut App) {
     let old: Vec<_> = app.monitors.iter().map(|m| m.hwnd).collect();
     let mut next: Vec<MonitorRt> = Vec::new();
     for info in infos {
-        if let Some(mut m) = MonitorRt::create(&app.gfx, info, app.level, app.backend_pref) {
+        if let Some(mut m) = MonitorRt::create(
+            &app.gfx,
+            info,
+            app.level,
+            app.backend_pref,
+            app.black_probe_enabled,
+        ) {
             if let Err(e) = m
                 .compositor
                 .resize(&app.gfx, m.info.size[0], m.info.size[1])

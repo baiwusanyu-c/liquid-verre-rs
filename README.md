@@ -344,7 +344,7 @@ match msg { WM_USER_FOCUS => { SetFocus(host_shell_hwnd); } }
   与 `poll_events`（有界队列 `EVENT_QUEUE_CAP = 256`，溢出丢最旧并在下次轮询补一条 `EventsDropped`）。
 - `Error` / `ErrorKind`（`#[non_exhaustive]`，10 类）/ `Result<T>`：
   `GraphicsInit`、`ShaderCompile`、`MonitorEnumeration`、`WindowCreation`、`CaptureUnavailable`、
-  `CaptureLost`、`InvalidConfig`、`NotSupported`、`Shutdown`、`Internal`。
+  `CaptureLost`、`CaptureDegraded`（0.5.4 黑帧探针）、`InvalidConfig`、`Shutdown`、`Internal`。
   `Error::kind()` / `message()` / `with_kind()`；`Display` 输出 `[kind] message[: source]`；
   底层 HRESULT 保留在 `source()`。
 - `BuildInfo` / `BUILD_INFO`：`version`、`git_sha`、`git_dirty`、`built_at_utc`、`target_triple`、
@@ -856,7 +856,7 @@ PeekMessage 泵
 | **HDR 桌面** | HDR/宽色域输出下 DDA 复制面是 HDR 参考值（整张过曝）；自动改走 **WGC**，由 DWM 做 HDR→SDR。SDR 输出仍 DDA 优先；`GLASS_BACKEND` 可强制 |
 | 拖拽期零 `SetWindowRgn` | 按下时一次性扩到整窗，抬起后收紧（旧实现每帧重建 HRGN，是 100~280 ms 长尾的主因） |
 | 不抢焦点 | 画布带 `WS_EX_NOACTIVATE`，层级操作一律 `SWP_NOACTIVATE` |
-| 独占全屏自动让路 | 4 Hz 轮询，命中就隐藏该屏画布 **并整屏停产**（采集 + 渲染全跳），退出后恢复。判据 = 前台窗口 `WS_POPUP` 且无 caption/thickframe 且铺满整块屏，外加三条身份排除（自家画布 / 无前台 / **`Progman` 桌面本身**）与 cloaked 否决；命中日志会打出触发窗口的 `class`/`title`/`rect`。`EngineConfig.fullscreen_hide`（默认 `true`）/ `GLASS_FS_HIDE=0` 可关 |
+| 独占全屏自动让路 | 4 Hz 轮询，命中就隐藏该屏画布 **并整屏停产**（采集 + 渲染全跳），退出后恢复。判据 = 前台窗口 `WS_POPUP` 且无 caption/thickframe 且铺满**画布所在屏**（0.5.4 起按屏取矩形，副屏全屏应用不再误伤主屏玻璃），外加身份排除（自家画布 / 无前台）、cloaked 否决与**桌面壳类名排除**（`Progman` 走身份 + 类名双保险，0.5.4 起 `WorkerW` 按类名挡 —— Win10 + Wallpaper Engine 点桌面时前台就是 WorkerW，形状与 Progman 同形，曾造成「点桌面分类框消失」）；命中日志会打出触发窗口的 `class`/`title`/`rect`。`EngineConfig.fullscreen_hide`（默认 `true`）/ `GLASS_FS_HIDE=0` 可关 |
 | 环境色不闪烁 | 1/16 层 GPU ping-pong EMA，τ=150 ms，零回读；**只在捕获内容真变化时推进** |
 | **块与块之间零串扰** | 鼠标 border 渐变乘 `fall × gate(2.5R..3R)`；缩放反馈只作用于被 hover 的那一块；脏区影响盒 = `max(3R+32, 2*grip+16) + ceil(shadow_margin)`，与之严格对齐 ⇒ 盒外精确为 0 |
 | 撑不住时自动降档 | 自适应质量控制器（**默认开启**）：持续丢 vblank 才逐级降，恢复后逐级升回；level 0 与未启用时**逐位一致** |
@@ -1008,7 +1008,8 @@ PeekMessage 泵
 
 | 变量 | 读取点 | 作用 |
 |---|---|---|
-| `GLASS_BACKEND=dda\|wgc` | `capture/mod.rs` | 强制采集后端（默认 Auto：HDR 输出→WGC，SDR→DDA 优先、失败回退 WGC）。强制 dda 且拿到 FP16 复制面时打一次 `[warn]`（背景会过曝） |
+| `GLASS_BACKEND=dda\|wgc` | `capture/mod.rs` | 强制采集后端（默认 Auto：HDR 输出→WGC，SDR→DDA 优先、失败回退 WGC）。强制 dda 且拿到 FP16 复制面时打一次 `[warn]`（背景会过曝）。0.5.4 注：黑帧探针的降级走 `Capture::downgrade_to_dda`，**绕开**本后门（取证语境 `GLASS_BACKEND=wgc + GLASS_BLACK_PROBE=force` 下降级不空转） |
+| `GLASS_BLACK_PROBE=0\|force` | `diag/env.rs` + `runtime` | 0.5.4 采集黑帧探针（默认开）：会话头几帧网格回读判「连续全黑」。WGC 自涂黑（把被 `WDA_EXCLUDEFROMCAPTURE` 排除的自家全屏画布画黑，Win10 实测路径）⇒ 翻转画布排除取裁决帧，内容改变即**自动降级 DDA**；DDA 连续全黑（MPO 视频壁纸不进复制帧 / 纯黑桌面，采集侧不可分辨）⇒ 只上抛 `Warning{CaptureDegraded}`，**绝不隐藏画布**（黑壁纸误伤红线）。`=0` 整条关闭（性能取证要完全 hermetic 时显式设）；`force` 把「画布仍在排除」的采样帧一律视作全黑，用于无 WE/无 HDR 机器闭环取证状态机（`tools/verify_black_probe.py`） |
 | `GLASS_SYNTH_CAP=1` | `capture/mod.rs` | 用**确定性合成图案**覆盖采集结果，使跨进程 / 跨时间的逐像素取证可复现 |
 | `GLASS_COPY_MODE=multi\|union\|full` | `capture/dda.rs` | 局部拷贝策略。`multi`(默认)=逐脏矩形 `CopySubresourceRegion`，超过 `MAX_DIRTY_RECTS = 24` 退回整屏；`union`=只拷脏矩形并集 bbox 一次；`full`=永远整屏 `CopyResource` |
 | `GLASS_SIM_DIRTY=<w>x<h>@<n>` | `capture/dda.rs` | 用 n 个固定尺寸、确定性散布的脏矩形取代真实脏矩形，使三种拷贝策略在完全相同的搬运量下对比 |

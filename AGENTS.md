@@ -38,7 +38,7 @@ Cargo workspace 库项目：`crates/liquid-verre`（库，package `liquid-verre-
 ## 提交前必须全绿（workspace 版）
 
 ```powershell
-cargo test --release --workspace                                  # 库 136 + 集成 11 + playground 5 + doctest 2 = 154
+cargo test --release --workspace   # 库 265 + api_surface 11 + host_contract 9 + playground 5 + doctest 2 = 292
 cargo clippy --workspace --all-targets --release -- -D warnings
 cargo fmt --all -- --check
 node scripts/check.mjs                                            # 等价于 cargo xtask check
@@ -62,6 +62,18 @@ python tools/gate_perf.py                                         # 性能阀门
 块外反向对照 + 物理拖拽终局；#3 本地不复现、补丁为宿主 wake_canvas_idle 的库侧内建化，
 脚本是常驻回归位）。两脚本枚举画布**必须按 pid 过滤**（truncate 泄漏前科：孤儿画布恒穿透，
 打中错窗口会把活测成死）。
+
+0.5.4 Win10+WE 兼容另立两件**行为取证**（同样不进 CI，触碰全屏停产门 / 采集会话建立
+路径必复跑）：`verify_desktop_foreground`（同形复现宿主报告：进程内注册类名 WorkerW/
+Progman 的铺满屏弹窗顶到前台 ⇒ 不许 fs_on、dda 不归零、画布不许隐藏；S1 对照组
+证明真全屏应用仍命中——判别力靠「同形状不同类名」对照，无需真装 WE；另钉死
+fullscreen_app_on 按**画布所在屏**取矩形，前科 = 副屏 XamlExplorerHostIslandWindow
+抢前台把主屏玻璃误停产）与 `verify_black_probe`（`GLASS_BLACK_PROBE=force` 把「画布仍
+在排除」的采样帧仿真为全黑，在真实 wgc/dda 双后端上闭环「采样→翻转排除→digest 裁决→
+WGC 自涂黑自动降级 DDA / DDA 连续黑只 Warning」整条状态机；R1 真实桌面零误报、
+R3 `=0` 全程静默；画布全程可见是每一阶段硬断言——黑壁纸误伤红线）。注意降级走
+`Capture::downgrade_to_dda` 专用构造**绕开** `GLASS_BACKEND` 后门（后门压过一切配置，
+顺着它会降级空转，首轮取证就是这样暴露的）。
 
 ## 发版与 CI（本地助手 + GitHub Actions）
 

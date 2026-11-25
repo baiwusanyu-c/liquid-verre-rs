@@ -8,6 +8,70 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
+## [0.5.4-unreleased]
+
+来源：宿主 `chapanda-ds-organizers` 的 Win10 + Wallpaper Engine（下称 WE）定位报告
+（2026-11-04，《Win10-WallpaperEngine-分类框黑框与消失-定位修复指南.md》）。
+一句话：**Progman 误报的第二半是 WorkerW；Win10 WGC 会把「被排除采集的自家画布」
+涂黑，靠运行期探针自检自愈**。本机（Win10、无 WE）用**同形刺激**复现了两条症状
+（注册进程类名 WorkerW/Progman 的铺满屏弹窗；`GLASS_BLACK_PROBE=force` 仿真涂黑），
+每件都有常驻判别取证（见 Added），不进 CI。
+
+### Fixed
+- **[P0] 桌面壳 `WorkerW` 被误判成「独占全屏应用」→ 点一下桌面，玻璃整体消失并整屏停产**
+  （`platform/display.rs`）：0.4.2 修 Progman 误报时只挡了 `GetShellWindow()` 返回的
+  **那一个 HWND**，而 WE 的经典方案把壁纸挂到 Progman 之外的 `WorkerW` 兄弟窗口 ——
+  它的样式（`WS_POPUP` 无 caption/thickframe）与矩形（铺满屏）和 Progman 同形，三条形状
+  判据全中，宿主实测「点桌面分类框消失、点任务栏又回来」正是 `hidden_fs` 的翻转形状。
+  现按**类名**排除桌面壳（`Progman` / `WorkerW`，大小写折叠随 atom 表口径，纯函数
+  `is_desktop_shell_class` 单测钉死前缀/截断/空串/越界四类分支）。成本纪律：类名读取
+  排在便宜形状段之后（真全屏游戏每圈只多付一次 `GetClassNameW`，比它替代的
+  `GetWindowRect`+`GetMonitorInfoW`+DWM RPC 便宜一个量级）；4 Hz 轮询路径仍零分配。
+  类名兜底同时覆盖「`GetShellWindow` 恰好失效时的 Progman」—— 这是宿主 `is_desktop_class`
+  早就认识、库侧一直缺的那条常识。
+- **[P1] 独占全屏压制越屏误伤：前台窗口铺满的是**别的屏**，本屏画布照样停产**
+  （`platform/display.rs::fullscreen_app_on` + `runtime/mod.rs`）：旧实现的铺满判据量的是
+  `MonitorFromWindow(fg)`（前台窗口自己的屏）而非画布所在屏。本机取证首轮当场抓到：
+  副屏上反复抢占前台的 `XamlExplorerHostIslandWindow`（rect [3120,0,5040,1080]，恰好
+  铺满副屏）把**主屏**画布 `SW_HIDE`、dda 归零 —— 而主屏玻璃明明没有被任何东西盖住。
+  现签名收 `HMONITOR`（调用方传 `mon.info.hmonitor`），矩形只对着这块屏量；
+  「隐藏该屏画布」这条门从此只响应**压在这块屏上**的全屏窗口。多屏用户的一条隐性
+  误伤顺带修掉，`verify_desktop_foreground.py` 的头部注释登记了前科。
+- **[P1] Win10 + WGC：被 `WDA_EXCLUDEFROMCAPTURE` 排除的自家全屏画布被整幅涂黑，
+  玻璃永久黑底**——新增运行期**黑帧探针**自检自愈（`capture/`、`runtime/monitor.rs`、
+  `platform/window.rs`）：本库自己的 `dda.rs` 模块头早已写明「WGC 会把被排除的全屏窗口
+  替换成黑色矩形，DDA 是直接露出下层」，但 Auto 规则里 HDR 输出与 DDA 创建失败回退
+  两条路都会落到 WGC —— 画布铺满整屏，被涂黑的就是**整张采集纹理**，两种玻璃风格
+  （共用同一张背景纹理）一起黑。判据不能按 OS 版本猜（依驱动/构建而异），改**实测**：
+  每会话头几个「内容变化」帧做网格回读（4px 步长、阈值 4 容忍 dither，纯函数
+  `grid_probe` + FNV 摘要，可单测）；连续全黑 ⇒ 把画布临时摘出采集排除取**一帧裁决**
+  （该帧只诊断不进金字塔，防自反馈）：内容改变 ⇒ 黑是「排除」涂的 ⇒ **自动降级 DDA**；
+  逐位没变 ⇒ 桌面本就黑 ⇒ 只告警。真实触发与降级路径的取证见 `verify_black_probe.py`
+  （force 仿真在真实 wgc/dda 双后端上闭环整条状态机）。
+  降级走新增的 `Capture::downgrade_to_dda`（**绕开** `GLASS_BACKEND` 后门 —— 后门语义是
+  「压过一切配置」，取证场景 `GLASS_BACKEND=wgc` 下若走 `for_monitor_pref(ForceDda)`
+  会把降级建回 WGC 空转，首轮取证正是这样暴露的）。
+
+### Added
+- `ErrorKind::CaptureDegraded`（`capture-degraded`）：采集「技术上可用、内容不可信」
+  （WGC 自涂黑 / MPO 黑帧），只经 `EngineEvent::Warning` 上抛，**不是** `Err`、
+  **不隐藏画布**。与指南建议的有意分歧必须写明白：指南建议「连续 N 帧全黑 ⇒ 上抛
+  CaptureLost 类事件」，但纯黑桌面与 MPO 黑帧在采集侧不可分辨，隐藏画布会把合法的
+  黑色壁纸用户打成「分类框消失」——比黑底更糟，所以只告警、处置权交宿主。
+- 黑帧探针取证后门 `GLASS_BLACK_PROBE=0|force`（`diag/env.rs`，与 `GLASS_FS_HIDE=0`
+  同构）：`=0` 整条关闭（真实采集的性能取证要完全 hermetic 时显式设）；
+  `force` 把「画布仍处于排除」的采样帧一律视作全黑（裁决帧仍按真实内容），
+  用于无 WE / 无 HDR 的机器闭环状态机。**默认开**：它是用户侧止损机制。
+- `platform/window.rs::set_capture_exclusion`（`WDA_EXCLUDEFROMCAPTURE` 常量与调用
+  收敛为单一来源，探针翻转专用）；`Capture::{probe_armable, last_frame_black_probe,
+  downgrade_to_dda, drop_probe_buffers}`；`MonitorRt::{cap_probe, arm_probe, probe_*}`。
+- 两件行为取证（不进 CI；触碰对应路径必复跑）：
+  `tools/verify_desktop_foreground.py`（S1 真全屏对照必须仍命中停产门，S3/S4 假
+  WorkerW/Progman 同形前台**不许**命中：dda 不归零、画布不隐藏、无 fs_on 翻转沿；
+  另钉死按屏取矩形）与 `tools/verify_black_probe.py`（R1 真实桌面探针零误报；
+  R2 force+强制 wgc 走完「采样→翻转→裁决→降级→重武装」闭环；R3 `=0` 全程静默；
+  R4 force+dda 只告警不换端；画布全程可见是每一阶段的硬断言）。
+
 ## [0.5.3] - 2026-11-04
 
 来源：宿主 `ikun_organizer` 对 0.5.2 的复验（`liquid-verre-rs-0.5.3-库侧修复清单-下层框hover命中未让位上层块.md`）。

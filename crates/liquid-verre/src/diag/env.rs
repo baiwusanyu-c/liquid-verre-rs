@@ -83,6 +83,23 @@ pub(crate) struct EnvOverrides {
     /// （实测 `repro_tremble far/many` 只有 0~1 帧、`verify_adaptive` 报「未观察到降档」）。
     /// 唯一不设它的是 `tools/verify_occlusion.py` —— 它就是测这条停产门的。
     pub no_fs_hide: bool,
+    /// `GLASS_BLACK_PROBE=0`：关闭 0.5.4 的**采集黑帧探针**（WGC 自涂黑自动降级 /
+    /// DDA 连续全黑告警）。取证后门，与 `no_fs_hide` 完全同构：构造期读一次，
+    /// 合成到 `App::black_probe_enabled` 传给各屏，热路径不再读环境。
+    ///
+    /// 为什么探针需要后门：它会在会话头几帧做**阻塞回读**并可能**更换采集后端**，
+    /// 对逐帧取证是干扰源（`GLASS_SYNTH_CAP` 路径已自动跳过；真实采集的性能取证
+    /// 若要完全 hermetic 就显式设本开关）。默认**开**——它是用户侧的止损机制。
+    pub no_black_probe: bool,
+    /// `GLASS_BLACK_PROBE=force`：把「画布仍处于采集排除」的采样帧一律视作全黑，
+    /// 用于在**没有 WE / 没有 HDR** 的机器上闭环取证探针状态机本身
+    /// （翻转、裁决、降级、事件），见 `tools/verify_black_probe.py`。
+    /// 只影响探针的输入判据，不改渲染与采集数据。**绝不默认开**。
+    pub black_probe_force: bool,
+    /// `GLASS_BACKEND=wgc`：后端被**显式强制**成 WGC（与 `capture/mod.rs` 里
+    /// 消费的是同一个环境变量，口径 = 值恰为 `wgc`）。强制场景下探针仍会裁决，
+    /// 但**不自动降级**——用户点名要 WGC，库只报告不擅自改道。
+    pub backend_forced_wgc: bool,
 }
 
 fn flag(name: &str) -> bool {
@@ -127,6 +144,9 @@ impl EnvOverrides {
             no_adaptive: std::env::var("GLASS_ADAPTIVE").ok().as_deref() == Some("0"),
             no_occlusion: std::env::var("GLASS_OCCLUSION").ok().as_deref() == Some("0"),
             no_fs_hide: std::env::var("GLASS_FS_HIDE").ok().as_deref() == Some("0"),
+            no_black_probe: std::env::var("GLASS_BLACK_PROBE").ok().as_deref() == Some("0"),
+            black_probe_force: std::env::var("GLASS_BLACK_PROBE").ok().as_deref() == Some("force"),
+            backend_forced_wgc: std::env::var("GLASS_BACKEND").ok().as_deref() == Some("wgc"),
         }
     }
 
@@ -149,6 +169,18 @@ mod tests {
         assert!(!e.extreme_spec && !e.verify_pass_a && !e.no_adaptive);
         assert!(!e.no_occlusion, "遮挡剔除的取证后门默认必须是「不关」");
         assert!(!e.no_fs_hide, "全屏隐藏检测的取证后门默认必须是「不关」");
+        assert!(
+            !e.no_black_probe,
+            "黑帧探针是用户侧止损机制，默认必须开（取证才显式关）"
+        );
+        assert!(
+            !e.black_probe_force,
+            "force 模拟黑帧只许取证显式开，默认必须假"
+        );
+        assert!(
+            !e.backend_forced_wgc || std::env::var("GLASS_BACKEND").is_ok(),
+            "该位只在 GLASS_BACKEND 确实存在时可为真"
+        );
         assert_eq!(e.sim_busy_us(), 0);
         assert!(e.sim_backdrop.is_none());
         assert!(e.monitor_limit.is_none());

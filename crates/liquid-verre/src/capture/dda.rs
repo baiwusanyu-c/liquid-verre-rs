@@ -190,6 +190,18 @@ pub fn output_color_space(device: &ID3D11Device, hmonitor: HMONITOR) -> Option<i
 }
 
 impl DdaCapture {
+    /// 最近一次交付的 owned 纹理（0.5.4 黑帧探针回读用；`None` = 尚未出过帧）。
+    #[must_use]
+    pub(crate) fn last_owned(&self) -> Option<ID3D11Texture2D> {
+        self.texture.clone()
+    }
+
+    /// owned 纹理内容是否忠实于本帧桌面：`GLASS_SKIP_COPY / GLASS_SKIP_DIRTY`
+    /// 归因后门开着时不搬（或不刷新）像素，黑帧结论失真 ⇒ 探针不得武装。
+    #[must_use]
+    pub(crate) fn probe_copy_honest(&self) -> bool {
+        !self.skip_copy && !self.skip_dirty
+    }
     /// 为**指定显示器**创建 duplication（方案 4.1：每个需要玻璃的显示器一个
     /// 采集会话，不是每块一个）。不同分辨率/不同 DPI 的屏各自独立。
     pub fn new_for_monitor(

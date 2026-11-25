@@ -1,0 +1,30 @@
+{
+  "id": "win10-we-desktop-capture",
+  "name": "win10-we-desktop-capture",
+  "title": "Win10+WE 兼容：WorkerW 误判排除 + 采集黑帧哨兵",
+  "description": "display.rs 桌面壳类名排除（WorkerW/Progman）；capture 黑帧探针（WGC 自涂黑自动降级 DDA / DDA 连续黑帧仅 Warning）；GLASS_BLACK_PROBE 后门与两件判别取证脚本",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": "liquid-verre-rs",
+  "priority": "P1",
+  "creator": "baiwusanyu",
+  "assignee": "baiwusanyu",
+  "createdAt": "2026-11-25",
+  "completedAt": "2026-11-25",
+  "branch": "master",
+  "base_branch": "master",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/liquid-verre/src/platform/display.rs",
+    "crates/liquid-verre/src/capture/mod.rs",
+    "crates/liquid-verre/src/runtime/mod.rs"
+  ],
+  "notes": "来源：宿主 Win10-WallpaperEngine-分类框黑框与消失-定位修复指南.md（2026-11-04）",
+  "meta": {}
+}

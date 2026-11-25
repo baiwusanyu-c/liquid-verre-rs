@@ -31,6 +31,15 @@ pub enum ErrorKind {
     /// **不会**作为 `Err` 返回：库内部按 500 ms 退避自动重建，
     /// 只通过 `EngineEvent::Warning` 上抛，避免上层被刷屏。
     CaptureLost,
+    /// 采集「技术上可用、内容不可信」（0.5.4 黑帧探针）。
+    ///
+    /// 两种现场形态都落到这里：Win10 上 WGC 把被 `WDA_EXCLUDEFROMCAPTURE`
+    /// 排除的自家全屏画布整幅涂黑（库会自动尝试降级 DDA，见事件 reason）；
+    /// 以及 MPO 硬件叠加层不进复制帧（Wallpaper Engine 视频壁纸一类）。
+    /// **不会**作为 `Err` 返回，库也**不隐藏画布**：纯黑桌面与 MPO 黑帧在采集侧
+    /// 不可分辨，隐藏会误伤合法的黑色壁纸用户 —— 只上抛 `EngineEvent::Warning`，
+    /// 由宿主决定提示文案（建议：换静态壁纸 / 关 MPO / 关闭 HDR 输出）。
+    CaptureDegraded,
     /// 上层传入的配置非法（已被 `sanitize` 夹紧但仍不可用，例如尺寸为 0）。
     InvalidConfig,
     /// 引擎已关闭后再调用句柄方法。
@@ -50,6 +59,7 @@ impl ErrorKind {
             ErrorKind::WindowCreation => "window-creation",
             ErrorKind::CaptureUnavailable => "capture-unavailable",
             ErrorKind::CaptureLost => "capture-lost",
+            ErrorKind::CaptureDegraded => "capture-degraded",
             ErrorKind::InvalidConfig => "invalid-config",
             ErrorKind::Shutdown => "shutdown",
             ErrorKind::Internal => "internal",
@@ -178,6 +188,8 @@ mod tests {
     #[test]
     fn kind_str_is_stable() {
         assert_eq!(ErrorKind::CaptureLost.as_str(), "capture-lost");
+        // 0.5.4 黑帧探针专用类别（宿主按 kind 分支，不匹配字符串）
+        assert_eq!(ErrorKind::CaptureDegraded.as_str(), "capture-degraded");
         assert_eq!(ErrorKind::GraphicsInit.as_str(), "graphics-init");
     }
 

@@ -29,7 +29,7 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::api::config::EngineConfig;
+use crate::api::config::{CaptureBackend, EngineConfig};
 use crate::api::event::EngineEvent;
 use crate::api::handle::Shared;
 use crate::capture::Capture;
@@ -152,7 +152,15 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
     log::info!(target: "boot", "创建各屏画布与采集...");
     let mut monitors_rt: Vec<MonitorRt> = Vec::new();
     for info in infos {
-        if let Some(mut m) = MonitorRt::create(&gfx, info, cfg.window_level, cfg.capture.backend) {
+        // 黑帧探针总开关在构造期合成一次（产品语义 && GLASS_BLACK_PROBE!=0），随屏携带；
+        // 热路径绝不 env::var（与 occlusion_enabled / fs_hide_enabled 同一纪律）。
+        if let Some(mut m) = MonitorRt::create(
+            &gfx,
+            info,
+            cfg.window_level,
+            cfg.capture.backend,
+            !env.no_black_probe,
+        ) {
             if let Some(cap) = m.capture.as_ref() {
                 shared.emit(EngineEvent::CaptureBackendSelected {
                     monitor_index: monitors_rt.len(),
@@ -271,6 +279,9 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         quality,
         monitor_limit: env.monitor_limit.or(cfg.monitor_limit).map(|n| n.max(1)),
         backend_pref: cfg.capture.backend,
+        black_probe_enabled: !env.no_black_probe,
+        black_probe_force: env.black_probe_force,
+        backend_forced_wgc: env.backend_forced_wgc,
         style_cache: StyleCache::default(),
         block_sinks: Vec::new(),
         block_focus_hwnds: Vec::new(),
@@ -425,10 +436,22 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
         {
             let gfx = &app.gfx;
             let backend_pref = app.backend_pref;
+            // 0.5.4 黑帧探针的两个运行期判据（构造期读好的 bool，这里只是搬到栈上
+            // 缩短借用链）：force=取证仿真；no_downgrade=后端被显式强制（env 或
+            // config 点名 wgc）时即便确认自涂黑也不擅自改道——但 force 取证语境
+            // 本身就是要闭环整条降级链，此时放行（见 diag/env.rs 注释与 prd AC3）。
+            let bp_force = app.black_probe_force;
+            let bp_no_downgrade = (app.backend_forced_wgc
+                || matches!(backend_pref, CaptureBackend::ForceWgc))
+                && !bp_force;
             for (mi, mon) in app.monitors.iter_mut().enumerate() {
                 mon.new_backdrop = false;
                 mon.backdrop_dirty = None;
                 mon.copied_px = 0;
+                // 0.5.4 黑帧探针的墙钟兜底必须排在下面所有 continue（停产门 / 降频 /
+                // 停采）之前：FlipWait 的画布处于「可被采集」的危险窗口，等不到帧时
+                // 只能靠墙钟强制恢复排除。非活动态第一条 match 就返回，稳态零成本。
+                mon.probe_deadline_check(&mut pending_events);
                 // 停产门 A：画布已被独占 / 无边框全屏应用压住（`hidden_fs` ⇒ `SW_HIDE`），
                 // 采集与渲染出来的每一个像素都进不了用户眼睛 ⇒ 整屏不采集（R-A1）。
                 // 在此之前 `hidden_fs` 只是「可见性位」：DDA 一切正常，于是我们满频跟着
@@ -513,6 +536,9 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                                     mon.capture = Some(cap);
                                     // 采集源重建后金字塔与后备缓冲都失效，下一帧必须整屏重来。
                                     mon.compositor.invalidate();
+                                    // 0.5.4 新会话必须重新武装黑帧探针（漏贴的后果是
+                                    // 「这一会话永远不判黑」，臂内自带三态门）。
+                                    mon.arm_probe();
                                 }
                                 Err(_) => {
                                     if !mon.capture_error_logged {
@@ -531,6 +557,14 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                 };
                 match outcome {
                     Ok(Some((tex, w, h, changed))) => {
+                        // 0.5.4 黑帧探针的**裁决帧**（摘除画布排除后的第一个内容帧）
+                        // 只诊断不渲染：这一帧画面里有「被采到的画布自己」，喂进
+                        // 金字塔就是一帧自反馈污染（方案 4.2 第一条红线）。跳过本屏
+                        // 本轮消费 = 玻璃至多陈旧一帧，与停产恢复同一已知代价。
+                        if changed && mon.probe_flipping() {
+                            mon.probe_adjudicate(gfx, bp_no_downgrade, &mut pending_events);
+                            continue;
+                        }
                         if mon.compositor.width != w || mon.compositor.height != h {
                             if let Err(e) = mon.compositor.resize(gfx, w, h) {
                                 log::error!("resize({}): {e}", mon.info.name);
@@ -543,6 +577,11 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                         mon.backdrop_dirty = dirty;
                         mon.copied_px = copied;
                         mon.last_capture = Instant::now();
+                        // 0.5.4 黑帧探针采样 tick：只对「内容变化」帧判黑（changed=false
+                        // 时 owned 纹理还是旧内容，判它等于重复计数）。稳态第一行 match 退出。
+                        if changed {
+                            mon.probe_sample_tick(gfx, bp_force, &mut pending_events);
+                        }
                         if !mon.ready && mon.compositor.capture_ready() {
                             mon.ready = true;
                             mon.hidden_capture = false;
@@ -871,7 +910,7 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                 let matched = if dragging {
                     None
                 } else {
-                    display::fullscreen_app_on(mon.hwnd)
+                    display::fullscreen_app_on(mon.hwnd, mon.info.hmonitor)
                 };
                 let hit = matched.is_some();
                 if hit != mon.hidden_fs {

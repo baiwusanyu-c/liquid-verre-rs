@@ -6,11 +6,11 @@
 
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Gdi::MONITORINFO;
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, EnumDisplaySettingsW, GetMonitorInfoW, DEVMODEW, ENUM_CURRENT_SETTINGS,
     HDC, HMONITOR, MONITORINFOEXW,
 };
-use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetForegroundWindow, GetShellWindow, GetWindowLongPtrW, GetWindowRect,
@@ -182,7 +182,7 @@ pub(crate) fn is_fullscreen_shape(style: u32, covers_monitor: bool, cloaked: Opt
 /// ② 4 Hz 轮询路径**零分配** —— 身份字符串只在翻转沿由 [`window_desc`] 构造。
 ///
 /// ⚠ **成本纪律**：[`dwm_cloaked`] 是跨进程 RPC，必须在便宜判据全部通过之后才调用
-/// （样式位、`GetWindowRect`、`MonitorFromWindow`、`GetMonitorInfoW`）。绝大多数时候
+/// （样式位、类名、`GetWindowRect`、`GetMonitorInfoW`）。绝大多数时候
 /// 前台是个普通带标题栏的窗口，第一段就返回 `None` 了，一次 RPC 都不该付。
 /// 这与 [`super::occlusion`] 回调的关卡顺序是同一个契约。
 ///
@@ -216,7 +216,69 @@ pub(crate) fn is_non_candidate_foreground(fg: HWND, mon_hwnd: HWND, shell: HWND)
     fg.0.is_null() || fg == mon_hwnd || (!shell.0.is_null() && fg == shell)
 }
 
-pub(crate) fn fullscreen_app_on(mon_hwnd: HWND) -> Option<HWND> {
+/// 桌面壳窗口类名表（0.5.4，见 `fullscreen_app_on` 内注释与任务 prd）。
+///
+/// 只列类名**恰好**如此的两个桌面壳：`Progman` 是 `GetShellWindow()` 背后的窗口，
+/// `WorkerW` 是 shell 为渲染壁纸动态创建的兄弟窗口（WE 等壁纸软件的主战场；
+/// 可存在多个实例，但类名同名）。
+pub(crate) const DESKTOP_SHELL_CLASSES: [&str; 2] = ["Progman", "WorkerW"];
+
+/// 把 ASCII 大写字母折叠成小写（Win32 类名是 ASCII；atom 表的大小写不敏感仅此一位差异）。
+fn fold_wide(c: u16) -> u16 {
+    if b'A' as u16 <= c && c <= b'Z' as u16 {
+        c + 32
+    } else {
+        c
+    }
+}
+
+/// 纯判据：`GetClassNameW` 写进 `buf` 的前 `n` 个宽字符是否精确等于某个**桌面壳类名**
+/// （大小写不敏感 —— Win32 类名注册走 atom 表，本来就不分大小写）。
+///
+/// 与 [`is_non_candidate_foreground`] 同理抽成纯函数：真实 HWND 无法在 CI 构造，
+/// 而每条分支（精确 / 前后缀 / 截断 / 越界长度）都必须可测。
+/// **零分配**：逐码位折叠比较，不走 `String::from_utf16_lossy`（4 Hz 轮询路径，R-E1）。
+///
+/// `n` 的钳位口径与 `platform::window::class_name_is_canvas` 同一条纪律：
+/// 负数按 0（不匹配），超长按 `buf.len()` 截断（缓冲区内容说了算）。
+#[must_use]
+pub(crate) fn is_desktop_shell_class(buf: &[u16], n: i32) -> bool {
+    let n = (n.max(0) as usize).min(buf.len());
+    let name = &buf[..n];
+    DESKTOP_SHELL_CLASSES.iter().any(|expect| {
+        let mut it = expect.encode_utf16();
+        for &got in name {
+            match it.next() {
+                Some(want) if fold_wide(want) == fold_wide(got) => {}
+                _ => return false,
+            }
+        }
+        it.next().is_none()
+    })
+}
+
+/// 读一次前台窗口的类名并判定是否桌面壳（`Progman` / `WorkerW`）。
+///
+/// ⚠ 只在**形状判据全中**之后调用（与 [`is_own_window`] 同一成本纪律）：
+/// 真全屏游戏为此多付一次 `GetClassNameW`（读类原子的单次内核调用，比紧随其后的
+/// `GetWindowRect` + `MonitorFromWindow` + `GetMonitorInfoW` + DWM RPC 便宜一个量级）；
+/// 而用户点一下桌面时前台**经常**就是桌面壳 —— 挡在这一层，后面的昂贵段一概不付。
+#[must_use]
+fn is_desktop_shell_foreground(fg: HWND) -> bool {
+    let mut buf = [0u16; 64];
+    // SAFETY: `buf` 是栈上定长数组，指针与真实长度交给 Win32，在这次同步调用内有效；
+    // `fg` 刚由 `GetForegroundWindow` 取得（可能已销毁，那时返回 0 ⇒ 走不匹配分支）。
+    let n = unsafe { GetClassNameW(fg, &mut buf) };
+    is_desktop_shell_class(&buf, n)
+}
+
+/// `mon_monitor` = **画布所在那块屏**的句柄（0.5.4 起必传）：铺满判据必须对着
+/// 「这块屏」量。旧实现用 `MonitorFromWindow(fg)` 拿前台窗口自己的屏 —— 于是
+/// 「副屏上开了个全屏应用」会把**主屏**画布一起停产（主屏玻璃明明还看得见！）。
+/// 本机实测前科（tools/verify_desktop_foreground.py S4 首轮 FAIL）：副屏 (3120,0,
+/// 5040,1080) 上反复抢占前台的 `XamlExplorerHostIslandWindow` 让主屏画布 `SW_HIDE`,
+/// dda 归零 —— 按屏取矩形才是「隐藏该屏画布」这条门自己的语义。
+pub(crate) fn fullscreen_app_on(mon_hwnd: HWND, mon_monitor: HMONITOR) -> Option<HWND> {
     unsafe {
         let fg = GetForegroundWindow();
         // 身份排除放在最前面（一次 GetShellWindow + 几次指针比较，零分配）：
@@ -231,17 +293,30 @@ pub(crate) fn fullscreen_app_on(mon_hwnd: HWND) -> Option<HWND> {
         if !is_fullscreen_shape(style, true, None) {
             return None;
         }
-        // 第二段（三次内核调用）：窗口矩形必须铺满它所在的那块屏。
+        // 第 1.5 段（0.5.4 类名排除）：桌面壳窗口（Progman / WorkerW）的形状判据**全中**，
+        // 但它们在 z 序最底、盖不住任何东西，永远不可能是「独占全屏应用」。
+        // ⚠ 这是 `is_non_candidate_foreground` 里 Progman 事故（见其注释）的**第二半**：
+        //   当年只挡了 `GetShellWindow()` 返回的那一个 HWND，而 Wallpaper Engine 的经典方案
+        //   把壁纸挂到 Progman 之外的 `WorkerW` 兄弟窗口 —— Win10 上用户点一下桌面空白处，
+        //   前台就是 WorkerW（宿主实测 2026-11：「分类框整体消失、点任务栏又回来」正是
+        //   `hidden_fs` 被误置的形状）。Win11 上桌面前台通常是 Progman，被身份排除挡住，
+        //   所以只有 Win10+WE 复现。类名兜底同时覆盖「GetShellWindow 恰好失效的 Progman」。
+        if is_desktop_shell_foreground(fg) {
+            return None;
+        }
+        // 第二段（两次内核调用）：窗口矩形必须铺满**画布所在**的那块屏。
+        // 屏句柄直接用调用方传来的（它就是画布绑定的屏），不再 MonitorFromWindow(fg)
+        // —— 前台窗口在自己的屏上铺满，不等于压在**这块**屏上（见函数文档的实测前科）。
         let mut wr = RECT::default();
         if GetWindowRect(fg, &mut wr).is_err() {
             return None;
         }
-        let hmon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+        if !GetMonitorInfoW(mon_monitor, &mut mi).as_bool() {
+            // 屏句柄已失效（拔屏瞬间）：本圈按「没命中」处理，下一圈会走显示器重建。
             return None;
         }
         let m = mi.rcMonitor;
@@ -338,7 +413,9 @@ pub(crate) fn on_battery() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_fullscreen_shape, is_non_candidate_foreground, wide_len};
+    use super::{
+        is_desktop_shell_class, is_fullscreen_shape, is_non_candidate_foreground, wide_len,
+    };
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{WS_CAPTION, WS_POPUP, WS_THICKFRAME};
 
@@ -432,6 +509,55 @@ mod tests {
         assert!(
             is_non_candidate_foreground(progman, canvas, progman),
             "前台是桌面本身时必须直接排除，否则用户点一下壁纸玻璃就消失并停产"
+        );
+    }
+
+    #[test]
+    fn desktop_shell_classes_are_matched_by_name() {
+        // 0.5.4（Win10 + Wallpaper Engine 事故，宿主定位报告 2026-11）：
+        // WorkerW 形状判据与 Progman 同形、却不是 GetShellWindow 返回的 HWND，只能按类名挡。
+        let w: Vec<u16> = "WorkerW".encode_utf16().collect();
+        assert!(
+            is_desktop_shell_class(&w, w.len() as i32),
+            "前台是 WorkerW 时必须排除，否则用户点一下壁纸玻璃就消失并停产"
+        );
+        let lower: Vec<u16> = "workerw".encode_utf16().collect();
+        assert!(
+            is_desktop_shell_class(&lower, lower.len() as i32),
+            "类名比较随 atom 表口径折叠大小写"
+        );
+        let p: Vec<u16> = "PROGMAN".encode_utf16().collect();
+        assert!(
+            is_desktop_shell_class(&p, p.len() as i32),
+            "类名兜底 Progman"
+        );
+        // 判别力护栏：前缀 / 后缀 / 空串一律不算桌面壳 —— 松一格等于放行「名字沾边的任何
+        // 窗口」，R-16 整体失效（真全屏的反向对照见 an_unrelated_window_stays_a_candidate）。
+        let p2: Vec<u16> = "Progman2".encode_utf16().collect();
+        assert!(
+            !is_desktop_shell_class(&p2, p2.len() as i32),
+            "Progman2 不是 Progman"
+        );
+        let short: Vec<u16> = "Progm".encode_utf16().collect();
+        assert!(
+            !is_desktop_shell_class(&short, short.len() as i32),
+            "截断前缀不许命中"
+        );
+        let empty: Vec<u16> = Vec::new();
+        assert!(
+            !is_desktop_shell_class(&empty, 0),
+            "空类名（查询失败）按不匹配处理"
+        );
+        let canvas: Vec<u16> = "LiquidVerreCanvas".encode_utf16().collect();
+        assert!(
+            !is_desktop_shell_class(&canvas, canvas.len() as i32),
+            "自家画布走 is_own_window，不在桌面壳表里（两处判据不许互相冒用）"
+        );
+        // 钳位口径（与 class_name_is_canvas 同纪律）：负数按 0 ⇒ 不匹配；超长钳到容量 ⇒ 内容说了算。
+        assert!(!is_desktop_shell_class(&w, -1));
+        assert!(
+            is_desktop_shell_class(&w, 1_000_000),
+            "超长钳到容量后仍应正确命中"
         );
     }
 
