@@ -379,10 +379,25 @@ fn fps_cap_and_adaptive_level_take_the_stricter_one() {
 
 #[cfg(test)]
 mod tests {
-    use super::{bump_streaks, far_past, QualityCtrl, STREAK_CAP};
+    use super::{bump_streaks, Instant, QualityCtrl, STREAK_CAP};
 
     /// 0.5.2 #6 主判据：计数器顶到上限后再跑一轮评估，不许 panic、不许回绕。
     ///
+    /// 「早于当前一个判定窗口（1 s）以上」的时刻——测试侧专用，不依赖机器开机时长。
+    ///
+    /// 不能用 far_past（1 小时前）：Windows 的 Instant 以开机为原点，开机不足 1 小时的
+    /// 机器上 checked_sub(1h) 必然失败并退化为 now，tick 在 epoch.elapsed()<1s 处当场
+    /// 早退，bump_streaks 一次都不跑，streak 停在 u8::MAX。实锤前科（2026-11-25）：
+    /// 本机重启后 uptime=47.7min，本测试 left=255/right=16 独红，同一二进制重启前 265
+    /// 全绿（release dry-run 抓到）；CI 全新 runner 同样 uptime<1h，一律会红。
+    /// 退 2s 只要求 uptime>2s，测试进程活着就满足；真退不动（病态时钟）会红给
+    /// 用户看而不是假绿。
+    fn past_of_window() -> Instant {
+        Instant::now()
+            .checked_sub(std::time::Duration::from_secs(2))
+            .unwrap_or_else(Instant::now)
+    }
+
     /// 判别力：把实现改回裸 `self.good_streak += 1`，本测试在 **debug** 构建里
     /// 立刻 `attempt to add with overflow` panic（这正是宿主线上「约 256 s 必崩」
     /// 的那条路径）；改回 `wrapping_add` 则断言 2 的「停在顶上」会红。
@@ -403,8 +418,8 @@ mod tests {
         q.level = 0; // level 0 时「连续 4 个干净窗口」不会触发升档，计数得以留在顶上
         q.good_streak = u8::MAX;
         for _ in 0..300 {
-            q.epoch = far_past();
-            q.cooldown_until = far_past();
+            q.epoch = past_of_window();
+            q.cooldown_until = past_of_window();
             q.frames = 30;
             q.missed = 0;
             assert!(!q.tick(1_000, true), "level 0 且干净：不该改档位");
@@ -419,8 +434,8 @@ mod tests {
         q.level = 4;
         q.bad_streak = u8::MAX;
         for _ in 0..300 {
-            q.epoch = far_past();
-            q.cooldown_until = far_past();
+            q.epoch = past_of_window();
+            q.cooldown_until = past_of_window();
             q.frames = 30;
             q.missed = 30;
             q.tick(10_000, true);
