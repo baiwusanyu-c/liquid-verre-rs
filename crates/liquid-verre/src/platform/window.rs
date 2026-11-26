@@ -543,8 +543,10 @@ unsafe fn start_resize_session(
     let Some(b) = app.manager.get(block) else {
         return;
     };
-    let s = b.scale.max(1e-3);
-    let origin = [b.x, b.y, b.width / s, b.height / s];
+    // 0.5.5：缩放会话 origin 直接存按下时刻**物理矩形**（不再除按下 b.scale）——
+    // 计算链全程物理域，会话与按下 scale 解耦，跨主/副屏过渡不再跳尺寸、
+    // 锚定边不再漂移（量纲推导与前科见 `input::drag::ResizeState::apply` 注释）。
+    let origin = [b.x, b.y, b.width, b.height];
     let min_size = [b.resize.min_width, b.resize.min_height];
     let now = app.t0.elapsed().as_secs_f64();
     app.min_drag_size = min_size;

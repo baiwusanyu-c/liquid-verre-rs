@@ -748,7 +748,9 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                 let now = app.t0.elapsed().as_secs_f64();
                 let id = session.id();
                 let resizing = session.is_resize();
-                // 用块**当前**所在屏的比例换算；跨屏后 sync_block_monitor 会再校正。
+                // 用块**当前**所在屏的比例：缩放会话内部全程物理域，这个 scale 只决定
+                // 逻辑折算（写回乘回同一值，乘除相消 ⇒ 跨屏过渡物理矩形逐帧不变，
+                // 0.5.5 契约，见 `input::drag::ResizeState::apply`）；移动会话不消费它。
                 let scale = drag_scale;
                 let r = session.apply(app.cursor, now, scale, min_size);
                 app.drag_velocity = session.velocity();
@@ -763,6 +765,9 @@ pub(crate) fn run(shared: Arc<Shared>) -> Result<()> {
                     // 移动时绝不写回尺寸：尺寸归 DPI 换算管，否则跨屏后会被
                     // 按下那一刻的像素尺寸覆盖（跨屏回归测试抓到的真实缺陷）。
                     if resizing {
+                        // 成对契约：`session.apply` 内部用**同一个** scale 把物理矩形
+                        // 折成逻辑返回，这里乘回去恰好还原（乘除相消）。会话中途跨屏
+                        // scale 翻转时物理几何逐帧不变 —— 改这里必须同步改 drag.rs。
                         b.width = r[2] * scale;
                         b.height = r[3] * scale;
                     }

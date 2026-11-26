@@ -3,8 +3,12 @@
 //! 共同约定：
 //! - 鼠标移动只记 pending，**每帧应用一次**（1000 Hz 消息 → 144 Hz 合并）；
 //! - 速度用 EMA(0.75/0.25) 平滑，供着色器做采集滞后外推（`lag_seconds`）；
-//! - `origin` 的 `x, y` 是虚拟屏物理像素，`w, h` 是**逻辑单位**（主屏物理像素），
-//!   这样跨屏拖拽 / 缩放不会被按下那一刻的像素尺寸锁死（方案 12.2.5）；
+//! - `origin` 的 `x, y` 是虚拟屏物理像素；**缩放会话的 `w, h` 也是物理像素**（0.5.5 起，
+//!   见 `ResizeState::apply` 的前科注释）。旧口径把 `w/h` 存成「按下那一刻 scale 下的
+//!   逻辑单位」、写回端每帧乘「当前所在屏 scale」，两套 scale 并存 —— 主/副屏过渡
+//!   瞬间物理尺寸按 `s_new/s_press` 跳变（宿主分类框「半主半副显示异常」根因之一）。
+//!   移动会话维持旧约定：尺寸归 rehome 的 DPI 换算管，不被按下那一刻的像素尺寸锁死
+//!   （方案 12.2.5）。
 //! - 缩放时**锚定不动边**：夹到最小尺寸时固定边必须纹丝不动，否则会出现「左边滑走」。
 
 use crate::core::block::MIN_SIZE;
@@ -55,9 +59,11 @@ impl DragSession {
 
     /// 每帧应用一次，返回 `(x, y, w_logical, h_logical)`。
     ///
-    /// `scale` = 块当前所在屏的 DPI 比例。移动会话**不**用 scale 换算尺寸
-    /// （尺寸归 DPI 换算管，否则跨屏后会被按下那一刻的像素尺寸覆盖 —— 这是
-    /// 跨屏回归测试抓到的真实缺陷）。
+    /// `scale` = 块当前所在屏的 DPI 比例。缩放会话在物理域算完后除以 `scale` 返回，
+    /// 调用方（`runtime::mod` 写回点）必须乘**同一个** `scale` 写回：乘除相消，物理矩形
+    /// 与会话中途的 scale 翻转无关 —— 这是跨屏不跳变的前提，成对契约不许拆开改。
+    /// 移动会话**不**用 scale 换算尺寸（尺寸归 DPI 换算管，否则跨屏后会被按下
+    /// 那一刻的像素尺寸覆盖 —— 这是跨屏回归测试抓到的真实缺陷）。
     pub(crate) fn apply(
         &mut self,
         cursor: [f32; 2],
@@ -134,7 +140,8 @@ pub(crate) struct ResizeState {
     pub id: u32,
     pub edges: ResizeEdges,
     pub start_cursor: [f32; 2],
-    /// `[x, y, w_logical, h_logical]`
+    /// `[x, y, w_phys, h_phys]` —— 按下时刻的**物理矩形**（0.5.5 起；旧口径存
+    /// 「按下 scale 下的逻辑尺寸」，与写回端的当前 scale 打架，见 `apply` 前科注释）。
     pub origin: [f32; 4],
     pub velocity: [f32; 2],
     last_cursor: [f32; 2],
@@ -160,13 +167,29 @@ impl ResizeState {
         }
     }
 
-    /// 返回 `(x, y, w_logical, h_logical)`。
+    /// 返回 `(x, y, w_logical, h_logical)`，其中 `w/h = 物理宽 / scale`。
     ///
-    /// 锚定规则：
-    /// - 拖右边 → 左边不动，`w = max(min_w, w0 + dx/s)`；
-    /// - 拖左边 → 右边不动，`w = max(min_w, w0 - dx/s)`，且 `x = x0 + (w0 - w)`
-    ///   （用 `w0 - w` 而不是 `dx/s`，这样夹到 `min_w` 时右边**精确**不动）；
+    /// **全程物理域计算**（`origin` 即按下时刻的物理矩形），只在返回时除以 `scale`
+    /// 折成逻辑单位。调用方（`runtime::mod` 写回点）必须乘**同一个** `scale` 写回
+    /// `b.width/b.height`：乘除相消后物理矩形与 scale 无关 —— 主/副屏过渡（1.0 ⇄ 0.5）
+    /// 不跳尺寸、不漂移。这是本函数与写回端的成对契约，改一边必须改另一边。
+    ///
+    /// 锚定规则（`dx/dy` 为**物理**光标增量）：
+    /// - 拖右边 → 左边不动，`w_phys = max(min_w_phys, w0 + dx)`；
+    /// - 拖左边 → 右边不动，`w_phys = max(min_w_phys, w0 - dx)`，且
+    ///   `x = x0 + (w0 - w)` —— 同量纲（物理 − 物理），锚定右边 `x + w ≡ x0 + w0`
+    ///   逐帧精确不动，夹到最小宽度同样成立。
+    ///   【前科 2026-11-26】旧实现把逻辑增量 `(w0 - w)` 直接加到物理 `x0`（少乘一个
+    ///   `s`），锚定边每帧漂 `(w0 - w) × (1 - s)`：主屏 s=1 漂移恒 0（宿主原话
+    ///   「主屏没有问题」），副屏 s=0.5 拖 200 px 漂 100 px —— 宿主两轮实测（合成
+    ///   输入 +200/+200/+100；真实鼠标 −26/−26/+13）与公式吻合，即「漂移出屏幕」
+    ///   主因。旧单测所有会动 x/y 的锚定用例全部 scale=1.0，唯一非 1.0 用例拖右缘
+    ///   （不改 x）恰好绕开缺陷，所以一直没被测出 —— 新判别用例见 tests 尾部。
     /// - 上下同理；对角 = 两个方向的组合。
+    ///
+    /// `min_size` 是**逻辑**下限（宿主契约）：×`scale` 进物理域后再垫 `MIN_SIZE`
+    /// 硬地板，与写回端 `b.clamp()`（按物理像素夹同一地板）同口径，低 scale 屏
+    /// 收缩到极限时不会被二次 clamp 扯歪锚定边。
     pub(crate) fn apply(
         &mut self,
         cursor: [f32; 2],
@@ -184,11 +207,13 @@ impl ResizeState {
         } else {
             1.0
         };
-        let dx = (cursor[0] - self.start_cursor[0]) / s;
-        let dy = (cursor[1] - self.start_cursor[1]) / s;
+        // 物理域增量：鼠标走多少物理像素，被拖的边就跟多少。origin 也是物理矩形，
+        // 会话中途跨屏（scale 翻转）不再让「按下那一刻的逻辑尺寸」把几何锁死。
+        let dx = cursor[0] - self.start_cursor[0];
+        let dy = cursor[1] - self.start_cursor[1];
         let [x0, y0, w0, h0] = self.origin;
-        let min_w = min_size[0].max(MIN_SIZE);
-        let min_h = min_size[1].max(MIN_SIZE);
+        let min_w = (min_size[0].max(MIN_SIZE) * s).max(MIN_SIZE);
+        let min_h = (min_size[1].max(MIN_SIZE) * s).max(MIN_SIZE);
 
         let mut x = x0;
         let mut y = y0;
@@ -207,7 +232,8 @@ impl ResizeState {
             h = (h0 - dy).max(min_h);
             y = y0 + (h0 - h);
         }
-        [x, y, w, h]
+        // 逻辑返回：写回端乘同一个 scale 恰好还原物理值。
+        [x, y, w / s, h / s]
     }
 }
 
@@ -354,11 +380,80 @@ mod tests {
     }
 
     #[test]
-    fn resize_converts_cursor_delta_by_dpi_scale() {
-        // 200% DPI：光标走 100 物理 px = 50 逻辑 px
+    fn resize_cursor_delta_is_physical_return_is_logical() {
+        // 200% DPI：物理 origin 宽 300，光标右移 100 物理 px → 物理宽 400（边缘跟手），
+        // 返回逻辑 = 400/2 = 200；写回端 ×2 恰好恢复 400。
+        // 旧实现：dx 先除 scale 只涨 50 逻辑，边跟不上光标；原点若按按下 scale 存
+        // 逻辑值，写回再乘当前 scale 会再乘错一层。
         let mut d = resize_session(E::RIGHT);
         let r = d.apply([100.0, 0.0], 0.016, 2.0, [24.0, 24.0]);
-        assert!((r[2] - 350.0).abs() < 1e-3, "w={}", r[2]);
+        assert!((r[2] - 200.0).abs() < 1e-3, "w_logical={}", r[2]);
+        assert!(
+            (r[2] * 2.0 - 400.0).abs() < 1e-3,
+            "写回物理宽必须 = w0 + dx(物理)"
+        );
+        assert_eq!(r[0], 100.0, "拖右缘时左缘（锚定边）不动");
+    }
+
+    fn resize_at(edges: E, origin: [f32; 4]) -> ResizeState {
+        ResizeState::begin(7, edges, [0.0, 0.0], origin, 0.0)
+    }
+
+    #[test]
+    fn resize_left_edge_half_scale_anchor_zero_drift() {
+        // 判别用例（旧实现必红）：副屏 50%，物理 origin [1000,500,400,300]，
+        // 抓左缘向左拖 200 物理 px。锚定右边 x + w_phys 必须逐像素 ≡ 1400。
+        // 旧实现 x = x0 + 逻辑增量(-400) = 600，右缘每帧漂 (w0-w)×(1-s) ——
+        // 即宿主「拖 200 漂 100/200」两轮实测的直接来源。
+        let mut d = resize_at(E::LEFT, [1000.0, 500.0, 400.0, 300.0]);
+        let r = d.apply([-200.0, 0.0], 0.016, 0.5, [24.0, 24.0]);
+        let w_phys = r[2] * 0.5;
+        assert!((r[0] - 800.0).abs() < 1e-3, "x={}", r[0]);
+        assert!(
+            (w_phys - 600.0).abs() < 1e-3,
+            "物理宽应随光标 +200, w_phys={w_phys}"
+        );
+        assert!((r[0] + w_phys - 1400.0).abs() < 1e-3, "右缘（锚定边）漂移");
+    }
+
+    #[test]
+    fn resize_top_edge_double_scale_anchor_zero_drift() {
+        // 判别用例（旧实现必红）：200% 屏，抓上缘向上拖 120 物理 px，
+        // 下缘（锚定边）必须 ≡ 560 不动。
+        let mut d = resize_at(E::TOP, [300.0, 200.0, 640.0, 360.0]);
+        let r = d.apply([0.0, -120.0], 0.016, 2.0, [24.0, 24.0]);
+        let h_phys = r[3] * 2.0;
+        assert!((r[1] - 80.0).abs() < 1e-3, "y={}", r[1]);
+        assert!((r[1] + h_phys - 560.0).abs() < 1e-3, "下缘（锚定边）漂移");
+    }
+
+    #[test]
+    fn resize_scale_flip_mid_session_keeps_physical_rect() {
+        // 判别用例（旧实现必红）：会话中途跨屏（写回 scale 1.0 → 0.5），
+        // 同一会话、同一光标位置：物理矩形必须不变，只随 scale 折算逻辑返回值。
+        // 旧实现原点锁「按下 scale 的逻辑尺寸」、写回乘「当前 scale」，
+        // 过渡瞬间物理尺寸按 s_new/s_press 跳变 = 宿主「半主半副显示异常」。
+        let mut d = resize_at(E::RIGHT, [1000.0, 500.0, 400.0, 300.0]);
+        let a = d.apply([160.0, 0.0], 0.016, 1.0, [24.0, 24.0]);
+        let b = d.apply([160.0, 0.0], 0.032, 0.5, [24.0, 24.0]);
+        assert!((a[0] - b[0]).abs() < 1e-3, "x 不该随屏翻转跳");
+        assert!((a[2] * 1.0 - b[2] * 0.5).abs() < 1e-3, "物理宽随屏翻转跳变");
+        assert!((a[3] * 1.0 - b[3] * 0.5).abs() < 1e-3, "物理高随屏翻转跳变");
+    }
+
+    #[test]
+    fn resize_min_clamp_half_scale_anchor_still_fixed() {
+        // 判别用例：副屏 50%，抓左缘向右拖 1000 物理 px（过头收缩）。
+        // 物理下限 = max(24×0.5, MIN_SIZE) = 24（与写回 b.clamp 同地板），
+        // 锚定右边仍须 ≡ 1400 纹丝不动 —— 旧实现逻辑/物理地板混算，这里必漂。
+        let mut d = resize_at(E::LEFT, [1000.0, 500.0, 400.0, 300.0]);
+        let r = d.apply([1000.0, 0.0], 0.016, 0.5, [24.0, 24.0]);
+        let w_phys = r[2] * 0.5;
+        assert!((w_phys - 24.0).abs() < 1e-3, "w_phys={w_phys}");
+        assert!(
+            (r[0] + w_phys - 1400.0).abs() < 1e-3,
+            "夹到最小时锚定边漂移"
+        );
     }
 
     #[test]
