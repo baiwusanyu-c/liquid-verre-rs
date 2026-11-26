@@ -8,7 +8,7 @@
 重构前的历史（单 bin crate `liquid-glass` 时期的第一~十四轮性能与视觉取证）见
 `performance_report.md` 与 `BASELINE.md`，本文件从库化重构那一版开始记。
 
-## [0.5.5-unreleased]
+## [0.5.5] - 2026-11-26
 
 来源：宿主 `chapanda-ds-organizers` 多屏定位报告 ——「分类框在主/副屏过渡（半主半副）
 显示异常、缩放时漂移出屏、拖拽边界失效」。对 **0.5.4 发布源码**逐行核对 + 宿主两轮
